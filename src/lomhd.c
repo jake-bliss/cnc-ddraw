@@ -24,6 +24,7 @@ static HANDLE g_worker_wake;
 static volatile LONG g_frames, g_want_frame, g_frame_ready, g_pack_ready;
 static volatile LONG g_seen_seq;
 static volatile const char* g_renderer;
+static volatile const char* g_gl_missing;   /* set by the render thread, logged by the worker */
 
 static BYTE* g_frame;
 static DWORD g_frame_w, g_frame_h, g_frame_bpp;
@@ -199,6 +200,18 @@ static DWORD WINAPI lomhd_worker(LPVOID unused)
         if (InterlockedCompareExchange(&g_frame_ready, 0, 1) == 1)
             lomhd_write_frame();
 
+        static BOOL reported_gl;
+        const char* missing = (const char*)g_gl_missing;
+
+        if (missing && !reported_gl)
+        {
+            char line[200];
+            _snprintf(line, sizeof(line), "overlay OFF: missing %s -- portraits stay vanilla", missing);
+            line[sizeof(line) - 1] = 0;
+            lomhd_log(line);
+            reported_gl = TRUE;
+        }
+
         /* What the matcher sees, logged only when it changes: this is the acceptance record. */
         LONG seq = g_seen_seq;
 
@@ -308,6 +321,7 @@ static char LOMHD_FRAG[] =
     "void main() { vec4 c = texture(tex, tc); if (c.a < 0.5) discard; color = vec4(c.rgb, 1.0); }\n";
 
 static GLuint g_program, g_vao, g_vbo, g_ebo, g_tex[LOMHD_MAX_PLACEMENTS];
+static PFNGLGETINTEGERVPROC lomhd_glGetIntegerv;
 static GLint g_pos_loc, g_uv_loc, g_tex_loc;
 static BOOL g_gl_failed;
 static DWORD* g_rgba;
@@ -317,11 +331,47 @@ static BOOL lomhd_gl_init(void)
     if (g_program || g_gl_failed)
         return g_program != 0;
 
+    /* cnc-ddraw fetches glGetIntegerv through wglGetProcAddress, which returns NULL for a GL 1.1
+     * function on Wine, and guards its own use of it. The first version of this file did not:
+     * it called straight through NULL and crashed the game the moment a portrait was found
+     * (EIP 0, GL_CURRENT_PROGRAM on the stack). A 1.1 function comes from opengl32.dll itself. */
+    lomhd_glGetIntegerv = glGetIntegerv ? glGetIntegerv :
+        (PFNGLGETINTEGERVPROC)GetProcAddress(GetModuleHandleA("opengl32.dll"), "glGetIntegerv");
+
+    /* Every entry point used below, checked before the first call. A missing one turns the overlay
+     * off -- vanilla portraits -- and the worker logs which; it must never be a crash. */
+    struct { const char* name; void* fn; } needed[] = {
+        { "glGetIntegerv", (void*)lomhd_glGetIntegerv }, { "glUseProgram", (void*)glUseProgram },
+        { "glGetAttribLocation", (void*)glGetAttribLocation },
+        { "glGetUniformLocation", (void*)glGetUniformLocation }, { "glUniform1i", (void*)glUniform1i },
+        { "glGenVertexArrays", (void*)glGenVertexArrays }, { "glBindVertexArray", (void*)glBindVertexArray },
+        { "glGenBuffers", (void*)glGenBuffers }, { "glBindBuffer", (void*)glBindBuffer },
+        { "glBufferData", (void*)glBufferData }, { "glBufferSubData", (void*)glBufferSubData },
+        { "glVertexAttribPointer", (void*)glVertexAttribPointer },
+        { "glEnableVertexAttribArray", (void*)glEnableVertexAttribArray },
+        { "glActiveTexture", (void*)glActiveTexture }, { "glGenTextures", (void*)glGenTextures },
+        { "glBindTexture", (void*)glBindTexture }, { "glTexParameteri", (void*)glTexParameteri },
+        { "glTexImage2D", (void*)glTexImage2D }, { "glDrawElements", (void*)glDrawElements },
+    };
+
+    for (size_t i = 0; i < sizeof(needed) / sizeof(needed[0]); i++)
+    {
+        if (!needed[i].fn)
+        {
+            g_gl_missing = needed[i].name;
+            g_gl_failed = TRUE;
+            SetEvent(g_worker_wake);
+            return FALSE;
+        }
+    }
+
     g_program = oglu_build_program(LOMHD_VERT, LOMHD_FRAG, TRUE);
 
     if (!g_program)
     {
+        g_gl_missing = "the overlay shader (it did not compile or link)";
         g_gl_failed = TRUE;
+        SetEvent(g_worker_wake);
         return FALSE;
     }
 
@@ -402,12 +452,13 @@ void lomhd_draw(void)
     if (!g_rgba)
         return;
 
-    GLint old_program, old_vao, old_active, old_tex;
-    glGetIntegerv(GL_CURRENT_PROGRAM, &old_program);
-    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &old_vao);
-    glGetIntegerv(GL_ACTIVE_TEXTURE, &old_active);
+    GLint old_program, old_vao, old_active, old_tex, old_array_buffer;
+    lomhd_glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_array_buffer);
+    lomhd_glGetIntegerv(GL_CURRENT_PROGRAM, &old_program);
+    lomhd_glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &old_vao);
+    lomhd_glGetIntegerv(GL_ACTIVE_TEXTURE, &old_active);
     glActiveTexture(GL_TEXTURE0);
-    glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_tex);
+    lomhd_glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_tex);
 
     glUseProgram(g_program);
     glUniform1i(g_tex_loc, 0);
@@ -445,6 +496,7 @@ void lomhd_draw(void)
     }
 
     glBindVertexArray(old_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, old_array_buffer);
     glBindTexture(GL_TEXTURE_2D, old_tex);
     glActiveTexture(old_active);
     glUseProgram(old_program);
