@@ -358,3 +358,4 @@ __pycache__/
 # !tools/packages.config
 ddraw_syms.dll
 tests/*.exe
+*.d

@@ -35,6 +35,11 @@ WINDRES  ?= i686-w64-mingw32-windres
 SRCS     := $(wildcard src/*.c) $(wildcard src/*/*.c) res.rc
 OBJS     := $(addsuffix .o, $(basename $(SRCS)))
 
+# Rebuild an object when a header it includes changes. Without this, adding a field to a struct
+# in inc/lomhd_match.h rebuilt only lomhd_match.o, and the DLL linked two layouts of one struct.
+CFLAGS   += -MMD -MP
+DEPS     := $(OBJS:.o=.d)
+
 .PHONY: clean all
 all: $(TARGET)
 
@@ -45,4 +50,7 @@ $(TARGET): $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ exports.def $(LIBS)
 
 clean:
-	$(RM) $(TARGET) $(OBJS) || del $(TARGET) $(subst /,\\,$(OBJS))
+	$(RM) $(TARGET) $(OBJS) $(DEPS) || del $(TARGET) $(subst /,\\,$(OBJS))
+
+# Last, so a dependency file's targets never become the default goal.
+-include $(DEPS)
