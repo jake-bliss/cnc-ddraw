@@ -40,6 +40,16 @@ static LOMHD_PACK g_pack;
 
 static PLACEMENT g_placements[LOMHD_MAX_PLACEMENTS];
 static int g_placement_count;
+
+/* What lomhd_draw draws, built by lomhd_scan while g_ddraw.cs is held. The draw runs after the
+ * renderer has RELEASED that lock, and cnc-ddraw frees the primary's buffer when the game releases
+ * the surface -- so the draw must never read the game's frame or surface. It reads only these.
+ * (Found by cross-model review, 2026-09-22: the first version built them inside the draw.) */
+#define LOMHD_MAX_HD_PIXELS (512 * 512)
+static DWORD* g_slot_rgba[LOMHD_MAX_PLACEMENTS];
+static int g_slot_w[LOMHD_MAX_PLACEMENTS], g_slot_h[LOMHD_MAX_PLACEMENTS];
+static float g_quad[LOMHD_MAX_PLACEMENTS][4];      /* x0, y0, x1, y1 in NDC */
+static int g_slot_count;
 static PLACEMENT g_seen[LOMHD_MAX_PLACEMENTS];   /* snapshot for the worker to log */
 static int g_seen_count;
 
@@ -280,6 +290,30 @@ static DWORD WINAPI lomhd_worker(LPVOID unused)
 /* Matching (render thread, g_ddraw.cs held -- memory only)                                    */
 /* ------------------------------------------------------------------------------------------- */
 
+/* The upscale as RGBA, with alpha cleared wherever the frame no longer shows the original pixel
+ * at that position -- the cursor, a tooltip, a dialog edge drawn on top. Each original pixel
+ * decides the upscale pixels that cover it. */
+static void build_masked_rgba(const PLACEMENT* p, const WORD* frame, int pitch_px, DWORD* out)
+{
+    const PORTRAIT* r = &g_pack.portraits[p->portrait];
+    const WORD* t = r->templ[p->rule];
+
+    for (int y = 0; y < r->hh; y++)
+    {
+        int sy = y * r->h / r->hh;
+        const WORD* frame_row = frame + (p->y + sy) * pitch_px + p->x;
+
+        for (int x = 0; x < r->hw; x++)
+        {
+            int sx = x * r->w / r->hw;
+            const BYTE* c = r->hd_pal + r->hd_idx[y * r->hw + x] * 3;
+            BOOL visible = frame_row[sx] == t[sy * r->w + sx];
+
+            out[y * r->hw + x] = (visible ? 0xFF000000u : 0) | (c[2] << 16) | (c[1] << 8) | c[0];
+        }
+    }
+}
+
 static void lomhd_scan(void)
 {
     IDirectDrawSurfaceImpl* primary = g_ddraw.primary;
@@ -287,13 +321,18 @@ static void lomhd_scan(void)
     if (!primary || primary->bpp != 16 || !g_pack_ready)
     {
         g_placement_count = 0;
+        g_slot_count = 0;
         return;
     }
 
     const WORD* frame = dds_GetBuffer(primary);
 
     if (!frame)
+    {
+        g_placement_count = 0;
+        g_slot_count = 0;
         return;
+    }
 
     PLACEMENT result[LOMHD_MAX_PLACEMENTS];
     int found = lomhd_find(&g_pack, frame, primary->width, primary->height, primary->pitch / 2,
@@ -306,6 +345,34 @@ static void lomhd_scan(void)
 
     memcpy(g_placements, result, sizeof(PLACEMENT) * found);
     g_placement_count = found;
+
+    int slots = 0;
+    float fw = (float)primary->width, fh = (float)primary->height;
+
+    for (int i = 0; i < found; i++)
+    {
+        const PORTRAIT* r = &g_pack.portraits[result[i].portrait];
+
+        if (r->hw * r->hh > LOMHD_MAX_HD_PIXELS)
+            continue;
+
+        if (!g_slot_rgba[slots])
+            g_slot_rgba[slots] = HeapAlloc(GetProcessHeap(), 0, LOMHD_MAX_HD_PIXELS * 4);
+
+        if (!g_slot_rgba[slots])
+            break;
+
+        build_masked_rgba(&result[i], frame, primary->pitch / 2, g_slot_rgba[slots]);
+        g_slot_w[slots] = r->hw;
+        g_slot_h[slots] = r->hh;
+        g_quad[slots][0] = result[i].x / fw * 2 - 1;
+        g_quad[slots][1] = 1 - result[i].y / fh * 2;
+        g_quad[slots][2] = (result[i].x + r->w) / fw * 2 - 1;
+        g_quad[slots][3] = 1 - (result[i].y + r->h) / fh * 2;
+        slots++;
+    }
+
+    g_slot_count = slots;
 
     if (changed)
     {
@@ -340,7 +407,6 @@ static GLuint g_program, g_vao, g_vbo, g_ebo, g_tex[LOMHD_MAX_PLACEMENTS];
 static PFNGLGETINTEGERVPROC lomhd_glGetIntegerv;
 static GLint g_pos_loc, g_uv_loc, g_tex_loc;
 static BOOL g_gl_failed;
-static DWORD* g_rgba;
 
 static BOOL lomhd_gl_init(void)
 {
@@ -426,46 +492,11 @@ static BOOL lomhd_gl_init(void)
     return TRUE;
 }
 
-/* The upscale as RGBA, with alpha cleared wherever the frame no longer shows the original pixel
- * at that position -- the cursor, a tooltip, a dialog edge drawn on top. Each original pixel
- * decides the upscale pixels that cover it. */
-static void build_masked_rgba(const PLACEMENT* p, const WORD* frame, int pitch_px)
-{
-    const PORTRAIT* r = &g_pack.portraits[p->portrait];
-    const WORD* t = r->templ[p->rule];
-
-    for (int y = 0; y < r->hh; y++)
-    {
-        int sy = y * r->h / r->hh;
-        const WORD* frame_row = frame + (p->y + sy) * pitch_px + p->x;
-
-        for (int x = 0; x < r->hw; x++)
-        {
-            int sx = x * r->w / r->hw;
-            const BYTE* c = r->hd_pal + r->hd_idx[y * r->hw + x] * 3;
-            BOOL visible = frame_row[sx] == t[sy * r->w + sx];
-
-            g_rgba[y * r->hw + x] = (visible ? 0xFF000000u : 0) | (c[2] << 16) | (c[1] << 8) | c[0];
-        }
-    }
-}
-
 void lomhd_draw(void)
 {
-    IDirectDrawSurfaceImpl* primary = g_ddraw.primary;
-
-    if (!g_placement_count || !primary || !lomhd_gl_init())
-        return;
-
-    const WORD* frame = dds_GetBuffer(primary);
-
-    if (!frame)
-        return;
-
-    if (!g_rgba)
-        g_rgba = HeapAlloc(GetProcessHeap(), 0, 512 * 512 * 4);
-
-    if (!g_rgba)
+    /* Runs WITHOUT g_ddraw.cs: reads only the slots lomhd_scan built under it, on this same render
+     * thread, never the game's surface. */
+    if (!g_slot_count || !lomhd_gl_init())
         return;
 
     GLint old_program, old_vao, old_active, old_tex, old_array_buffer;
@@ -481,25 +512,14 @@ void lomhd_draw(void)
     glBindVertexArray(g_vao);
     glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
 
-    float fw = (float)primary->width, fh = (float)primary->height;
-
-    for (int i = 0; i < g_placement_count; i++)
+    for (int i = 0; i < g_slot_count; i++)
     {
-        const PLACEMENT* p = &g_placements[i];
-        const PORTRAIT* r = &g_pack.portraits[p->portrait];
-
-        if (r->hw * r->hh > 512 * 512)
-            continue;
-
-        build_masked_rgba(p, frame, primary->pitch / 2);
-
         glBindTexture(GL_TEXTURE_2D, g_tex[i]);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, r->hw, r->hh, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_rgba);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_slot_w[i], g_slot_h[i], 0, GL_RGBA,
+            GL_UNSIGNED_BYTE, g_slot_rgba[i]);
 
-        /* Frame coordinates to the viewport cnc-ddraw set for the scaled frame. Texture row 0 is
-         * the top of the picture, the same convention cnc-ddraw uses for the frame itself. */
-        float x0 = p->x / fw * 2 - 1, x1 = (p->x + r->w) / fw * 2 - 1;
-        float y0 = 1 - p->y / fh * 2, y1 = 1 - (p->y + r->h) / fh * 2;
+        /* Texture row 0 is the top of the picture, the convention cnc-ddraw uses for the frame. */
+        float x0 = g_quad[i][0], y0 = g_quad[i][1], x1 = g_quad[i][2], y1 = g_quad[i][3];
         GLfloat quad[16] = {
             x0, y0, 0, 0,
             x1, y0, 1, 0,

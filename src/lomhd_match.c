@@ -53,15 +53,19 @@ BOOL lomhd_pack_parse(const BYTE* data, DWORD size, LOMHD_PACK* pack, DWORD* bad
     if (size < 12 || memcmp(data, "LOMHDPK1", 8) != 0)
         return FALSE;
 
-    int count = *(const DWORD*)(data + 8);
+    DWORD raw_count = *(const DWORD*)(data + 8);
 
     /* 748 x 2 rules x LOMHD_PROBES entries must leave the table well under half full, or every
-     * miss walks a long probe chain on every pixel of every frame. */
-    if (count <= 0 || count * 2 * LOMHD_PROBES > LOMHD_TABLE / 2)
+     * miss walks a long probe chain on every pixel of every frame. Compared in 64 bits: the pack
+     * is untrusted input, and a huge count would overflow the multiply and pass the check.
+     * (Found by cross-model review, 2026-09-22.) */
+    if (raw_count == 0 || (unsigned long long)raw_count * 2 * LOMHD_PROBES > LOMHD_TABLE / 2)
     {
         *bad_offset = 8;
         return FALSE;
     }
+
+    int count = (int)raw_count;
 
     pack->portraits = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(PORTRAIT) * count);
     pack->table = HeapAlloc(GetProcessHeap(), 0, sizeof(PROBE) * LOMHD_TABLE);
@@ -92,7 +96,9 @@ BOOL lomhd_pack_parse(const BYTE* data, DWORD size, LOMHD_PACK* pack, DWORD* bad
             const BYTE* pal = data + pos + 4;
             const BYTE* idx = pal + 768;
 
-            if (w <= 0 || h <= 0 || pos + 4 + 768 + (DWORD)(w * h) > size)
+            /* 64-bit: w and h are 16-bit, so w * h reaches 2^32 and would wrap a DWORD. */
+            if (w <= 0 || h <= 0 ||
+                (unsigned long long)pos + 4 + 768 + (unsigned long long)w * h > size)
                 goto corrupt;
 
             pos += 4 + 768 + w * h;
