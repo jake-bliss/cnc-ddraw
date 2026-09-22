@@ -23,6 +23,12 @@
 static HANDLE g_worker_wake;
 static volatile LONG g_frames, g_want_frame, g_frame_ready, g_pack_ready;
 static volatile LONG g_seen_seq;
+
+/* Debug mode: a file named `lomhd_debug` beside lomse.exe when the game starts. Players get three
+ * kinds of log line -- the pack loaded, the overlay turned itself off, or an error. Debug adds the
+ * detection record, a five-second watchdog and the `lomhd_dump` frame trigger: the instruments
+ * that found every problem in this file, kept for the next platform it has to be proven on. */
+static volatile LONG g_debug;
 static volatile const char* g_renderer;
 static volatile const char* g_gl_missing;   /* set by the render thread, logged by the worker */
 
@@ -172,6 +178,15 @@ static DWORD WINAPI lomhd_worker(LPVOID unused)
 {
     (void)unused;
 
+    char debug_flag[MAX_PATH];
+    lomhd_path(debug_flag, sizeof(debug_flag), "lomhd_debug");
+
+    if (GetFileAttributesA(debug_flag) != INVALID_FILE_ATTRIBUTES)
+    {
+        InterlockedExchange(&g_debug, 1);
+        lomhd_log("debug: on (lomhd_debug present)");
+    }
+
     if (lomhd_load_pack())
         InterlockedExchange(&g_pack_ready, 1);
 
@@ -187,15 +202,16 @@ static DWORD WINAPI lomhd_worker(LPVOID unused)
 
         const char* renderer = (const char*)g_renderer;
 
-        if (renderer != reported_renderer)
+        if (renderer != reported_renderer && (g_debug || reported_renderer))
         {
             char line[160];
             _snprintf(line, sizeof(line), "renderer: %s%s", renderer ? renderer : "?",
                 reported_renderer ? " (CHANGED)" : "");
             line[sizeof(line) - 1] = 0;
             lomhd_log(line);
-            reported_renderer = renderer;
         }
+
+        reported_renderer = renderer;
 
         if (InterlockedCompareExchange(&g_frame_ready, 0, 1) == 1)
             lomhd_write_frame();
@@ -215,7 +231,7 @@ static DWORD WINAPI lomhd_worker(LPVOID unused)
         /* What the matcher sees, logged only when it changes: this is the acceptance record. */
         LONG seq = g_seen_seq;
 
-        if (seq != logged_seq)
+        if (seq != logged_seq && g_debug)
         {
             PLACEMENT seen[LOMHD_MAX_PLACEMENTS];
             int n;
@@ -241,7 +257,7 @@ static DWORD WINAPI lomhd_worker(LPVOID unused)
             logged_seq = seq;
         }
 
-        if (GetFileAttributesA(trigger) != INVALID_FILE_ATTRIBUTES)
+        if (g_debug && GetFileAttributesA(trigger) != INVALID_FILE_ATTRIBUTES)
         {
             DeleteFileA(trigger);
             InterlockedExchange(&g_want_frame, 1);
@@ -249,7 +265,7 @@ static DWORD WINAPI lomhd_worker(LPVOID unused)
 
         DWORD now = GetTickCount();
 
-        if (now - last_report >= 5000)
+        if (g_debug && now - last_report >= 5000)
         {
             lomhd_logf("watchdog: frames=%ld want_frame=%ld pack=%ld",
                 InterlockedExchange(&g_frames, 0), g_want_frame, g_pack_ready);
@@ -553,7 +569,8 @@ void lomhd_on_frame(const char* renderer)
     InterlockedIncrement(&g_frames);
     lomhd_copy_frame_if_wanted();
 
-    /* A frame that has not changed cannot have moved a portrait, so it keeps the last scan. */
-    if (g_ddraw.render.surface_updated || !g_placement_count)
+    /* Only the OpenGL renderer can draw the overlay, so only it pays for the scan. A frame that
+     * has not changed cannot have moved a portrait, so it keeps the last scan. */
+    if (strcmp(renderer, "opengl") == 0 && (g_ddraw.render.surface_updated || !g_placement_count))
         lomhd_scan();
 }
