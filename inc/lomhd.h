@@ -7,4 +7,7 @@
 /* Called by the renderer with g_ddraw.cs held, once per rendered frame. */
 void lomhd_on_frame(const char* renderer);
 
+/* Called by the OpenGL renderer after it has drawn the scaled frame, before SwapBuffers. */
+void lomhd_draw(void);
+
 #endif

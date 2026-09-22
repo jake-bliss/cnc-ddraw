@@ -3,28 +3,44 @@
 #include <string.h>
 #include "dd.h"
 #include "ddsurface.h"
+#include "opengl_utils.h"
 #include "lomhd.h"
+#include "lomhd_match.h"
 
-/* Lords of Magic HD overlay -- development instrument, stage 1.
+/* Lords of Magic HD overlay.
  *
- * THE ONE RULE: the render thread never touches a file. It holds g_ddraw.cs while it calls
- * lomhd_on_frame, and the first version of this file did its logging and its screenshots right
- * there. Under Wine that wedged both the render thread and a second thread writing the same log,
- * after a dozen dumps, while the game carried on. So the render thread only counts frames and,
- * when asked, copies the frame into memory. One worker thread owns every file operation: it polls
- * for the trigger, writes the frame dumps, and writes every log line. */
+ * The game draws at 640x480 in 16 bpp, exactly as it always has. This finds portraits in the
+ * finished frame and draws their upscaled versions over them after cnc-ddraw has scaled the frame
+ * to the window. Nothing in lomse.exe is hooked: a portrait is recognised by its pixels, which the
+ * engine copies into the frame as exact RGB565 values -- Observed 2026-09-22 for both the native
+ * bottom-strip slot and the script-drawn info panel, 100% of pixels. So detection covers every
+ * place a portrait can appear, including ones no script names.
+ *
+ * THE ONE RULE: the render thread never touches a file. It holds g_ddraw.cs whenever it calls in
+ * here, and doing file I/O there wedged the render thread under Wine in an early build. The render
+ * thread scans, copies and draws; one worker thread owns every file operation. */
 
-static HANDLE g_worker_wake;           /* set by the render thread when a frame copy is ready */
-static volatile LONG g_frames;         /* frames seen since the worker last reported */
-static volatile LONG g_want_frame;     /* worker -> render thread: copy the next frame */
-static volatile LONG g_frame_ready;    /* render thread -> worker: the copy below is complete */
+static HANDLE g_worker_wake;
+static volatile LONG g_frames, g_want_frame, g_frame_ready, g_pack_ready;
+static volatile LONG g_seen_seq;
 static volatile const char* g_renderer;
 
-static BYTE* g_frame;                  /* one frame, tightly packed, owned by whoever holds the flag */
+static BYTE* g_frame;
 static DWORD g_frame_w, g_frame_h, g_frame_bpp;
 
-/* Paths resolve from lomse.exe's own directory, never the working directory: an early build used
- * a relative path and its trigger was never seen. */
+static BYTE* g_pack_bytes;
+static LOMHD_PACK g_pack;
+
+static PLACEMENT g_placements[LOMHD_MAX_PLACEMENTS];
+static int g_placement_count;
+static PLACEMENT g_seen[LOMHD_MAX_PLACEMENTS];   /* snapshot for the worker to log */
+static int g_seen_count;
+
+
+/* ------------------------------------------------------------------------------------------- */
+/* Files (worker thread only)                                                                  */
+/* ------------------------------------------------------------------------------------------- */
+
 static void lomhd_path(char* out, size_t size, const char* name)
 {
     char exe[MAX_PATH];
@@ -44,7 +60,6 @@ static void lomhd_path(char* out, size_t size, const char* name)
     out[size - 1] = 0;
 }
 
-/* Worker thread only. Shared read AND write, so a reader on either side can never block it. */
 static void lomhd_log(const char* line)
 {
     char path[MAX_PATH];
@@ -71,9 +86,14 @@ static void lomhd_log(const char* line)
     CloseHandle(f);
 }
 
-/* Worker thread only. Format: "LOMHDRAW", then u32 width, height, bits per pixel, then the pixels,
- * rows packed with no padding. Raw rather than PNG so an analysis reads the exact frame values
- * with no decoder in between. */
+static void lomhd_logf(const char* fmt, long a, long b, long c)
+{
+    char line[200];
+    _snprintf(line, sizeof(line), fmt, a, b, c);
+    line[sizeof(line) - 1] = 0;
+    lomhd_log(line);
+}
+
 static void lomhd_write_frame(void)
 {
     SYSTEMTIME t;
@@ -96,26 +116,66 @@ static void lomhd_write_frame(void)
     }
 
     DWORD header[3] = { g_frame_w, g_frame_h, g_frame_bpp };
-    DWORD bytes = g_frame_w * g_frame_h * (g_frame_bpp / 8);
     DWORD written;
 
     WriteFile(f, "LOMHDRAW", 8, &written, NULL);
     WriteFile(f, header, sizeof(header), &written, NULL);
-    WriteFile(f, g_frame, bytes, &written, NULL);
+    WriteFile(f, g_frame, g_frame_w * g_frame_h * (g_frame_bpp / 8), &written, NULL);
     CloseHandle(f);
 
     char line[160];
-    _snprintf(line, sizeof(line), "frame: wrote %s (%lux%lu, %lu bpp)",
-        name, g_frame_w, g_frame_h, g_frame_bpp);
+    _snprintf(line, sizeof(line), "frame: wrote %s", name);
     line[sizeof(line) - 1] = 0;
     lomhd_log(line);
 }
+
+/* ------------------------------------------------------------------------------------------- */
+/* The portrait pack (worker thread, once)                                                     */
+/* ------------------------------------------------------------------------------------------- */
+
+static BOOL lomhd_load_pack(void)
+{
+    char path[MAX_PATH];
+    lomhd_path(path, sizeof(path), "lomhd_portraits.pack");
+
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+
+    if (f == INVALID_HANDLE_VALUE)
+    {
+        lomhd_log("pack: lomhd_portraits.pack not found -- overlay off, game unchanged");
+        return FALSE;
+    }
+
+    DWORD size = GetFileSize(f, NULL), got = 0, bad = 0;
+    g_pack_bytes = HeapAlloc(GetProcessHeap(), 0, size ? size : 1);
+    BOOL ok = g_pack_bytes && ReadFile(f, g_pack_bytes, size, &got, NULL) && got == size;
+    CloseHandle(f);
+
+    if (!ok || !lomhd_pack_parse(g_pack_bytes, size, &g_pack, &bad))
+    {
+        lomhd_logf("pack: unreadable or corrupt near byte %ld of %ld -- overlay off",
+            (long)bad, (long)size, 0);
+        return FALSE;
+    }
+
+    lomhd_logf("pack: %ld portraits loaded, %ld bytes, probe width %ld",
+        g_pack.count, (long)size, g_pack.probe_width);
+    return TRUE;
+}
+
+/* ------------------------------------------------------------------------------------------- */
+/* Worker                                                                                      */
+/* ------------------------------------------------------------------------------------------- */
 
 static DWORD WINAPI lomhd_worker(LPVOID unused)
 {
     (void)unused;
 
+    if (lomhd_load_pack())
+        InterlockedExchange(&g_pack_ready, 1);
+
     DWORD last_report = GetTickCount();
+    LONG logged_seq = 0;
     const char* reported_renderer = NULL;
     char trigger[MAX_PATH];
     lomhd_path(trigger, sizeof(trigger), "lomhd_dump");
@@ -139,6 +199,35 @@ static DWORD WINAPI lomhd_worker(LPVOID unused)
         if (InterlockedCompareExchange(&g_frame_ready, 0, 1) == 1)
             lomhd_write_frame();
 
+        /* What the matcher sees, logged only when it changes: this is the acceptance record. */
+        LONG seq = g_seen_seq;
+
+        if (seq != logged_seq)
+        {
+            PLACEMENT seen[LOMHD_MAX_PLACEMENTS];
+            int n;
+
+            EnterCriticalSection(&g_ddraw.cs);
+            n = g_seen_count;
+            memcpy(seen, g_seen, sizeof(seen));
+            LeaveCriticalSection(&g_ddraw.cs);
+
+            if (n == 0)
+                lomhd_log("seen: no portraits");
+
+            for (int i = 0; i < n; i++)
+            {
+                char line[160];
+                _snprintf(line, sizeof(line), "seen: %s at (%d,%d) %s",
+                    g_pack.portraits[seen[i].portrait].name, seen[i].x, seen[i].y,
+                    seen[i].rule ? "round" : "truncate");
+                line[sizeof(line) - 1] = 0;
+                lomhd_log(line);
+            }
+
+            logged_seq = seq;
+        }
+
         if (GetFileAttributesA(trigger) != INVALID_FILE_ATTRIBUTES)
         {
             DeleteFileA(trigger);
@@ -149,11 +238,8 @@ static DWORD WINAPI lomhd_worker(LPVOID unused)
 
         if (now - last_report >= 5000)
         {
-            char line[96];
-            _snprintf(line, sizeof(line), "watchdog: frames=%ld want_frame=%ld",
-                InterlockedExchange(&g_frames, 0), g_want_frame);
-            line[sizeof(line) - 1] = 0;
-            lomhd_log(line);
+            lomhd_logf("watchdog: frames=%ld want_frame=%ld pack=%ld",
+                InterlockedExchange(&g_frames, 0), g_want_frame, g_pack_ready);
             last_report = now;
         }
     }
@@ -161,7 +247,213 @@ static DWORD WINAPI lomhd_worker(LPVOID unused)
     return 0;
 }
 
-/* Render thread, g_ddraw.cs held. Memory only: no file, no log, no allocation after the first. */
+/* ------------------------------------------------------------------------------------------- */
+/* Matching (render thread, g_ddraw.cs held -- memory only)                                    */
+/* ------------------------------------------------------------------------------------------- */
+
+static void lomhd_scan(void)
+{
+    IDirectDrawSurfaceImpl* primary = g_ddraw.primary;
+
+    if (!primary || primary->bpp != 16 || !g_pack_ready)
+    {
+        g_placement_count = 0;
+        return;
+    }
+
+    const WORD* frame = dds_GetBuffer(primary);
+
+    if (!frame)
+        return;
+
+    PLACEMENT result[LOMHD_MAX_PLACEMENTS];
+    int found = lomhd_find(&g_pack, frame, primary->width, primary->height, primary->pitch / 2,
+        result, LOMHD_MAX_PLACEMENTS);
+
+    BOOL changed = found != g_seen_count;
+
+    for (int k = 0; k < found && !changed; k++)
+        changed = memcmp(&result[k], &g_seen[k], sizeof(PLACEMENT)) != 0;
+
+    memcpy(g_placements, result, sizeof(PLACEMENT) * found);
+    g_placement_count = found;
+
+    if (changed)
+    {
+        memcpy(g_seen, result, sizeof(PLACEMENT) * found);
+        g_seen_count = found;
+        InterlockedIncrement(&g_seen_seq);
+        SetEvent(g_worker_wake);
+    }
+}
+
+/* ------------------------------------------------------------------------------------------- */
+/* Drawing (render thread, g_ddraw.cs held, the GL context current)                            */
+/* ------------------------------------------------------------------------------------------- */
+
+static char LOMHD_VERT[] =
+    "#version 150\n"
+    "in vec2 pos;\n"
+    "in vec2 uv;\n"
+    "out vec2 tc;\n"
+    "void main() { gl_Position = vec4(pos, 0.0, 1.0); tc = uv; }\n";
+
+/* Discard rather than blend: the texture's alpha is a 0/1 mask of which pixels still show the
+ * portrait, and discarding needs no blend state, which this context does not expose. */
+static char LOMHD_FRAG[] =
+    "#version 150\n"
+    "uniform sampler2D tex;\n"
+    "in vec2 tc;\n"
+    "out vec4 color;\n"
+    "void main() { vec4 c = texture(tex, tc); if (c.a < 0.5) discard; color = vec4(c.rgb, 1.0); }\n";
+
+static GLuint g_program, g_vao, g_vbo, g_ebo, g_tex[LOMHD_MAX_PLACEMENTS];
+static GLint g_pos_loc, g_uv_loc, g_tex_loc;
+static BOOL g_gl_failed;
+static DWORD* g_rgba;
+
+static BOOL lomhd_gl_init(void)
+{
+    if (g_program || g_gl_failed)
+        return g_program != 0;
+
+    g_program = oglu_build_program(LOMHD_VERT, LOMHD_FRAG, TRUE);
+
+    if (!g_program)
+    {
+        g_gl_failed = TRUE;
+        return FALSE;
+    }
+
+    g_pos_loc = glGetAttribLocation(g_program, "pos");
+    g_uv_loc = glGetAttribLocation(g_program, "uv");
+    g_tex_loc = glGetUniformLocation(g_program, "tex");
+
+    static const GLushort indices[6] = { 0, 1, 2, 0, 2, 3 };
+
+    glGenVertexArrays(1, &g_vao);
+    glBindVertexArray(g_vao);
+    glGenBuffers(1, &g_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(GLfloat) * 16, NULL, GL_DYNAMIC_DRAW);
+    glVertexAttribPointer(g_pos_loc, 2, GL_FLOAT, GL_FALSE, sizeof(GLfloat) * 4, (void*)0);
+    glEnableVertexAttribArray(g_pos_loc);
+    glVertexAttribPointer(g_uv_loc, 2, GL_FLOAT, GL_FALSE, sizeof(GLfloat) * 4,
+        (void*)(sizeof(GLfloat) * 2));
+    glEnableVertexAttribArray(g_uv_loc);
+    glGenBuffers(1, &g_ebo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
+    glBindVertexArray(0);
+
+    glGenTextures(LOMHD_MAX_PLACEMENTS, g_tex);
+
+    for (int i = 0; i < LOMHD_MAX_PLACEMENTS; i++)
+    {
+        glBindTexture(GL_TEXTURE_2D, g_tex[i]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+
+    return TRUE;
+}
+
+/* The upscale as RGBA, with alpha cleared wherever the frame no longer shows the original pixel
+ * at that position -- the cursor, a tooltip, a dialog edge drawn on top. Each original pixel
+ * decides the upscale pixels that cover it. */
+static void build_masked_rgba(const PLACEMENT* p, const WORD* frame, int pitch_px)
+{
+    const PORTRAIT* r = &g_pack.portraits[p->portrait];
+    const WORD* t = r->templ[p->rule];
+
+    for (int y = 0; y < r->hh; y++)
+    {
+        int sy = y * r->h / r->hh;
+        const WORD* frame_row = frame + (p->y + sy) * pitch_px + p->x;
+
+        for (int x = 0; x < r->hw; x++)
+        {
+            int sx = x * r->w / r->hw;
+            const BYTE* c = r->hd_pal + r->hd_idx[y * r->hw + x] * 3;
+            BOOL visible = frame_row[sx] == t[sy * r->w + sx];
+
+            g_rgba[y * r->hw + x] = (visible ? 0xFF000000u : 0) | (c[2] << 16) | (c[1] << 8) | c[0];
+        }
+    }
+}
+
+void lomhd_draw(void)
+{
+    IDirectDrawSurfaceImpl* primary = g_ddraw.primary;
+
+    if (!g_placement_count || !primary || !lomhd_gl_init())
+        return;
+
+    const WORD* frame = dds_GetBuffer(primary);
+
+    if (!frame)
+        return;
+
+    if (!g_rgba)
+        g_rgba = HeapAlloc(GetProcessHeap(), 0, 512 * 512 * 4);
+
+    if (!g_rgba)
+        return;
+
+    GLint old_program, old_vao, old_active, old_tex;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &old_program);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &old_vao);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &old_active);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_tex);
+
+    glUseProgram(g_program);
+    glUniform1i(g_tex_loc, 0);
+    glBindVertexArray(g_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+
+    float fw = (float)primary->width, fh = (float)primary->height;
+
+    for (int i = 0; i < g_placement_count; i++)
+    {
+        const PLACEMENT* p = &g_placements[i];
+        const PORTRAIT* r = &g_pack.portraits[p->portrait];
+
+        if (r->hw * r->hh > 512 * 512)
+            continue;
+
+        build_masked_rgba(p, frame, primary->pitch / 2);
+
+        glBindTexture(GL_TEXTURE_2D, g_tex[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, r->hw, r->hh, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_rgba);
+
+        /* Frame coordinates to the viewport cnc-ddraw set for the scaled frame. Texture row 0 is
+         * the top of the picture, the same convention cnc-ddraw uses for the frame itself. */
+        float x0 = p->x / fw * 2 - 1, x1 = (p->x + r->w) / fw * 2 - 1;
+        float y0 = 1 - p->y / fh * 2, y1 = 1 - (p->y + r->h) / fh * 2;
+        GLfloat quad[16] = {
+            x0, y0, 0, 0,
+            x1, y0, 1, 0,
+            x1, y1, 1, 1,
+            x0, y1, 0, 1,
+        };
+
+        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(quad), quad);
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
+    }
+
+    glBindVertexArray(old_vao);
+    glBindTexture(GL_TEXTURE_2D, old_tex);
+    glActiveTexture(old_active);
+    glUseProgram(old_program);
+}
+
+/* ------------------------------------------------------------------------------------------- */
+/* Per frame (render thread, g_ddraw.cs held)                                                  */
+/* ------------------------------------------------------------------------------------------- */
+
 static void lomhd_copy_frame_if_wanted(void)
 {
     if (!g_want_frame || g_frame_ready)
@@ -172,8 +464,7 @@ static void lomhd_copy_frame_if_wanted(void)
     if (!primary)
         return;
 
-    DWORD bytes_pp = primary->bytes_pp;
-    DWORD row = primary->width * bytes_pp;
+    DWORD row = primary->width * primary->bytes_pp;
 
     if (!g_frame)
         g_frame = HeapAlloc(GetProcessHeap(), 0, 1920 * 1440 * 4);
@@ -191,7 +482,7 @@ static void lomhd_copy_frame_if_wanted(void)
 
     g_frame_w = primary->width;
     g_frame_h = primary->height;
-    g_frame_bpp = bytes_pp * 8;
+    g_frame_bpp = primary->bytes_pp * 8;
 
     InterlockedExchange(&g_want_frame, 0);
     InterlockedExchange(&g_frame_ready, 1);
@@ -209,4 +500,8 @@ void lomhd_on_frame(const char* renderer)
     g_renderer = renderer;
     InterlockedIncrement(&g_frames);
     lomhd_copy_frame_if_wanted();
+
+    /* A frame that has not changed cannot have moved a portrait, so it keeps the last scan. */
+    if (g_ddraw.render.surface_updated || !g_placement_count)
+        lomhd_scan();
 }

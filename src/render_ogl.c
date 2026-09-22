@@ -1377,6 +1377,8 @@ static void ogl_render()
             glEnd();
         }
 
+        lomhd_draw();
+
         if (g_ddraw.bnet_active)
             glClear(GL_COLOR_BUFFER_BIT);
 
