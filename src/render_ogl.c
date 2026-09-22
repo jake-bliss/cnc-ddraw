@@ -8,6 +8,7 @@
 #include "openglshader.h"
 #include "render_gdi.h"
 #include "render_ogl.h"
+#include "lomhd.h"
 #include "utils.h"
 #include "debug.h"
 
@@ -1016,6 +1017,8 @@ static void ogl_render()
         fpsl_frame_start();
 
         EnterCriticalSection(&g_ddraw.cs);
+
+        lomhd_on_frame("opengl");
 
         if (g_ddraw.primary && 
             g_ddraw.primary->bpp == g_ddraw.bpp &&

@@ -1,3 +1,4 @@
+#include "lomhd.h"
 #include <windows.h>
 #include <stdio.h>
 #include "fps_limiter.h"
@@ -51,6 +52,8 @@ DWORD WINAPI gdi_render_main(void)
         fpsl_frame_start();
 
         EnterCriticalSection(&g_ddraw.cs);
+
+        lomhd_on_frame("gdi");
 
         if (g_ddraw.primary && 
             g_ddraw.primary->bpp == g_ddraw.bpp &&

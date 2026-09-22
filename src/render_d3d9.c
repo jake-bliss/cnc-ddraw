@@ -1,3 +1,4 @@
+#include "lomhd.h"
 #include <windows.h>
 #include <stdio.h>
 #include <d3d9.h>
@@ -596,6 +597,8 @@ DWORD WINAPI d3d9_render_main(void)
         fpsl_frame_start();
 
         EnterCriticalSection(&g_ddraw.cs);
+
+        lomhd_on_frame("d3d9");
 
         if (g_ddraw.primary && 
             g_ddraw.primary->bpp == g_ddraw.bpp &&
