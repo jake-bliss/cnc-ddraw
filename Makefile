@@ -37,7 +37,8 @@ OBJS     := $(addsuffix .o, $(basename $(SRCS)))
 
 # Rebuild an object when a header it includes changes. Without this, adding a field to a struct
 # in inc/lomhd_match.h rebuilt only lomhd_match.o, and the DLL linked two layouts of one struct.
-CFLAGS   += -MMD -MP
+# `override`, so `make CFLAGS=...` on the command line cannot drop it. (Cross-model review.)
+override CFLAGS += -MMD -MP
 DEPS     := $(OBJS:.o=.d)
 
 .PHONY: clean all

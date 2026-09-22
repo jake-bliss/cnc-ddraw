@@ -93,6 +93,7 @@ int main(void)
      * record planted there makes the whole pack parse as valid. A small pack cannot show this --
      * an earlier version of this test used one and passed against the broken parser too. */
     BOOL built = FALSE;
+    DWORD hd1_pos_used = 0;
     for (DWORD H = 320; H < 400 && !built; H++)
     {
         DWORD orig_len = 4 + 768 + 70 * 67;
@@ -123,10 +124,24 @@ int main(void)
         BYTE zero = 0; put(&zero, 1); put_image(70, 67, 70 * 67); put_u16(fw); put_u16(fh);
         len = save;
         built = len == size;
+        hd1_pos_used = hd1_pos;
     }
     printf("%-60s %s\n", "(the wraparound pack could be built)", built ? "ok" : "FAIL");
     if (!built) failures++;
     expect("the review's wraparound pack is refused", FALSE);
+
+    /* ...and refused BY THE BOUNDS CHECK, at the start of the 65535x65535 image. The 512 cap would
+     * refuse this pack too, so a bare FALSE passed with the 64-bit check reverted: the 32-bit check
+     * let pos wrap, and the cap then refused it at the wrapped offset. (Cross-model review, second
+     * pass, 2026-09-22.) */
+    {
+        LOMHD_PACK pack; DWORD bad = 0;
+        BOOL got = lomhd_pack_parse(buf, len, &pack, &bad);
+        lomhd_pack_free(&pack);
+        BOOL right = !got && bad == hd1_pos_used;
+        printf("%-60s %s\n", "...refused at the oversized image, before pos can wrap", right ? "ok" : "FAIL");
+        if (!right) failures++;
+    }
 
     printf("%s\n", failures ? "FAILED" : "all passed");
     return failures ? 1 : 0;

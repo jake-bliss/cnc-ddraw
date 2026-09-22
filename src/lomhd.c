@@ -431,7 +431,12 @@ static GLint g_pos_loc, g_uv_loc, g_tex_loc;
 static BOOL g_gl_failed;
 static BOOL g_gl_failed_permanently;   /* a missing entry point does not come back */
 
-static BOOL lomhd_gl_init(void)
+/* Whether the current context can run the overlay at all. Decided BEFORE lomhd_draw queries any
+ * state: GL_VERTEX_ARRAY_BINDING is GL 3.0 state, and querying it in a 2.x context raises
+ * GL_INVALID_ENUM, which cnc-ddraw's first-ten-frames glGetError check in render_ogl.c reads as its
+ * own failure and turns the OpenGL renderer off -- the whole game, not just the overlay.
+ * (Found by cross-model review, second pass, 2026-09-22.) */
+static BOOL lomhd_gl_usable(void)
 {
     /* cnc-ddraw creates a fresh GL context every time its render thread starts -- window resize,
      * fullscreen toggle, display mode change -- and deletes the old one. Object names from the old
@@ -452,8 +457,19 @@ static BOOL lomhd_gl_init(void)
     if (g_program || g_gl_failed)
         return g_program != 0;
 
-    /* Every entry point used below, checked before the first call. A missing one turns the overlay
-     * off -- vanilla portraits -- and the worker logs which; it must never be a crash. */
+    /* glGetString(GL_VERSION) is valid in every context and needs no newer state to ask. */
+    const char* version = glGetString ? (const char*)glGetString(GL_VERSION) : NULL;
+
+    if (!version || version[0] < '3' || version[0] > '9')
+    {
+        g_gl_missing = "an OpenGL 3 context (this one is older)";
+        g_gl_failed = TRUE;
+        SetEvent(g_worker_wake);
+        return FALSE;
+    }
+
+    /* Every entry point lomhd_draw and lomhd_gl_init use, checked before the first call. A missing
+     * one turns the overlay off -- vanilla portraits -- and the worker logs which; never a crash. */
     struct { const char* name; void* fn; } needed[] = {
         { "glGetIntegerv", (void*)lomhd_glGetIntegerv }, { "glUseProgram", (void*)glUseProgram },
         { "glGetAttribLocation", (void*)glGetAttribLocation },
@@ -478,6 +494,15 @@ static BOOL lomhd_gl_init(void)
             return FALSE;
         }
     }
+
+    return TRUE;
+}
+
+/* Objects for the current context. lomhd_gl_usable has already vetted it. */
+static BOOL lomhd_gl_init(void)
+{
+    if (g_program || g_gl_failed)
+        return g_program != 0;
 
     g_program = oglu_build_program(LOMHD_VERT, LOMHD_FRAG, TRUE);
 
@@ -538,6 +563,9 @@ void lomhd_draw(void)
         SetEvent(g_worker_wake);
         return;
     }
+
+    if (!lomhd_gl_usable())
+        return;
 
     /* Captured BEFORE lomhd_gl_init, which binds objects of its own the first time it runs in a
      * context; capturing after it would "restore" lomhd's bindings instead of cnc-ddraw's. */
