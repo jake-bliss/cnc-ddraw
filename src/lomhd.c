@@ -45,7 +45,7 @@ static int g_placement_count;
  * renderer has RELEASED that lock, and cnc-ddraw frees the primary's buffer when the game releases
  * the surface -- so the draw must never read the game's frame or surface. It reads only these.
  * (Found by cross-model review, 2026-09-22: the first version built them inside the draw.) */
-#define LOMHD_MAX_HD_PIXELS (512 * 512)
+#define LOMHD_MAX_HD_PIXELS (LOMHD_MAX_HD_SIDE * LOMHD_MAX_HD_SIDE)
 static DWORD* g_slot_rgba[LOMHD_MAX_PLACEMENTS];
 static int g_slot_w[LOMHD_MAX_PLACEMENTS], g_slot_h[LOMHD_MAX_PLACEMENTS];
 static float g_quad[LOMHD_MAX_PLACEMENTS][4];      /* x0, y0, x1, y1 in NDC */
@@ -405,20 +405,52 @@ static char LOMHD_FRAG[] =
 
 static GLuint g_program, g_vao, g_vbo, g_ebo, g_tex[LOMHD_MAX_PLACEMENTS];
 static PFNGLGETINTEGERVPROC lomhd_glGetIntegerv;
+static HGLRC g_gl_context;              /* the context g_program and friends were created in */
+
+typedef HGLRC (WINAPI* PFNWGLGETCURRENTCONTEXT)(void);
+static PFNWGLGETCURRENTCONTEXT lomhd_wglGetCurrentContext;
+
+/* cnc-ddraw fetches glGetIntegerv through wglGetProcAddress, which returns NULL for a GL 1.1
+ * function on Wine, and guards its own use of it. The first live build did not: it called through
+ * NULL and crashed on the first portrait (EIP 0, GL_CURRENT_PROGRAM on the stack). GL 1.1 and wgl
+ * functions come from opengl32.dll itself. */
+static BOOL lomhd_resolve_basics(void)
+{
+    HMODULE gl = GetModuleHandleA("opengl32.dll");
+
+    if (!lomhd_glGetIntegerv)
+        lomhd_glGetIntegerv = glGetIntegerv ? glGetIntegerv :
+            (gl ? (PFNGLGETINTEGERVPROC)GetProcAddress(gl, "glGetIntegerv") : NULL);
+
+    if (!lomhd_wglGetCurrentContext && gl)
+        lomhd_wglGetCurrentContext = (PFNWGLGETCURRENTCONTEXT)GetProcAddress(gl, "wglGetCurrentContext");
+
+    return lomhd_glGetIntegerv && lomhd_wglGetCurrentContext;
+}
 static GLint g_pos_loc, g_uv_loc, g_tex_loc;
 static BOOL g_gl_failed;
+static BOOL g_gl_failed_permanently;   /* a missing entry point does not come back */
 
 static BOOL lomhd_gl_init(void)
 {
+    /* cnc-ddraw creates a fresh GL context every time its render thread starts -- window resize,
+     * fullscreen toggle, display mode change -- and deletes the old one. Object names from the old
+     * context mean nothing in the new one, and binding a stale texture name leaves cnc-ddraw's own
+     * frame texture bound, which the upload below would then redefine at portrait size. So the
+     * objects are owned by the context they were made in, and remade when it changes.
+     * (Found by cross-model review, 2026-09-22.) */
+    HGLRC current = lomhd_wglGetCurrentContext();
+
+    if (current != g_gl_context)
+    {
+        g_program = g_vao = g_vbo = g_ebo = 0;
+        memset(g_tex, 0, sizeof(g_tex));
+        g_gl_failed = FALSE;
+        g_gl_context = current;
+    }
+
     if (g_program || g_gl_failed)
         return g_program != 0;
-
-    /* cnc-ddraw fetches glGetIntegerv through wglGetProcAddress, which returns NULL for a GL 1.1
-     * function on Wine, and guards its own use of it. The first version of this file did not:
-     * it called straight through NULL and crashed the game the moment a portrait was found
-     * (EIP 0, GL_CURRENT_PROGRAM on the stack). A 1.1 function comes from opengl32.dll itself. */
-    lomhd_glGetIntegerv = glGetIntegerv ? glGetIntegerv :
-        (PFNGLGETINTEGERVPROC)GetProcAddress(GetModuleHandleA("opengl32.dll"), "glGetIntegerv");
 
     /* Every entry point used below, checked before the first call. A missing one turns the overlay
      * off -- vanilla portraits -- and the worker logs which; it must never be a crash. */
@@ -496,9 +528,19 @@ void lomhd_draw(void)
 {
     /* Runs WITHOUT g_ddraw.cs: reads only the slots lomhd_scan built under it, on this same render
      * thread, never the game's surface. */
-    if (!g_slot_count || !lomhd_gl_init())
+    if (!g_slot_count || g_gl_failed_permanently)
         return;
 
+    if (!lomhd_resolve_basics() || !glActiveTexture)
+    {
+        g_gl_missing = "glGetIntegerv, wglGetCurrentContext or glActiveTexture";
+        g_gl_failed_permanently = TRUE;
+        SetEvent(g_worker_wake);
+        return;
+    }
+
+    /* Captured BEFORE lomhd_gl_init, which binds objects of its own the first time it runs in a
+     * context; capturing after it would "restore" lomhd's bindings instead of cnc-ddraw's. */
     GLint old_program, old_vao, old_active, old_tex, old_array_buffer;
     lomhd_glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_array_buffer);
     lomhd_glGetIntegerv(GL_CURRENT_PROGRAM, &old_program);
@@ -506,6 +548,12 @@ void lomhd_draw(void)
     lomhd_glGetIntegerv(GL_ACTIVE_TEXTURE, &old_active);
     glActiveTexture(GL_TEXTURE0);
     lomhd_glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_tex);
+
+    if (!lomhd_gl_init())
+    {
+        glActiveTexture(old_active);
+        return;
+    }
 
     glUseProgram(g_program);
     glUniform1i(g_tex_loc, 0);

@@ -40,6 +40,7 @@ int main(int argc, char** argv)
         if (!f || fsize < 20 || memcmp(f, "LOMHDRAW", 8) != 0) { printf("%s: not a frame\n", argv[a]); continue; }
         DWORD w = *(DWORD*)(f + 8), h = *(DWORD*)(f + 12), bpp = *(DWORD*)(f + 16);
         if (bpp != 16) { printf("%s: %lu bpp, skipped\n", argv[a], bpp); continue; }
+        if ((unsigned long long)w * h * 2 + 20 > fsize) { printf("%s: truncated\n", argv[a]); continue; }
 
         PLACEMENT out[LOMHD_MAX_PLACEMENTS];
         LARGE_INTEGER t0, t1; QueryPerformanceCounter(&t0);

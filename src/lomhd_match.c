@@ -44,6 +44,24 @@ static void table_insert(PROBE* table, unsigned long long hash, int portrait, in
     }
 }
 
+void lomhd_pack_free(LOMHD_PACK* pack)
+{
+    if (pack->portraits)
+    {
+        for (int p = 0; p < pack->allocated; p++)
+            for (int rule = 0; rule < 2; rule++)
+                if (pack->portraits[p].templ[rule])
+                    HeapFree(GetProcessHeap(), 0, pack->portraits[p].templ[rule]);
+
+        HeapFree(GetProcessHeap(), 0, pack->portraits);
+    }
+
+    if (pack->table)
+        HeapFree(GetProcessHeap(), 0, pack->table);
+
+    memset(pack, 0, sizeof(*pack));
+}
+
 BOOL lomhd_pack_parse(const BYTE* data, DWORD size, LOMHD_PACK* pack, DWORD* bad_offset)
 {
     DWORD pos = 12;
@@ -68,10 +86,14 @@ BOOL lomhd_pack_parse(const BYTE* data, DWORD size, LOMHD_PACK* pack, DWORD* bad
     int count = (int)raw_count;
 
     pack->portraits = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(PORTRAIT) * count);
+    pack->allocated = pack->portraits ? count : 0;
     pack->table = HeapAlloc(GetProcessHeap(), 0, sizeof(PROBE) * LOMHD_TABLE);
 
+    /* An allocation failure is a refusal like any other, freed like any other. A test that ran
+     * 40,000 parses without freeing exhausted a 32-bit heap, and every case after it then
+     * "passed" by running out of memory -- caught only because a control run disagreed. */
     if (!pack->portraits || !pack->table)
-        return FALSE;
+        goto corrupt;
 
     for (int i = 0; i < LOMHD_TABLE; i++)
         pack->table[i].portrait = -1;
@@ -113,7 +135,7 @@ BOOL lomhd_pack_parse(const BYTE* data, DWORD size, LOMHD_PACK* pack, DWORD* bad
                     r->templ[rule] = HeapAlloc(GetProcessHeap(), 0, sizeof(WORD) * w * h);
 
                     if (!r->templ[rule])
-                        return FALSE;
+                        goto corrupt;
 
                     for (int i = 0; i < w * h; i++)
                         r->templ[rule][i] = rule ? rgb565_round(pal + idx[i] * 3)
@@ -122,6 +144,11 @@ BOOL lomhd_pack_parse(const BYTE* data, DWORD size, LOMHD_PACK* pack, DWORD* bad
             }
             else
             {
+                /* The draw keeps one buffer per placement at this size; anything bigger would be
+                 * packed and then silently never drawn, so refuse it here instead. */
+                if (w > LOMHD_MAX_HD_SIDE || h > LOMHD_MAX_HD_SIDE)
+                    goto corrupt;
+
                 r->hw = w;
                 r->hh = h;
                 r->hd_pal = pal;
@@ -166,23 +193,30 @@ BOOL lomhd_pack_parse(const BYTE* data, DWORD size, LOMHD_PACK* pack, DWORD* bad
 
 corrupt:
     *bad_offset = pos;
+    lomhd_pack_free(pack);
     return FALSE;
 }
 
-static int count_matches(const WORD* frame, int pitch_px, int x, int y, const PORTRAIT* r, int rule)
+/* TRUE when at least `needed` pixels agree. Stops as soon as the mismatches make that impossible:
+ * this runs on the render thread under g_ddraw.cs, which the game's own ddraw calls also take, and a
+ * portrait with a flat-colour probe row would otherwise cost a full compare for every flat run on
+ * screen. (Suggested by cross-model review, 2026-09-22.) */
+static BOOL enough_matches(const WORD* frame, int pitch_px, int x, int y, const PORTRAIT* r, int rule,
+    int needed)
 {
     const WORD* t = r->templ[rule];
-    int same = 0;
+    int allowed_misses = r->w * r->h - needed;
 
     for (int j = 0; j < r->h; j++)
     {
         const WORD* row = frame + (y + j) * pitch_px + x;
 
         for (int i = 0; i < r->w; i++)
-            same += row[i] == t[j * r->w + i];
+            if (row[i] != t[j * r->w + i] && --allowed_misses < 0)
+                return FALSE;
     }
 
-    return same;
+    return TRUE;
 }
 
 int lomhd_find(const LOMHD_PACK* pack, const WORD* frame, int width, int height, int pitch_px,
@@ -228,8 +262,8 @@ int lomhd_find(const LOMHD_PACK* pack, const WORD* frame, int width, int height,
                 if (duplicate)
                     continue;
 
-                if (count_matches(frame, pitch_px, x, top, r, probe->rule) <
-                    (int)(LOMHD_MATCH_FRACTION * r->w * r->h))
+                if (!enough_matches(frame, pitch_px, x, top, r, probe->rule,
+                        (int)(LOMHD_MATCH_FRACTION * r->w * r->h)))
                     continue;
 
                 out[found].portrait = probe->portrait;
