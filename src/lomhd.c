@@ -180,6 +180,15 @@ static BOOL lomhd_load_pack(void)
     return TRUE;
 }
 
+BOOL lomhd_wants_opengl(void)
+{
+    /* Startup, not the render thread: a single attribute query is the whole cost. Found 2026-09-22:
+     * the Steam install on Windows has no ddraw.ini, so renderer=auto chose Direct3D 9 there. */
+    char path[MAX_PATH];
+    lomhd_path(path, sizeof(path), "lomhd_portraits.pack");
+    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+}
+
 /* ------------------------------------------------------------------------------------------- */
 /* Worker                                                                                      */
 /* ------------------------------------------------------------------------------------------- */

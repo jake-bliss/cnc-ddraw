@@ -3,6 +3,7 @@
 #include "ddraw.h"
 #include "IDirectDraw.h"
 #include "dd.h"
+#include "lomhd.h"
 #include "hook.h"
 #include "config.h"
 #include "mouse.h"
@@ -1868,7 +1869,7 @@ HRESULT dd_CreateEx(GUID* lpGuid, LPVOID* lplpDD, REFIID iid, IUnknown* pUnkOute
         }
         else /* auto */
         {
-            if (!IsWine() && d3d9_is_available())
+            if (!IsWine() && !lomhd_wants_opengl() && d3d9_is_available())
             {
                 g_ddraw.renderer = d3d9_render_main;
             }
