@@ -31,7 +31,7 @@
 static HANDLE g_worker_wake;
 static volatile LONG g_frames, g_want_frame, g_frame_ready, g_pack_ready;
 static volatile LONG g_seen_seq, g_loaded_seq;
-static volatile LONG g_over_budget;         /* scans that skipped sprites: LOMHD_MAX_VERIFICATIONS */
+static volatile LONG g_over_budget;         /* scans that skipped sprites: LOMHD_BAND_VERIFICATIONS */
 
 /* Debug mode: a file named `lomhd_debug` beside lomse.exe when the game starts. Players get three
  * kinds of log line -- the pack loaded, the overlay turned itself off, or an error. Debug adds the
@@ -198,7 +198,9 @@ static BOOL pack_read(void* ctx, DWORD off, DWORD len, BYTE* out)
 {
     HANDLE f = ctx;
     DWORD got = 0;
-    return SetFilePointer(f, (LONG)off, NULL, FILE_BEGIN) != INVALID_SET_FILE_POINTER &&
+    LARGE_INTEGER at;
+    at.QuadPart = off;              /* unsigned: a pack of animated frames passes 2 GB (Claude review) */
+    return SetFilePointerEx(f, at, NULL, FILE_BEGIN) &&
         ReadFile(f, out, len, &got, NULL) && got == len;
 }
 
@@ -458,10 +460,10 @@ static BOOL prefetch(int p)
     if (!r->group)
         return FALSE;
 
-    int end = r->group_first + r->group_count;
-
-    for (int q = p + 1; q < end && q <= p + LOMHD_PREFETCH; q++)
+    /* Wrapping: a looping animation's first frames follow its last. */
+    for (int k = 1; k <= LOMHD_PREFETCH && k < r->group_count; k++)
     {
+        int q = r->group_first + (p - r->group_first + k) % r->group_count;
         LOMHD_IMG* img = &g_img[q];
         img->last_used = g_scan_count;
 

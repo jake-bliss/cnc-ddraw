@@ -784,6 +784,7 @@ typedef struct
     int width, height, pitch_px, max, found;
     PLACEMENT* out;
     LOMHD_STATS stats;
+    int band_verifications;             /* this band's sprite comparisons so far */
     int matched_of[LOMHD_MAX_PLACEMENTS], total_of[LOMHD_MAX_PLACEMENTS];
 } SEARCH;
 
@@ -828,14 +829,15 @@ static void try_probes(SEARCH* s, unsigned long long h, int probe_width, int x, 
             continue;
 
         /* A frame no capture comes near -- a battle nobody has recorded -- must not stall the game:
-         * past the budget, sprites wait for the next frame. Pictures are always searched. */
-        if (r->masked && s->stats.verifications >= LOMHD_MAX_VERIFICATIONS)
+         * past its band's budget, that band's sprites are skipped. Pictures are always searched. */
+        if (r->masked && s->band_verifications >= LOMHD_BAND_VERIFICATIONS)
         {
             s->stats.over_budget = TRUE;
             continue;
         }
 
         s->stats.verifications += r->masked;
+        s->band_verifications += r->masked;
 
         int matched = score(s->frame, s->pitch_px, left, top, r, probe->rule, probe->mirror, needed);
 
@@ -885,6 +887,9 @@ int lomhd_find(const LOMHD_PACK* pack, const WORD* frame, int width, int height,
     for (int y = 0; y < height; y++)
     {
         const WORD* row = frame + y * pitch_px;
+
+        if (y % LOMHD_BAND_ROWS == 0)
+            s.band_verifications = 0;
         unsigned long long h = width >= W ? run_hash(row, W) : 0, hs = run_hash(row, SW);
 
         for (int x = 0; x + SW <= width; x++)

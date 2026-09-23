@@ -400,21 +400,32 @@ int main(void)
         if (n >= 0) lomhd_pack_free(&pack);
     }
 
-    /* The comparison budget. Every row of this frame repeats one probe's slice, so the probe hits
-     * all over it and every hit is compared -- and fails, the rest of the sprite being elsewhere.
-     * Sprites stop at LOMHD_MAX_VERIFICATIONS; a picture in the same frame is still found. */
+    /* The comparison budget, per band of LOMHD_BAND_ROWS rows. Every row of this frame but the last
+     * two bands repeats one probe's slice, so the probe hits all over it and every hit is compared --
+     * and fails, the rest of the sprite being elsewhere. Each of those bands stops at its budget;
+     * a picture in the same frame, and a sprite in the clean bands, are still found. A budget for the
+     * whole frame spent itself in the top rows and never reached that sprite. */
     {
         static BYTE busy[40 * 36];
         picture(busy, 40, 36, 19);
         LOMHD_PACK pack; PLACEMENT out[LOMHD_MAX_PLACEMENTS]; LOMHD_STATS st;
-        begin(2); tp_add_sprite("busy", 40, 36, busy, 0); record("a", 70, 67, a);
-        for (int y = 0; y < FH; y++) for (int x = 0; x < FW; x++) frame_idx[y][x] = busy[(x % 40)];
-        draw(a, 70, 67, 500, 380);
+        int clean = ((FH - 1) / LOMHD_BAND_ROWS - 1) * LOMHD_BAND_ROWS;     /* the last two bands */
+        begin(3); tp_add_sprite("busy", 40, 36, busy, 0); record("a", 70, 67, a); tp_add_sprite("t2", 40, 36, t2, 0);
+        background(45);
+        for (int y = 0; y < clean; y++) for (int x = 0; x < FW; x++) frame_idx[y][x] = busy[(x % 40)];
+        draw(a, 70, 67, 500, 300);
+        draw_sprite(t2, 40, 36, 100, clean + 2);
         int n = find_stats(out, &pack, &st);
-        BOOL has_a = FALSE;
-        for (int i = 0; i < n; i++) has_a |= strcmp(pack.portraits[out[i].portrait].name, "a") == 0;
-        check_that("a frame of false sprite hits stops at the budget, pictures still found",
-            n >= 1 && has_a && st.over_budget && st.verifications == LOMHD_MAX_VERIFICATIONS);
+        BOOL has_a = FALSE, has_t2 = FALSE;
+        for (int i = 0; i < n; i++)
+        {
+            has_a |= strcmp(pack.portraits[out[i].portrait].name, "a") == 0;
+            has_t2 |= strcmp(pack.portraits[out[i].portrait].name, "t2") == 0;
+        }
+        check_that("false sprite hits stop at each band's budget, not the whole frame's",
+            st.over_budget && st.verifications >= (clean / LOMHD_BAND_ROWS) * LOMHD_BAND_VERIFICATIONS &&
+            st.verifications <= (clean / LOMHD_BAND_ROWS + 1) * LOMHD_BAND_VERIFICATIONS);
+        check_that("... pictures are still found, and a sprite below the busy bands", has_a && has_t2);
         if (n >= 0) lomhd_pack_free(&pack);
     }
 

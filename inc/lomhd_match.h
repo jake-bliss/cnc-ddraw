@@ -23,8 +23,12 @@
 #define LOMHD_MAX_IMAGES 131072         /* records a pack may hold */
 #define LOMHD_MAX_PROBES (1 << 20)      /* probes a pack may insert; the table is sized to hold them
                                          * at most half full, so 16 MB at most, 32 MB with slack */
-#define LOMHD_MAX_VERIFICATIONS 2048    /* sprite comparisons a scan may make; beyond them sprites
-                                         * are skipped for that frame. Captured frames need < 100 */
+#define LOMHD_BAND_ROWS 64              /* the frame is searched in bands of this many rows ... */
+#define LOMHD_BAND_VERIFICATIONS 256    /* ... each making at most this many sprite comparisons;
+                                         * beyond them the band's sprites are skipped. A budget for
+                                         * the whole frame always ran out at the same row, so the
+                                         * same lower sprites went unseen scan after scan (Claude
+                                         * review, 2026-09-23). Captured frames need < 100 in all */
 #define LOMHD_MAX_HD_SIDE 1280          /* an upscale larger than this is refused at load */
 #define LOMHD_MATCH_FRACTION 0.85       /* small images: a cursor or tooltip may cover part */
 #define LOMHD_LARGE_PIXELS 65536        /* above this an image is "large": see LOMHD_LARGE_FRACTION */
@@ -103,7 +107,7 @@ typedef struct
 typedef struct
 {
     int verifications;                  /* sprite comparisons made */
-    BOOL over_budget;                   /* LOMHD_MAX_VERIFICATIONS was reached: sprites were skipped */
+    BOOL over_budget;                   /* a band spent LOMHD_BAND_VERIFICATIONS: sprites skipped */
 } LOMHD_STATS;
 
 /* What the first 8 bytes of a file say: this build's pack, another LOMHDPK version (made by an
