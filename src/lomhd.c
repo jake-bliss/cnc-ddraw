@@ -31,6 +31,7 @@
 static HANDLE g_worker_wake;
 static volatile LONG g_frames, g_want_frame, g_frame_ready, g_pack_ready;
 static volatile LONG g_seen_seq, g_loaded_seq;
+static volatile LONG g_over_budget;         /* scans that skipped sprites: LOMHD_MAX_VERIFICATIONS */
 
 /* Debug mode: a file named `lomhd_debug` beside lomse.exe when the game starts. Players get three
  * kinds of log line -- the pack loaded, the overlay turned itself off, or an error. Debug adds the
@@ -82,6 +83,14 @@ static BYTE* g_slot_mask[LOMHD_MAX_PLACEMENTS];   /* w*h: 255 where the frame st
 static size_t g_slot_mask_cap[LOMHD_MAX_PLACEMENTS];
 static int g_slot_img[LOMHD_MAX_PLACEMENTS];
 static float g_quad[LOMHD_MAX_PLACEMENTS][4];      /* x0, y0, x1, y1 in NDC */
+static BOOL g_slot_mirror[LOMHD_MAX_PLACEMENTS];   /* drawn flipped left to right */
+
+/* An animated sprite's next frames, loaded and uploaded ahead of being drawn: otherwise each frame
+ * shows the original for a scan or two the first time round, and the animation flickers. Only the
+ * next few -- a leader has ~280 frames, 27 MB of texture, and a start screen shows ten. */
+#define LOMHD_PREFETCH 8
+static int g_upload[LOMHD_MAX_PLACEMENTS * LOMHD_PREFETCH];
+static int g_upload_count;
 static int g_slot_count;
 static PLACEMENT g_placements[LOMHD_MAX_PLACEMENTS];
 static int g_placement_count;
@@ -245,6 +254,8 @@ static BOOL lomhd_load_pack(void)
     lomhd_logf("pack: opened in %ld ms", (long)(GetTickCount() - start), 0, 0);
     lomhd_logf("pack: %ld of them sprites, sprite probe width %ld", g_pack.sprites,
         LOMHD_SPRITE_PROBE_W, 0);
+    lomhd_logf("pack: %ld probes, %ld palettes, %ld KB resident", g_pack.probes,
+        g_pack.palette_count, (long)(g_pack.resident >> 10));
     return TRUE;
 }
 
@@ -355,9 +366,11 @@ static DWORD WINAPI lomhd_worker(LPVOID unused)
         }
 
         /* What the matcher sees, logged only when it changes: this is the acceptance record. */
+        /* At most once a second: an animation changes what is seen on every frame. */
         LONG seq = g_seen_seq;
+        static DWORD last_seen_log;
 
-        if (seq != logged_seq && g_debug)
+        if (seq != logged_seq && g_debug && GetTickCount() - last_seen_log >= 1000)
         {
             PLACEMENT seen[LOMHD_MAX_PLACEMENTS];
             int n;
@@ -373,14 +386,15 @@ static DWORD WINAPI lomhd_worker(LPVOID unused)
             for (int i = 0; i < n; i++)
             {
                 char line[160];
-                _snprintf(line, sizeof(line), "seen: %s at (%d,%d) %s",
+                _snprintf(line, sizeof(line), "seen: %s at (%d,%d) %s%s",
                     g_pack.portraits[seen[i].portrait].name, seen[i].x, seen[i].y,
-                    seen[i].rule ? "round" : "truncate");
+                    seen[i].rule ? "round" : "truncate", seen[i].mirror ? " mirrored" : "");
                 line[sizeof(line) - 1] = 0;
                 lomhd_log(line);
             }
 
             logged_seq = seq;
+            last_seen_log = GetTickCount();
         }
 
         if (g_debug && GetFileAttributesA(trigger) != INVALID_FILE_ATTRIBUTES)
@@ -395,6 +409,11 @@ static DWORD WINAPI lomhd_worker(LPVOID unused)
         {
             lomhd_logf("watchdog: frames=%ld want_frame=%ld textures=%ld KB",
                 InterlockedExchange(&g_frames, 0), g_want_frame, (long)(g_tex_bytes >> 10));
+
+            LONG over = InterlockedExchange(&g_over_budget, 0);
+
+            if (over)
+                lomhd_logf("watchdog: %ld scans over the sprite budget -- sprites skipped there", over, 0, 0);
             last_report = now;
         }
     }
@@ -413,8 +432,11 @@ static DWORD WINAPI lomhd_worker(LPVOID unused)
 static void build_mask(const PLACEMENT* pl, const BYTE* idx, const WORD* frame, int pitch_px, BYTE* out)
 {
     const PORTRAIT* r = &g_pack.portraits[pl->portrait];
-    const WORD* lut = r->lut[pl->rule];
+    const WORD* lut = r->pal->lut[pl->rule];
+    const BYTE* skip = r->pal->skip;
 
+    /* In the image's own columns: a mirrored placement reads the frame right to left, and the draw
+     * flips the mask and the upscale together. */
     for (int y = 0; y < r->h; y++)
     {
         const WORD* row = frame + (pl->y + y) * pitch_px + pl->x;
@@ -422,8 +444,40 @@ static void build_mask(const PLACEMENT* pl, const BYTE* idx, const WORD* frame, 
         BYTE* m = out + y * r->w;
 
         for (int x = 0; x < r->w; x++)
-            m[x] = !r->skip[t[x]] && row[x] == lut[t[x]] ? 255 : 0;
+            m[x] = !skip[t[x]] && row[pl->mirror ? r->w - 1 - x : x] == lut[t[x]] ? 255 : 0;
     }
+}
+
+/* Touch the next LOMHD_PREFETCH frames of p's group: keep them from going stale, ask for those not
+ * loaded, and queue those loaded but not yet uploaded. Returns TRUE if any were asked for. */
+static BOOL prefetch(int p)
+{
+    const PORTRAIT* r = &g_pack.portraits[p];
+    BOOL requested = FALSE;
+
+    if (!r->group)
+        return FALSE;
+
+    int end = r->group_first + r->group_count;
+
+    for (int q = p + 1; q < end && q <= p + LOMHD_PREFETCH; q++)
+    {
+        LOMHD_IMG* img = &g_img[q];
+        img->last_used = g_scan_count;
+
+        if (img->state == IMG_NONE)
+        {
+            InterlockedExchange(&img->state, IMG_REQUESTED);
+            requested = TRUE;
+        }
+        else if (img->state == IMG_READY && !img->tex && img->rgb &&
+            g_upload_count < (int)(sizeof(g_upload) / sizeof(g_upload[0])))
+        {
+            g_upload[g_upload_count++] = q;
+        }
+    }
+
+    return requested;
 }
 
 static void lomhd_scan(void)
@@ -434,6 +488,7 @@ static void lomhd_scan(void)
     {
         g_placement_count = 0;
         g_slot_count = 0;
+        g_upload_count = 0;
         return;
     }
 
@@ -443,12 +498,17 @@ static void lomhd_scan(void)
     {
         g_placement_count = 0;
         g_slot_count = 0;
+        g_upload_count = 0;
         return;
     }
 
     PLACEMENT result[LOMHD_MAX_PLACEMENTS];
+    LOMHD_STATS stats;
     int found = lomhd_find(&g_pack, frame, primary->width, primary->height, primary->pitch / 2,
-        result, LOMHD_MAX_PLACEMENTS);
+        result, LOMHD_MAX_PLACEMENTS, &stats);
+
+    if (stats.over_budget)
+        InterlockedIncrement(&g_over_budget);
 
     BOOL changed = found != g_seen_count;
 
@@ -462,6 +522,7 @@ static void lomhd_scan(void)
     int slots = 0;
     BOOL requested = FALSE;
     float fw = (float)primary->width, fh = (float)primary->height;
+    g_upload_count = 0;
 
     for (int i = 0; i < found; i++)
     {
@@ -476,6 +537,8 @@ static void lomhd_scan(void)
             InterlockedExchange(&img->state, IMG_REQUESTED);
             requested = TRUE;
         }
+
+        requested |= prefetch(p);
 
         if (img->state != IMG_READY)
             continue;                       /* drawn once loaded; the original shows until then */
@@ -494,6 +557,7 @@ static void lomhd_scan(void)
 
         build_mask(&result[i], r->idx ? r->idx : img->idx, frame, primary->pitch / 2, g_slot_mask[slots]);
         g_slot_img[slots] = p;
+        g_slot_mirror[slots] = result[i].mirror;
         g_quad[slots][0] = result[i].x / fw * 2 - 1;
         g_quad[slots][1] = 1 - result[i].y / fh * 2;
         g_quad[slots][2] = (result[i].x + r->w) / fw * 2 - 1;
@@ -776,7 +840,7 @@ void lomhd_draw(void)
 {
     /* Runs WITHOUT g_ddraw.cs: reads only the slots lomhd_scan built under it, on this same render
      * thread, never the game's surface. */
-    if (!g_slot_count || g_gl_failed_permanently)
+    if ((!g_slot_count && !g_upload_count) || g_gl_failed_permanently)
         return;
 
     if (!lomhd_resolve_basics() || !glActiveTexture)
@@ -815,11 +879,13 @@ void lomhd_draw(void)
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 
-    /* Upscales that arrived since the last draw: upload once, then the CPU copy goes. */
-    for (int i = 0; i < g_slot_count; i++)
+    /* Upscales that arrived since the last draw: upload once, then the CPU copy goes. Those on
+     * screen, then an animation's next frames. */
+    for (int i = 0; i < g_slot_count + g_upload_count; i++)
     {
-        LOMHD_IMG* img = &g_img[g_slot_img[i]];
-        const PORTRAIT* r = &g_pack.portraits[g_slot_img[i]];
+        int p = i < g_slot_count ? g_slot_img[i] : g_upload[i - g_slot_count];
+        LOMHD_IMG* img = &g_img[p];
+        const PORTRAIT* r = &g_pack.portraits[p];
 
         if (img->tex || !img->rgb)
             continue;
@@ -862,11 +928,12 @@ void lomhd_draw(void)
 
         /* Texture row 0 is the top of the picture, the convention cnc-ddraw uses for the frame. */
         float x0 = g_quad[i][0], y0 = g_quad[i][1], x1 = g_quad[i][2], y1 = g_quad[i][3];
+        float u0 = g_slot_mirror[i] ? 1.0f : 0.0f, u1 = 1.0f - u0;
         GLfloat quad[16] = {
-            x0, y0, 0, 0,
-            x1, y0, 1, 0,
-            x1, y1, 1, 1,
-            x0, y1, 0, 1,
+            x0, y0, u0, 0,
+            x1, y0, u1, 0,
+            x1, y1, u1, 1,
+            x0, y1, u0, 1,
         };
 
         glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(quad), quad);

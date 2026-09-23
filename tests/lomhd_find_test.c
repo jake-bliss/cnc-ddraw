@@ -73,7 +73,13 @@ static int kept_percent(const BYTE* idx, int w, int h, int x, int y)
 
 static TP_MEM mem;
 
-static int find(PLACEMENT* out, LOMHD_PACK* pack)
+static void check_that(const char* what, BOOL ok)
+{
+    printf("%-66s %s\n", what, ok ? "ok" : "FAIL");
+    if (!ok) failures++;
+}
+
+static int find_stats(PLACEMENT* out, LOMHD_PACK* pack, LOMHD_STATS* stats)
 {
     for (int y = 0; y < FH; y++)
         for (int x = 0; x < FW; x++)
@@ -83,8 +89,10 @@ static int find(PLACEMENT* out, LOMHD_PACK* pack)
             frame[y * FW + x] = (WORD)((r << 11) | (g << 5) | r);
         }
     if (!tp_open(tp_finish(), pack, &mem)) { printf("pack refused\n"); return -1; }
-    return lomhd_find(pack, frame, FW, FH, FW, out, LOMHD_MAX_PLACEMENTS);
+    return lomhd_find(pack, frame, FW, FH, FW, out, LOMHD_MAX_PLACEMENTS, stats);
 }
+
+static int find(PLACEMENT* out, LOMHD_PACK* pack) { return find_stats(out, pack, NULL); }
 
 /* The placements found, as "name@x,y" sorted-insensitive: each wanted entry must appear, and
  * nothing else. */
@@ -312,10 +320,101 @@ int main(void)
                 narrow_frame[j * 24 + i] = (WORD)(((v >> 3) << 11) | ((v >> 2) << 5) | (v >> 3));
             }
         tp_begin(); tp_add_sprite("n", 20, 24, narrow, 0);
-        int n = tp_open(tp_finish(), &pack, &mem) ? lomhd_find(&pack, narrow_frame, 24, 30, 24, out, LOMHD_MAX_PLACEMENTS) : -1;
+        int n = tp_open(tp_finish(), &pack, &mem) ? lomhd_find(&pack, narrow_frame, 24, 30, 24, out, LOMHD_MAX_PLACEMENTS, NULL) : -1;
         BOOL ok = n == 1 && out[0].x == 0 && out[0].y == 0;
         printf("%-66s %s\n", "a frame narrower than a picture's probe still finds a sprite", ok ? "ok" : "FAIL");
         if (!ok) failures++;
+        if (n >= 0) lomhd_pack_free(&pack);
+    }
+
+    /* Mirrored (format 5): map armies facing the other way are their sprite flipped left to right
+     * (2026-09-23). A sprite marked MIRROR is found either way round; one not marked only as stored. */
+    {
+        static BYTE flip[40 * 36];
+        for (int j = 0; j < 36; j++) for (int i = 0; i < 40; i++) flip[j * 40 + i] = t1[j * 40 + 39 - i];
+
+        begin(1); tp_add_frame("m", 40, 36, t1, 0, 0, TRUE);
+        background(40); draw_sprite(flip, 40, 36, 150, 120);
+        expect("a mirror-marked sprite drawn flipped is found", (const char*[]){ "m@150,120" }, 1);
+
+        LOMHD_PACK pack; PLACEMENT out[LOMHD_MAX_PLACEMENTS];
+        begin(1); tp_add_frame("m", 40, 36, t1, 0, 0, TRUE);
+        background(40); draw_sprite(flip, 40, 36, 150, 120);
+        int n = find(out, &pack);
+        check_that("... and its placement says so", n == 1 && out[0].mirror == 1);
+        if (n >= 0) lomhd_pack_free(&pack);
+
+        begin(1); tp_add_frame("m", 40, 36, t1, 0, 0, TRUE);
+        background(41); draw_sprite(t1, 40, 36, 150, 120);
+        n = find(out, &pack);
+        check_that("... and drawn as stored, is found unflipped", n == 1 && out[0].mirror == 0 &&
+            out[0].x == 150 && out[0].y == 120);
+        if (n >= 0) lomhd_pack_free(&pack);
+
+        begin(1); tp_add_sprite("plain", 40, 36, t1, 0);
+        background(40); draw_sprite(flip, 40, 36, 150, 120);
+        expect("a sprite not marked mirror is not found flipped", (const char*[]){ 0 }, 0);
+
+        /* Flipped, and its left third (its right third as stored) covered: found by a mirrored
+         * probe in another band. */
+        begin(1); tp_add_frame("m", 40, 36, t1, 0, 0, TRUE);
+        background(42); draw_sprite(flip, 40, 36, 300, 300);
+        for (int j = 0; j < 36; j++) for (int i = 0; i < 12; i++) frame_idx[300 + j][300 + i] ^= 128;
+        expect("... flipped with a side covered, too", (const char*[]){ "m@300,300" }, 1);
+        /* Only its (stored) left band can match: image columns 18, 25 and 32 are covered on every
+         * row, and every 8-pixel slice starting in the middle or right band holds one of them. The
+         * left band's slices then sit at the far side of the flipped sprite, so a mirrored probe
+         * recorded at the stored column rather than w - col - width finds nothing. */
+        begin(1); tp_add_frame("m", 40, 36, t1, 0, 0, TRUE);
+        background(44); draw_sprite(flip, 40, 36, 200, 50);
+        for (int j = 0; j < 36; j++)
+            for (int c = 18; c <= 32; c += 7)
+                if (t1[j * 40 + c] > 1) frame_idx[50 + j][200 + 39 - c] ^= 128;
+        printf("    (keeps %d%%)\n", kept_percent(flip, 40, 36, 200, 50));
+        expect("... found by an off-centre band alone", (const char*[]){ "m@200,50" }, 1);
+    }
+
+    /* A map-size unit: 10 pixels wide, too narrow for the old 16-pixel probe. */
+    {
+        static BYTE tiny[10 * 28];
+        sprite(tiny, 10, 28, 17);
+        for (int j = 0; j < 28; j++) for (int i = 0; i < 10; i++) if (tiny[j * 10 + i] < 2 && j > 3 && j < 24) tiny[j * 10 + i] = (BYTE)(j * 3 + i + 20);
+        begin(1); tp_add_frame("tiny", 10, 28, tiny, 0, 0, TRUE);
+        background(43); draw_sprite(tiny, 10, 28, 77, 88);
+        expect("a 10-pixel-wide sprite is found", (const char*[]){ "tiny@77,88" }, 1);
+    }
+
+    /* A run of one colour is no probe. The sprite below has busy rows and a block of solid 50;
+     * before LOMHD_SPRITE_MIN_COLOURS its 50-only slices hit every pixel of a frame of 50 and each
+     * hit was a comparison. Now a frame of 50 costs none, and the sprite on it is still found. */
+    {
+        static BYTE part[40 * 36];
+        sprite(part, 40, 36, 18);
+        for (int j = 8; j < 28; j++) for (int i = 4; i < 36; i++) if (part[j * 40 + i] > 1) part[j * 40 + i] = 50;
+        LOMHD_PACK pack; PLACEMENT out[LOMHD_MAX_PLACEMENTS]; LOMHD_STATS st;
+        begin(1); tp_add_sprite("part", 40, 36, part, 0);
+        memset(frame_idx, 50, sizeof frame_idx); draw_sprite(part, 40, 36, 200, 200);
+        int n = find_stats(out, &pack, &st);
+        check_that("a sprite with one-colour runs on a frame of that colour: found, few comparisons",
+            n == 1 && out[0].x == 200 && out[0].y == 200 && st.verifications < 50 && !st.over_budget);
+        if (n >= 0) lomhd_pack_free(&pack);
+    }
+
+    /* The comparison budget. Every row of this frame repeats one probe's slice, so the probe hits
+     * all over it and every hit is compared -- and fails, the rest of the sprite being elsewhere.
+     * Sprites stop at LOMHD_MAX_VERIFICATIONS; a picture in the same frame is still found. */
+    {
+        static BYTE busy[40 * 36];
+        picture(busy, 40, 36, 19);
+        LOMHD_PACK pack; PLACEMENT out[LOMHD_MAX_PLACEMENTS]; LOMHD_STATS st;
+        begin(2); tp_add_sprite("busy", 40, 36, busy, 0); record("a", 70, 67, a);
+        for (int y = 0; y < FH; y++) for (int x = 0; x < FW; x++) frame_idx[y][x] = busy[(x % 40)];
+        draw(a, 70, 67, 500, 380);
+        int n = find_stats(out, &pack, &st);
+        BOOL has_a = FALSE;
+        for (int i = 0; i < n; i++) has_a |= strcmp(pack.portraits[out[i].portrait].name, "a") == 0;
+        check_that("a frame of false sprite hits stops at the budget, pictures still found",
+            n >= 1 && has_a && st.over_budget && st.verifications == LOMHD_MAX_VERIFICATIONS);
         if (n >= 0) lomhd_pack_free(&pack);
     }
 

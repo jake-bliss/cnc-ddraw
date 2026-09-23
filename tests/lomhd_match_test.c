@@ -44,16 +44,12 @@ int main(int argc, char** argv)
     double t0 = now_ms();
     if (!lomhd_pack_open(file_read, pf, size, &pack, &bad))
     { fprintf(stderr, "pack refused near byte %lu\n", (unsigned long)bad); return 1; }
-    size_t resident = 0; int large = 0;
+    int large = 0;
     for (int i = 0; i < pack.count; i++)
-    {
-        const PORTRAIT* r = &pack.portraits[i];
-        resident += sizeof(*r) + (r->idx ? (size_t)r->w * r->h : 0) + (size_t)r->sw * r->sh;
-        large += r->idx == NULL;
-    }
-    printf("pack: %d images (%d large, %d sprites), probe width %d, opened in %.0f ms, %.1f MB resident\n",
-        pack.count, large, pack.sprites, pack.probe_width, now_ms() - t0,
-        (resident + sizeof(PROBE) * LOMHD_TABLE) / 1048576.0);
+        large += !pack.portraits[i].masked && pack.portraits[i].idx == NULL;
+    printf("pack: %d images (%d large, %d sprites), %d probes, %d palettes, opened in %.0f ms, %.1f MB resident\n",
+        pack.count, large, pack.sprites, pack.probes, pack.palette_count, now_ms() - t0,
+        pack.resident / 1048576.0);
 
     double worst = 0, total = 0; int frames = 0;
 
@@ -69,7 +65,7 @@ int main(int argc, char** argv)
         int n = 0;
         double s = now_ms();
         for (int rep = 0; rep < 5; rep++)         /* clock() is coarse: time five searches */
-            n = lomhd_find(&pack, (const WORD*)(f + 20), (int)w, (int)h, (int)w, out, LOMHD_MAX_PLACEMENTS);
+            n = lomhd_find(&pack, (const WORD*)(f + 20), (int)w, (int)h, (int)w, out, LOMHD_MAX_PLACEMENTS, NULL);
         double ms = (now_ms() - s) / 5;
         total += ms; frames++; if (ms > worst) worst = ms;
 

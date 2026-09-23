@@ -1,7 +1,8 @@
 /* The pack parser's refusal paths, asserted. The pack is untrusted input: every malformed shape
  * here must be refused, and a valid one accepted. First written after cross-model review built a
  * 140 KB pack that the first parser accepted with a 65535x65535 upscale inside it; rewritten for
- * format 3, whose upscales are read lazily and whose inflation is bounded; format 4 adds sprites. */
+ * format 3, whose upscales are read lazily and whose inflation is bounded; format 4 adds sprites,
+ * format 5 animated and mirrored ones. */
 #include <stdio.h>
 #include "lomhd_test_pack.h"
 #include "lodepng.h"
@@ -58,7 +59,7 @@ int main(void)
     check("a count of zero is refused", !opens(tp_len));
 
     two(); tp_finish(); *(DWORD*)(tp_buf + 8) = 0xFFFFFFFFu;
-    check("a count too large for the probe table is refused", !opens(tp_len));
+    check("a count over LOMHD_MAX_IMAGES is refused", !opens(tp_len));
 
     tp_begin(); tp_add("a", LOMHD_PROBE_W - 1, 67, idx_a); tp_finish();
     check("an original narrower than the probe slice is refused", !opens(tp_len));
@@ -81,8 +82,9 @@ int main(void)
     two(); tp_finish();
     {
         /* The first stream is a's indices: its last byte is the adler32's last byte. */
-        DWORD index_end = 12 + 2 * (2 + 8 + 2 + 768 + 8);
-        DWORD idx_len = *(DWORD*)(tp_buf + 12 + 2 + 8 + 2 + 768);
+        DWORD index_end = 12 + 2 * (2 + 8 + 2 + 2 + 768 + 8);
+        DWORD idx_len;
+        memcpy(&idx_len, tp_buf + 12 + 2 + 8 + 2 + 2 + 768, 4);
         tp_buf[index_end + idx_len - 1] ^= 0xFF;
         check("an index stream failing its checksum is refused", !opens(tp_len));
     }
@@ -90,7 +92,10 @@ int main(void)
     two(); tp_finish();
     {
         /* Lengths that no longer add up to the file: a's index stream claims one byte more. */
-        (*(DWORD*)(tp_buf + 12 + 2 + 8 + 2 + 768))++;
+        DWORD len;
+        memcpy(&len, tp_buf + 12 + 2 + 8 + 2 + 2 + 768, 4);
+        len++;
+        memcpy(tp_buf + 12 + 2 + 8 + 2 + 2 + 768, &len, 4);
         check("stream lengths that do not add up to the file are refused", !opens(tp_len));
     }
 
@@ -139,8 +144,8 @@ int main(void)
             lomhd_pack_version(tp_buf, 7) == LOMHD_PACK_UNKNOWN);
     }
 
-    /* Sprites (format 4). A sprite is probed on 16-pixel opaque runs; indices 0 (its key here) and
-     * 1 (the shadow) are not part of it. */
+    /* Sprites. A sprite is probed on LOMHD_SPRITE_PROBE_W-pixel opaque runs; indices 0 (its key
+     * here) and 1 (the shadow) are not part of it. */
     {
         static BYTE s[24 * 20];
         for (int i = 0; i < 24 * 20; i++) s[i] = (BYTE)(i * 13 % 120 + 4);
@@ -161,32 +166,40 @@ int main(void)
         free(hd);
         lomhd_pack_free(&pack);
 
-        /* Opaque runs: rows 0-1 hold a 16-pixel run, the rest only 15, broken by the key. Row 2 is
-         * then given its break, at column 15 (a 15-pixel run) or 16 (16), made of `gap`. */
-        static BYTE runs[24 * 20];
+        /* Opaque runs, W = LOMHD_SPRITE_PROBE_W: rows 0-1 hold a W-pixel run, the rest only W - 1,
+         * broken by the key. Row 2 is then given its break, at column W - 1 (a run of W - 1) or W
+         * (a run of W), made of `gap`. The sprite is W + 4 wide, so nothing right of a break is W. */
+        #define SW LOMHD_SPRITE_PROBE_W
+        static BYTE runs[(SW + 4) * 20];
         #define RUNS(key, col, gap) do { \
             for (int j = 0; j < 20; j++) \
-                for (int i = 0; i < 24; i++) \
-                    runs[j * 24 + i] = (BYTE)(i == (j < 2 ? 16 : 15) ? (key) : i * 7 % 100 + 10); \
-            for (int i = 0; i < 24; i++) runs[2 * 24 + i] = (BYTE)(i == (col) ? (gap) : i * 7 % 100 + 10); \
-            tp_begin(); tp_add_sprite("s", 24, 20, runs, key); tp_finish(); } while (0)
+                for (int i = 0; i < SW + 4; i++) \
+                    runs[j * (SW + 4) + i] = (BYTE)(i == (j < 2 ? SW : SW - 1) ? (key) : i * 7 % 100 + 10); \
+            for (int i = 0; i < SW + 4; i++) runs[2 * (SW + 4) + i] = (BYTE)(i == (col) ? (gap) : i * 7 % 100 + 10); \
+            tp_begin(); tp_add_sprite("s", SW + 4, 20, runs, key); tp_finish(); } while (0)
 
-        RUNS(0, 16, 0);
-        check("a sprite with three rows holding a 16-pixel opaque run is accepted", opens(tp_len));
-        RUNS(0, 15, 0);
+        RUNS(0, SW, 0);
+        check("a sprite with three rows holding a full-probe opaque run is accepted", opens(tp_len));
+        RUNS(0, SW - 1, 0);
         check("a sprite with only two such rows is refused", !opens(tp_len));
-        RUNS(5, 16, 1);
-        check("... with key 5, a row broken at 16 by the shadow index still counts", opens(tp_len));
-        RUNS(5, 15, 1);
-        check("... and one broken at 15 by the shadow index does not", !opens(tp_len));
-        RUNS(5, 15, 0);
+        RUNS(5, SW, 1);
+        check("... with key 5, a row broken at W by the shadow index still counts", opens(tp_len));
+        RUNS(5, SW - 1, 1);
+        check("... and one broken at W - 1 by the shadow index does not", !opens(tp_len));
+        RUNS(5, SW - 1, 0);
         check("... while index 0 is opaque when it is not the key", opens(tp_len));
 
-        tp_begin(); tp_add_sprite("s", 15, 20, s, 0); tp_finish();
+        tp_begin(); tp_add_sprite("s", SW - 1, 20, s, 0); tp_finish();
         check("a sprite narrower than its probe is refused", !opens(tp_len));
 
-        tp_begin(); tp_add("a", 70, 67, idx_a)->flags = 2; tp_finish();
+        tp_begin(); tp_add("a", 70, 67, idx_a)->flags = 4; tp_finish();
         check("an unknown flag bit is refused", !opens(tp_len));
+
+        tp_begin(); tp_add("a", 70, 67, idx_a)->flags = LOMHD_FLAG_MIRROR; tp_finish();
+        check("a picture marked mirror is refused", !opens(tp_len));
+
+        tp_begin(); tp_add("a", 70, 67, idx_a)->group = 1; tp_finish();
+        check("a picture in a group is refused", !opens(tp_len));
 
         tp_begin(); tp_add("a", 70, 67, idx_a)->key = 3; tp_finish();
         check("a picture with a colour key is refused", !opens(tp_len));
@@ -195,34 +208,89 @@ int main(void)
         for (int i = 0; i < 260 * 260; i++) big[i] = (BYTE)(i % 97 + 4);
         tp_begin(); tp_add_sprite("big", 260, 260, big, 0)->hw = 520; tp_finish();
         check("a sprite larger than a large picture's threshold is refused", !opens(tp_len));
+
+        /* Groups: an animated sprite's frames, consecutive. Frames 1-3 of group 7, then a picture,
+         * then group 9. The same group again after another record is refused. */
+        tp_begin();
+        tp_add_frame("g7a", 24, 20, s, 0, 7, TRUE);
+        tp_add_frame("g7b", 24, 20, s, 0, 7, TRUE);
+        tp_add_frame("g7c", 24, 20, s, 0, 7, TRUE);
+        tp_add("a", 70, 67, idx_a);
+        tp_add_frame("g9a", 24, 20, s, 0, 9, FALSE);
+        tp_finish();
+        ok = tp_open(tp_len, &pack, &mem);
+        check("a group's frames know its first record and its size", ok &&
+            pack.portraits[1].group_first == 0 && pack.portraits[2].group_count == 3 &&
+            pack.portraits[4].group_first == 4 && pack.portraits[4].group_count == 1 &&
+            pack.portraits[0].mirror && !pack.portraits[4].mirror);
+
+        /* Palettes: the three frames of group 7 share one; the picture and group 9 have their own
+         * (the picture's is the same colours, but a picture keys nothing). */
+        check("consecutive frames with one palette share it", ok && pack.palette_count == 3 &&
+            pack.portraits[0].pal == pack.portraits[2].pal && pack.portraits[3].pal != pack.portraits[2].pal);
+        lomhd_pack_free(&pack);
+
+        tp_begin();
+        tp_add_frame("g7a", 24, 20, s, 0, 7, FALSE);
+        tp_add("a", 70, 67, idx_a);
+        tp_add_frame("g7b", 24, 20, s, 0, 7, FALSE);
+        tp_finish();
+        check("a group split by another record is refused", !opens(tp_len));
+
+        tp_begin();
+        tp_add_sprite("k0", 24, 20, s, 0);
+        tp_add_sprite("k5", 24, 20, s, 5);
+        tp_finish();
+        ok = tp_open(tp_len, &pack, &mem);
+        check("the same colours with another key are another palette", ok && pack.palette_count == 2 &&
+            pack.portraits[1].pal->skip[5] && !pack.portraits[0].pal->skip[5]);
+        lomhd_pack_free(&pack);
+
+        /* A sprite's probes hold LOMHD_SPRITE_MIN_COLOURS colours or are not made. Every row of this
+         * one is a single colour: it opens (it is a valid sprite) with no probe at all. */
+        static BYTE flat[24 * 20];
+        for (int j = 0; j < 20; j++) for (int i = 0; i < 24; i++) flat[j * 24 + i] = (BYTE)(j * 3 + 10);
+        tp_begin(); tp_add_sprite("flat", 24, 20, flat, 0); tp_finish();
+        ok = tp_open(tp_len, &pack, &mem);
+        check("a sprite of one-colour rows opens with no probes", ok && pack.probes == 0);
+        lomhd_pack_free(&pack);
     }
 
-    /* Probe-table capacity: LOMHD_TABLE / 2 entries. A picture takes exactly 6 (3 rows x 2 rules),
-     * so 5,461 open, as in format 3; the first format-4 reader reserved 18 per picture and refused
-     * 5,460 (Claude review, 2026-09-23). A 48x8 sprite with busy rows takes 24 (4 rows x 3 bands
-     * x 2 rules): 1,365 fit and 1,366 do not. Every image's pixels differ, so probes do not pile
-     * onto one hash chain. */
+    /* Probe capacity: LOMHD_MAX_PROBES. A 48x8 mirrored sprite with busy rows takes 24 (4 rows x 3
+     * bands x both ways round; one colour rule). Every image's pixels differ, so probes do not
+     * pile onto one hash chain, and the upscales are 1x1 to keep the pack small. A picture takes 6
+     * (3 rows x 2 rules). */
     {
-        static BYTE many[5462][48 * 8];
+        #define CAP_SPRITES (LOMHD_MAX_PROBES / 24)
+        static BYTE many[CAP_SPRITES + 1][48 * 8];
         unsigned s = 12345;
-        for (int k = 0; k < 5462; k++)
+        for (int k = 0; k <= CAP_SPRITES; k++)
             for (int i = 0; i < 48 * 8; i++) { s ^= s << 13; s ^= s >> 17; s ^= s << 5; many[k][i] = (BYTE)(s % 240 + 8); }
 
         char name[16];
         tp_begin();
-        for (int k = 0; k < 5461; k++) { snprintf(name, sizeof name, "p%d", k); tp_add(name, 32, 4, many[k]); }
+        for (int k = 0; k < 5461; k++) { snprintf(name, sizeof name, "p%d", k); tp_add(name, 32, 4, many[k])->hw = 1; tp_records[k].hh = 1; }
         tp_finish();
         check("5,461 pictures open", opens(tp_len));
 
-        tp_begin();
-        for (int k = 0; k < 1365; k++) { snprintf(name, sizeof name, "s%d", k); tp_add_sprite(name, 48, 8, many[k], 0); }
-        tp_finish();
-        check("1,365 sprites of 24 probes each open", opens(tp_len));
-
-        tp_begin();
-        for (int k = 0; k < 1366; k++) { snprintf(name, sizeof name, "s%d", k); tp_add_sprite(name, 48, 8, many[k], 0); }
-        tp_finish();
-        check("1,366 do not", !opens(tp_len));
+        for (int extra = 0; extra < 2; extra++)
+        {
+            tp_begin();
+            for (int k = 0; k < CAP_SPRITES + extra; k++)
+            {
+                snprintf(name, sizeof name, "s%d", k);
+                TP_RECORD* r = tp_add_frame(name, 48, 8, many[k], 0, 0, TRUE);
+                r->hw = r->hh = 1;
+            }
+            tp_finish();
+            LOMHD_PACK pack; TP_MEM mem;
+            BOOL ok = tp_open(tp_len, &pack, &mem);
+            if (!extra)
+                check("sprites of 24 probes each open up to LOMHD_MAX_PROBES", ok && pack.probes == CAP_SPRITES * 24);
+            else
+                check("... and one more is refused", !ok);
+            lomhd_pack_free(&pack);
+        }
     }
 
     {
