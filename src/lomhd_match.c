@@ -244,8 +244,10 @@ BOOL lomhd_pack_parse(const BYTE* data, DWORD size, LOMHD_PACK* pack, DWORD* bad
                 goto corrupt;
 
             /* This lodepng has no output cap, so a crafted stream could allocate far more than
-             * rgb_size before the size check below refuses it. The pack is built on the player's
-             * own machine by lomhd_setup.py; the check still refuses anything that is not exact. */
+             * rgb_size before the size check below refuses it. Accepted: the pack is built on the
+             * player's own machine by lomhd_setup.py and sits beside ddraw.dll, so whoever can
+             * write a hostile pack can replace the DLL itself. The check still refuses anything
+             * that is not exact. */
             unsigned char* out = NULL;
             size_t out_size = 0;
             unsigned err = lodepng_zlib_decompress(&out, &out_size, data + pos + 8, zlen,
@@ -257,7 +259,10 @@ BOOL lomhd_pack_parse(const BYTE* data, DWORD size, LOMHD_PACK* pack, DWORD* bad
                 goto corrupt;
             }
 
-            r->hd_rgb = out;
+            /* lodepng grows its buffer 1.5x at a time; keep only what is used, in a 32-bit
+             * process holding ~110 MB of these for the whole session. */
+            unsigned char* fitted = realloc(out, rgb_size);
+            r->hd_rgb = fitted ? fitted : out;
             pos += 8 + zlen;
         }
 
@@ -319,13 +324,18 @@ static int count_matches(const WORD* frame, int pitch_px, int x, int y, const PO
     return r->w * r->h - misses;
 }
 
-/* A 1-in-16 sample of the image, held to the same fraction. A false hit fails here after a few
- * dozen pixels instead of thousands; a real image, whose every pixel matches, always passes. */
+/* A 1-in-16 sample of the image, held to a looser bar than the full count. It only exists to reject
+ * a false hit cheaply: a false hit misses most samples and fails after a few dozen pixels. The bar
+ * is loose because the sample grid over-weights the top and left edges -- held to the full 85%, a
+ * tooltip over a portrait's top 10 rows failed the sample (54 misses, 46 allowed) while the full
+ * count passed (700 misses, 704 allowed). Cross-model review, 2026-09-22. */
+#define LOMHD_SPARSE_FRACTION 0.6
+
 static BOOL sparse_agrees(const WORD* frame, int pitch_px, int x, int y, const PORTRAIT* r, int rule)
 {
     const WORD* t = r->templ[rule];
     int samples = ((r->h + 3) / 4) * ((r->w + 3) / 4);
-    int allowed_misses = samples - (int)(LOMHD_MATCH_FRACTION * samples), misses = 0;
+    int allowed_misses = samples - (int)(LOMHD_SPARSE_FRACTION * samples), misses = 0;
 
     for (int j = 0; j < r->h; j += 4)
         for (int i = 0; i < r->w; i += 4)
@@ -335,9 +345,20 @@ static BOOL sparse_agrees(const WORD* frame, int pitch_px, int x, int y, const P
     return TRUE;
 }
 
-static BOOL overlaps(const PLACEMENT* a, const PORTRAIT* ra, int x, int y, const PORTRAIT* rb)
+/* Two placements are alternatives for one spot when they share at least half of the smaller one.
+ * Upgrade levels of a building share nearly all of it; two different pictures that merely touch,
+ * or share a border pixel, are both drawn. */
+static BOOL same_spot(const PLACEMENT* a, const PORTRAIT* ra, int x, int y, const PORTRAIT* rb)
 {
-    return a->x < x + rb->w && x < a->x + ra->w && a->y < y + rb->h && y < a->y + ra->h;
+    int right = a->x + ra->w < x + rb->w ? a->x + ra->w : x + rb->w;
+    int bottom = a->y + ra->h < y + rb->h ? a->y + ra->h : y + rb->h;
+    int w = right - (a->x > x ? a->x : x), h = bottom - (a->y > y ? a->y : y);
+    int smaller = ra->w * ra->h < rb->w * rb->h ? ra->w * ra->h : rb->w * rb->h;
+
+    if (w <= 0 || h <= 0)
+        return FALSE;
+
+    return 2 * w * h >= smaller;
 }
 
 int lomhd_find(const LOMHD_PACK* pack, const WORD* frame, int width, int height, int pitch_px,
@@ -374,44 +395,43 @@ int lomhd_find(const LOMHD_PACK* pack, const WORD* frame, int width, int height,
                 if (left < 0 || top < 0 || left + r->w > width || top + r->h > height)
                     continue;
 
-                /* The same image is reached again from each probe row and both rules. */
-                BOOL seen = FALSE;
+                /* Every candidate at the same spot must be beaten, not just the first found: a
+                 * candidate beating a weak placement while overlapping a strong one would draw its
+                 * worse upscale over the strong one. The same image, reached again from another
+                 * probe row or the other RGB565 rule, is just another candidate here -- skipping it
+                 * as already seen kept a 95% rule-0 match from its 100% rule-1 score. Needing more
+                 * than the best rival lets count_matches stop early on every repeat. */
+                int area = r->w * r->h;
+                int needed = (int)(LOMHD_MATCH_FRACTION * area);
 
-                for (int k = 0; k < found && !seen; k++)
-                    seen = out[k].x == left && out[k].y == top && out[k].portrait == probe->portrait;
+                for (int k = 0; k < found; k++)
+                    if (same_spot(&out[k], &pack->portraits[out[k].portrait], left, top, r)
+                        && (int)(score[k] * area) + 1 > needed)
+                        needed = (int)(score[k] * area) + 1;
 
-                if (seen)
+                if (needed > area || !sparse_agrees(frame, pitch_px, left, top, r, probe->rule))
                     continue;
 
-                if (!sparse_agrees(frame, pitch_px, left, top, r, probe->rule))
-                    continue;
-
-                int matched = count_matches(frame, pitch_px, left, top, r, probe->rule,
-                    (int)(LOMHD_MATCH_FRACTION * r->w * r->h));
+                int matched = count_matches(frame, pitch_px, left, top, r, probe->rule, needed);
 
                 if (matched < 0)
                     continue;
 
-                double s = (double)matched / (r->w * r->h);
+                double s = (double)matched / area;
+                int kept = 0;
 
-                /* Overlapping candidates are alternatives for one spot on screen: an upgraded
-                 * building matched 78% where the level below it matched 100% (2026-09-22). Keep
-                 * the best; a worse candidate never displaces a better one. */
-                int rival = -1;
-
-                for (int k = 0; k < found && rival < 0; k++)
-                    if (overlaps(&out[k], &pack->portraits[out[k].portrait], left, top, r))
-                        rival = k;
-
-                if (rival >= 0)
+                /* It beats everything at its spot: drop those, then add it. */
+                for (int k = 0; k < found; k++)
                 {
-                    if (s <= score[rival])
+                    if (same_spot(&out[k], &pack->portraits[out[k].portrait], left, top, r))
                         continue;
 
-                    out[rival] = (PLACEMENT){ probe->portrait, probe->rule, left, top };
-                    score[rival] = s;
-                    continue;
+                    out[kept] = out[k];
+                    score[kept] = score[k];
+                    kept++;
                 }
+
+                found = kept;
 
                 if (found == max)
                     continue;
