@@ -328,7 +328,8 @@ static int count_matches(const WORD* frame, int pitch_px, int x, int y, const PO
  * a false hit cheaply: a false hit misses most samples and fails after a few dozen pixels. The bar
  * is loose because the sample grid over-weights the top and left edges -- held to the full 85%, a
  * tooltip over a portrait's top 10 rows failed the sample (54 misses, 46 allowed) while the full
- * count passed (700 misses, 704 allowed). Cross-model review, 2026-09-22. */
+ * count passed (700 misses, 704 allowed). Cross-model review, 2026-09-22. It can still refuse a
+ * cover striped exactly along the grid (every 4th row); covers on screen are solid blocks. */
 #define LOMHD_SPARSE_FRACTION 0.6
 
 static BOOL sparse_agrees(const WORD* frame, int pitch_px, int x, int y, const PORTRAIT* r, int rule)
@@ -336,6 +337,10 @@ static BOOL sparse_agrees(const WORD* frame, int pitch_px, int x, int y, const P
     const WORD* t = r->templ[rule];
     int samples = ((r->h + 3) / 4) * ((r->w + 3) / 4);
     int allowed_misses = samples - (int)(LOMHD_SPARSE_FRACTION * samples), misses = 0;
+
+    /* Too few samples to judge: one covered row of an 8-row image is half its sample rows. */
+    if (samples < 64)
+        return TRUE;
 
     for (int j = 0; j < r->h; j += 4)
         for (int i = 0; i < r->w; i += 4)
@@ -365,7 +370,7 @@ int lomhd_find(const LOMHD_PACK* pack, const WORD* frame, int width, int height,
     PLACEMENT* out, int max)
 {
     const int W = LOMHD_PROBE_W;
-    double score[LOMHD_MAX_PLACEMENTS];
+    int matched_of[LOMHD_MAX_PLACEMENTS]; /* pixels matched; a score is this over the area */
     int found = 0;
 
     if (!pack->count || width < W || max > LOMHD_MAX_PLACEMENTS)
@@ -404,10 +409,15 @@ int lomhd_find(const LOMHD_PACK* pack, const WORD* frame, int width, int height,
                 int area = r->w * r->h;
                 int needed = (int)(LOMHD_MATCH_FRACTION * area);
 
+                /* In integers: as doubles, 4060/4690 and 232/268 -- equal -- let the tie through. */
                 for (int k = 0; k < found; k++)
-                    if (same_spot(&out[k], &pack->portraits[out[k].portrait], left, top, r)
-                        && (int)(score[k] * area) + 1 > needed)
-                        needed = (int)(score[k] * area) + 1;
+                {
+                    const PORTRAIT* rk = &pack->portraits[out[k].portrait];
+                    int beat = (int)((long long)matched_of[k] * area / (rk->w * rk->h)) + 1;
+
+                    if (same_spot(&out[k], rk, left, top, r) && beat > needed)
+                        needed = beat;
+                }
 
                 if (needed > area || !sparse_agrees(frame, pitch_px, left, top, r, probe->rule))
                     continue;
@@ -417,7 +427,6 @@ int lomhd_find(const LOMHD_PACK* pack, const WORD* frame, int width, int height,
                 if (matched < 0)
                     continue;
 
-                double s = (double)matched / area;
                 int kept = 0;
 
                 /* It beats everything at its spot: drop those, then add it. */
@@ -427,7 +436,7 @@ int lomhd_find(const LOMHD_PACK* pack, const WORD* frame, int width, int height,
                         continue;
 
                     out[kept] = out[k];
-                    score[kept] = score[k];
+                    matched_of[kept] = matched_of[k];
                     kept++;
                 }
 
@@ -437,7 +446,7 @@ int lomhd_find(const LOMHD_PACK* pack, const WORD* frame, int width, int height,
                     continue;
 
                 out[found] = (PLACEMENT){ probe->portrait, probe->rule, left, top };
-                score[found] = s;
+                matched_of[found] = matched;
                 found++;
             }
         }

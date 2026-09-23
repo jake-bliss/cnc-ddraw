@@ -17,6 +17,7 @@ static DWORD len;
 static int failures;
 static BYTE frame_idx[FH][FW];
 static WORD frame[FH * FW];
+static int frame_rule;              /* 0: truncating RGB565, 1: rounding */
 
 static void put(const void* p, DWORD n) { memcpy(buf + len, p, n); len += n; }
 static void put_u16(WORD v) { put(&v, 2); }
@@ -76,8 +77,9 @@ static int find(PLACEMENT* out, LOMHD_PACK* pack)
     for (int y = 0; y < FH; y++)
         for (int x = 0; x < FW; x++)
         {
-            BYTE v = frame_idx[y][x];
-            frame[y * FW + x] = (WORD)(((v >> 3) << 11) | ((v >> 2) << 5) | (v >> 3));
+            int v = frame_idx[y][x], r = v >> 3, g = v >> 2;
+            if (frame_rule) { r = (v + 4) >> 3; g = (v + 2) >> 2; r = r > 31 ? 31 : r; g = g > 63 ? 63 : g; }
+            frame[y * FW + x] = (WORD)((r << 11) | (g << 5) | r);
         }
     DWORD bad;
     if (!lomhd_pack_parse(buf, len, pack, &bad)) { printf("pack refused near byte %lu\n", bad); return -1; }
@@ -154,6 +156,22 @@ int main(void)
     expect("a candidate must beat every placement it overlaps", (const char*[]){ "a@0,200", "b@80,200" }, 2);
     begin(3); record("c", 90, 67, c); record("b", 70, 67, b); record("a", 70, 67, a);
     expect("... in either pack order", (const char*[]){ "a@0,200", "b@80,200" }, 2);
+
+    /* The frame drawn with the ROUNDING rule. Index v looks the same under both rules when v % 8
+     * is 0; rows 0-5 of r use v % 8 == 4, so the truncating rule scores it 91% and the rounding
+     * rule 100%. r2 is r with rows 60-62 changed: 95.5%, between the two. Regression cover only:
+     * the first version skipped r's second rule as "already seen", but recovered at r's next probe
+     * row, so this case passes against it too. */
+    static BYTE r[70 * 67], r2[70 * 67];
+    picture(r, 70, 67, 3);
+    for (int i = 0; i < 70 * 67; i++) r[i] = (BYTE)((r[i] & ~7) | (i < 6 * 70 ? 4 : 0));
+    memcpy(r2, r, sizeof r);
+    for (int i = 60 * 70; i < 63 * 70; i++) r2[i] = (BYTE)(r2[i] ^ 128);
+    frame_rule = 1;
+    begin(2); record("r", 70, 67, r); record("r2", 70, 67, r2);
+    clear(); draw(r, 70, 67, 300, 300);
+    expect("a picture's better colour rule counts, not its first", (const char*[]){ "r@300,300" }, 1);
+    frame_rule = 0;
 
     printf("%s\n", failures ? "FAILED" : "all passed");
     return failures ? 1 : 0;
