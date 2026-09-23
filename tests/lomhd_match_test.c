@@ -29,7 +29,7 @@ int main(int argc, char** argv)
     LOMHD_PACK pack;
     if (!bytes || !lomhd_pack_parse(bytes, size, &pack, &bad))
     { fprintf(stderr, "pack refused near byte %lu\n", bad); return 1; }
-    printf("pack: %d portraits, probe width %d\n", pack.count, pack.probe_width);
+    printf("pack: %d images, format %d, probe width %d\n", pack.count, pack.version, pack.probe_width);
 
     LARGE_INTEGER freq; QueryPerformanceFrequency(&freq);
     double worst = 0, total = 0; int frames = 0;

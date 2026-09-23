@@ -175,8 +175,10 @@ static BOOL lomhd_load_pack(void)
         return FALSE;
     }
 
-    lomhd_logf("pack: %ld portraits loaded, %ld bytes, probe width %ld",
-        g_pack.count, (long)size, g_pack.probe_width);
+    /* The probe width doubles as a build check: a stale object linked against an older
+     * LOMHD_PACK layout once printed a pointer here instead of the width (2026-09-22). */
+    lomhd_logf("pack: %ld images loaded, format %ld, probe width %ld",
+        g_pack.count, g_pack.version, g_pack.probe_width);
     return TRUE;
 }
 
@@ -318,7 +320,7 @@ static void build_masked_rgba(const PLACEMENT* p, const WORD* frame, int pitch_p
         for (int x = 0; x < r->hw; x++)
         {
             int sx = x * r->w / r->hw;
-            const BYTE* c = r->hd_pal + r->hd_idx[y * r->hw + x] * 3;
+            const BYTE* c = r->hd_rgb + (y * r->hw + x) * 3;
             BOOL visible = frame_row[sx] == t[sy * r->w + sx];
 
             out[y * r->hw + x] = (visible ? 0xFF000000u : 0) | (c[2] << 16) | (c[1] << 8) | c[0];

@@ -1,8 +1,18 @@
 #include <windows.h>
+#include <stdlib.h>
 #include <string.h>
 #include "lomhd_match.h"
+#include "lodepng.h"
 
-/* Finding portraits in a frame. Pure -- see lomhd_match.h. */
+/* Finding known images in a frame. Pure -- see lomhd_match.h.
+ *
+ * Pack formats, little-endian, both "count u32, then records":
+ *   LOMHDPK1  name; original (u16 w, u16 h, 768 palette, w*h indices); upscale in the same shape.
+ *             Every original is the same width (portraits, 70x67).
+ *   LOMHDPK2  name; original as above; upscale as u16 hw, u16 hh, u32 zlen, zlib(hw*hh*3 RGB).
+ *             Any widths. Full colour: the overlay draws its own texture, so the upscale need not
+ *             be squeezed into the original's 256 colours -- that remap, and the despeckle before
+ *             it, were what lost detail in the first building upscales (2026-09-22). */
 
 #define HASH_BASE 1000003ULL
 
@@ -17,9 +27,9 @@ static WORD rgb565_round(const BYTE* c)
     return (WORD)(((r > 31 ? 31 : r) << 11) | ((g > 63 ? 63 : g) << 5) | (b > 31 ? 31 : b));
 }
 
-/* Rolling polynomial hash over one row of pixels. `+ 1` so a run of black (0x0000) still moves the
+/* Rolling polynomial hash over one run of pixels. `+ 1` so a run of black (0x0000) still moves the
  * hash; without it every all-black window would hash to zero and collide. */
-static unsigned long long row_hash(const WORD* px, int n)
+static unsigned long long run_hash(const WORD* px, int n)
 {
     unsigned long long h = 0;
 
@@ -29,7 +39,7 @@ static unsigned long long row_hash(const WORD* px, int n)
     return h;
 }
 
-static void table_insert(PROBE* table, unsigned long long hash, int portrait, int rule, int row)
+static void table_insert(PROBE* table, unsigned long long hash, int portrait, int rule, int row, int col)
 {
     for (int i = (int)(hash & (LOMHD_TABLE - 1)); ; i = (i + 1) & (LOMHD_TABLE - 1))
     {
@@ -39,9 +49,44 @@ static void table_insert(PROBE* table, unsigned long long hash, int portrait, in
             table[i].portrait = portrait;
             table[i].rule = rule;
             table[i].row = row;
+            table[i].col = col;
             return;
         }
     }
+}
+
+/* Where in a row to take the probe slice: the 32 pixels with the most distinct colours. A flat
+ * slice -- black, sky, bare parchment -- also occurs all over the frame, and every such hit costs a
+ * full comparison of a large image: the first multi-width build took ~10 s a frame against 2.5 ms
+ * (2026-09-22). Ties go to the middle, away from shared frame borders. */
+static int busiest_slice(const WORD* row, int w)
+{
+    int best = (w - LOMHD_PROBE_W) / 2, best_distinct = -1, mid = best;
+
+    for (int col = 0; col + LOMHD_PROBE_W <= w; col += 2)
+    {
+        int distinct = 0;
+
+        for (int i = 0; i < LOMHD_PROBE_W; i++)
+        {
+            BOOL repeat = FALSE;
+
+            for (int j = 0; j < i && !repeat; j++)
+                repeat = row[col + j] == row[col + i];
+
+            distinct += !repeat;
+        }
+
+        int dist = col > mid ? col - mid : mid - col, best_dist = best > mid ? best - mid : mid - best;
+
+        if (distinct > best_distinct || (distinct == best_distinct && dist < best_dist))
+        {
+            best = col;
+            best_distinct = distinct;
+        }
+    }
+
+    return best;
 }
 
 void lomhd_pack_free(LOMHD_PACK* pack)
@@ -49,9 +94,13 @@ void lomhd_pack_free(LOMHD_PACK* pack)
     if (pack->portraits)
     {
         for (int p = 0; p < pack->allocated; p++)
+        {
             for (int rule = 0; rule < 2; rule++)
                 if (pack->portraits[p].templ[rule])
                     HeapFree(GetProcessHeap(), 0, pack->portraits[p].templ[rule]);
+
+            free(pack->portraits[p].hd_rgb);        /* malloc'd: lodepng allocates with malloc */
+        }
 
         HeapFree(GetProcessHeap(), 0, pack->portraits);
     }
@@ -62,21 +111,40 @@ void lomhd_pack_free(LOMHD_PACK* pack)
     memset(pack, 0, sizeof(*pack));
 }
 
+/* One image block: u16 w, u16 h, then (palette form) 768 + w*h, or (zlib form) u32 zlen + zlen.
+ * Every bound is computed in 64 bits: the pack is untrusted input, and w * h reaches 2^32.
+ * (32-bit wraparound found by cross-model review, 2026-09-22.) */
+static BOOL read_dims(const BYTE* data, DWORD size, DWORD pos, int* w, int* h)
+{
+    if ((unsigned long long)pos + 4 > size)
+        return FALSE;
+
+    *w = *(const WORD*)(data + pos);
+    *h = *(const WORD*)(data + pos + 2);
+    return *w > 0 && *h > 0;
+}
+
 BOOL lomhd_pack_parse(const BYTE* data, DWORD size, LOMHD_PACK* pack, DWORD* bad_offset)
 {
     DWORD pos = 12;
     memset(pack, 0, sizeof(*pack));
     *bad_offset = 0;
 
-    if (size < 12 || memcmp(data, "LOMHDPK1", 8) != 0)
+    if (size < 12)
+        return FALSE;
+
+    if (memcmp(data, "LOMHDPK1", 8) == 0)
+        pack->version = 1;
+    else if (memcmp(data, "LOMHDPK2", 8) == 0)
+        pack->version = 2;
+    else
         return FALSE;
 
     DWORD raw_count = *(const DWORD*)(data + 8);
 
-    /* 748 x 2 rules x LOMHD_PROBES entries must leave the table well under half full, or every
-     * miss walks a long probe chain on every pixel of every frame. Compared in 64 bits: the pack
-     * is untrusted input, and a huge count would overflow the multiply and pass the check.
-     * (Found by cross-model review, 2026-09-22.) */
+    /* count x 2 rules x LOMHD_PROBES entries must leave the table well under half full, or every
+     * miss walks a long probe chain on every pixel of every frame. 64-bit, so a huge count cannot
+     * overflow the multiply and pass. */
     if (raw_count == 0 || (unsigned long long)raw_count * 2 * LOMHD_PROBES > LOMHD_TABLE / 2)
     {
         *bad_offset = 8;
@@ -102,89 +170,123 @@ BOOL lomhd_pack_parse(const BYTE* data, DWORD size, LOMHD_PACK* pack, DWORD* bad
     {
         PORTRAIT* r = &pack->portraits[p];
 
-        if (pos + 1 > size || pos + 1 + data[pos] > size)
+        if ((unsigned long long)pos + 1 > size || (unsigned long long)pos + 1 + data[pos] > size)
             goto corrupt;
 
         int n = data[pos];
         memcpy(r->name, data + pos + 1, n < (int)sizeof(r->name) - 1 ? n : (int)sizeof(r->name) - 1);
         pos += 1 + n;
 
-        for (int image = 0; image < 2; image++)
+        /* The original: always palette form. It is what the frame is matched against. */
+        int w, h;
+
+        if (!read_dims(data, size, pos, &w, &h) ||
+            (unsigned long long)pos + 4 + 768 + (unsigned long long)w * h > size)
+            goto corrupt;
+
+        /* A probe hashes LOMHD_PROBE_W pixels of LOMHD_PROBES distinct rows; smaller images are
+         * refused rather than half-matched. v1 packs also keep their one fixed width. */
+        if (w < LOMHD_PROBE_W || h < LOMHD_PROBES + 1 || (pack->version == 1 && p > 0 && w != pack->portraits[0].w))
+            goto corrupt;
+
+        const BYTE* pal = data + pos + 4;
+        const BYTE* idx = pal + 768;
+        r->w = w;
+        r->h = h;
+
+        for (int rule = 0; rule < 2; rule++)
         {
-            if (pos + 4 + 768 > size)
+            r->templ[rule] = HeapAlloc(GetProcessHeap(), 0, sizeof(WORD) * w * h);
+
+            if (!r->templ[rule])
                 goto corrupt;
 
-            int w = *(const WORD*)(data + pos), h = *(const WORD*)(data + pos + 2);
-            const BYTE* pal = data + pos + 4;
-            const BYTE* idx = pal + 768;
-
-            /* 64-bit: w and h are 16-bit, so w * h reaches 2^32 and would wrap a DWORD. */
-            if (w <= 0 || h <= 0 ||
-                (unsigned long long)pos + 4 + 768 + (unsigned long long)w * h > size)
-                goto corrupt;
-
-            pos += 4 + 768 + w * h;
-
-            if (image == 0)
-            {
-                r->w = w;
-                r->h = h;
-
-                for (int rule = 0; rule < 2; rule++)
-                {
-                    r->templ[rule] = HeapAlloc(GetProcessHeap(), 0, sizeof(WORD) * w * h);
-
-                    if (!r->templ[rule])
-                        goto corrupt;
-
-                    for (int i = 0; i < w * h; i++)
-                        r->templ[rule][i] = rule ? rgb565_round(pal + idx[i] * 3)
-                                                 : rgb565_truncate(pal + idx[i] * 3);
-                }
-            }
-            else
-            {
-                /* The draw keeps one buffer per placement at this size; anything bigger would be
-                 * packed and then silently never drawn, so refuse it here instead. */
-                if (w > LOMHD_MAX_HD_SIDE || h > LOMHD_MAX_HD_SIDE)
-                    goto corrupt;
-
-                r->hw = w;
-                r->hh = h;
-                r->hd_pal = pal;
-                r->hd_idx = idx;
-            }
+            for (int i = 0; i < w * h; i++)
+                r->templ[rule][i] = rule ? rgb565_round(pal + idx[i] * 3) : rgb565_truncate(pal + idx[i] * 3);
         }
 
-        /* The rolling hash scans one fixed width. Every shipped portrait is 70x67; a pack that
-         * breaks that is refused rather than half-matched. */
-        if (p == 0)
-            pack->probe_width = r->w;
+        pos += 4 + 768 + w * h;
 
-        if (r->w != pack->probe_width || r->h < LOMHD_PROBES + 1)
+        /* The upscale. Anything bigger than the draw's per-placement buffer would be packed and
+         * then silently never drawn, so it is refused here instead. */
+        int hw, hh;
+
+        if (!read_dims(data, size, pos, &hw, &hh) || hw > LOMHD_MAX_HD_SIDE || hh > LOMHD_MAX_HD_SIDE)
             goto corrupt;
+
+        size_t rgb_size = (size_t)hw * hh * 3;
+
+        if (pack->version == 1)
+        {
+            if ((unsigned long long)pos + 4 + 768 + (unsigned long long)hw * hh > size)
+                goto corrupt;
+
+            const BYTE* hpal = data + pos + 4;
+            const BYTE* hidx = hpal + 768;
+            r->hd_rgb = malloc(rgb_size);
+
+            if (!r->hd_rgb)
+                goto corrupt;
+
+            for (int i = 0; i < hw * hh; i++)
+                memcpy(r->hd_rgb + i * 3, hpal + hidx[i] * 3, 3);
+
+            pos += 4 + 768 + hw * hh;
+        }
+        else
+        {
+            if ((unsigned long long)pos + 8 > size)
+                goto corrupt;
+
+            DWORD zlen = *(const DWORD*)(data + pos + 4);
+
+            if ((unsigned long long)pos + 8 + zlen > size)
+                goto corrupt;
+
+            /* This lodepng has no output cap, so a crafted stream could allocate far more than
+             * rgb_size before the size check below refuses it. The pack is built on the player's
+             * own machine by lomhd_setup.py; the check still refuses anything that is not exact. */
+            unsigned char* out = NULL;
+            size_t out_size = 0;
+            unsigned err = lodepng_zlib_decompress(&out, &out_size, data + pos + 8, zlen,
+                &lodepng_default_decompress_settings);
+
+            if (err || out_size != rgb_size)
+            {
+                free(out);
+                goto corrupt;
+            }
+
+            r->hd_rgb = out;
+            pos += 8 + zlen;
+        }
+
+        r->hw = hw;
+        r->hh = hh;
     }
 
     if (pos != size)
         goto corrupt;
 
+    pack->probe_width = LOMHD_PROBE_W;
     pack->pow = 1;
 
-    for (int i = 1; i < pack->probe_width; i++)
+    for (int i = 1; i < LOMHD_PROBE_W; i++)
         pack->pow *= HASH_BASE;
 
     for (int p = 0; p < count; p++)
     {
         PORTRAIT* r = &pack->portraits[p];
 
-        for (int rule = 0; rule < 2; rule++)
+        for (int k = 1; k <= LOMHD_PROBES; k++)
         {
-            for (int k = 1; k <= LOMHD_PROBES; k++)
-            {
-                /* Several probe rows, so a cursor sitting on one does not hide the portrait. */
-                int row = r->h * k / (LOMHD_PROBES + 1);
-                table_insert(pack->table, row_hash(r->templ[rule] + row * r->w, r->w), p, rule, row);
-            }
+            /* Several probe rows, so a cursor sitting on one does not hide the image. */
+            int row = r->h * k / (LOMHD_PROBES + 1);
+            int col = busiest_slice(r->templ[0] + row * r->w, r->w);
+
+            for (int rule = 0; rule < 2; rule++)
+                table_insert(pack->table, run_hash(r->templ[rule] + row * r->w + col, LOMHD_PROBE_W),
+                    p, rule, row, col);
         }
     }
 
@@ -197,48 +299,68 @@ corrupt:
     return FALSE;
 }
 
-/* TRUE when at least `needed` pixels agree. Stops as soon as the mismatches make that impossible:
- * this runs on the render thread under g_ddraw.cs, which the game's own ddraw calls also take, and a
- * portrait with a flat-colour probe row would otherwise cost a full compare for every flat run on
- * screen. (Suggested by cross-model review, 2026-09-22.) */
-static BOOL enough_matches(const WORD* frame, int pitch_px, int x, int y, const PORTRAIT* r, int rule,
+/* How many pixels agree, or -1 as soon as fewer than `needed` can. The early exit matters: this
+ * runs on the render thread under g_ddraw.cs, which the game's own ddraw calls also take. */
+static int count_matches(const WORD* frame, int pitch_px, int x, int y, const PORTRAIT* r, int rule,
     int needed)
 {
     const WORD* t = r->templ[rule];
-    int allowed_misses = r->w * r->h - needed;
+    int allowed_misses = r->w * r->h - needed, misses = 0;
 
     for (int j = 0; j < r->h; j++)
     {
         const WORD* row = frame + (y + j) * pitch_px + x;
 
         for (int i = 0; i < r->w; i++)
-            if (row[i] != t[j * r->w + i] && --allowed_misses < 0)
-                return FALSE;
+            if (row[i] != t[j * r->w + i] && ++misses > allowed_misses)
+                return -1;
     }
 
+    return r->w * r->h - misses;
+}
+
+/* A 1-in-16 sample of the image, held to the same fraction. A false hit fails here after a few
+ * dozen pixels instead of thousands; a real image, whose every pixel matches, always passes. */
+static BOOL sparse_agrees(const WORD* frame, int pitch_px, int x, int y, const PORTRAIT* r, int rule)
+{
+    const WORD* t = r->templ[rule];
+    int samples = ((r->h + 3) / 4) * ((r->w + 3) / 4);
+    int allowed_misses = samples - (int)(LOMHD_MATCH_FRACTION * samples), misses = 0;
+
+    for (int j = 0; j < r->h; j += 4)
+        for (int i = 0; i < r->w; i += 4)
+            if (frame[(y + j) * pitch_px + x + i] != t[j * r->w + i] && ++misses > allowed_misses)
+                return FALSE;
+
     return TRUE;
+}
+
+static BOOL overlaps(const PLACEMENT* a, const PORTRAIT* ra, int x, int y, const PORTRAIT* rb)
+{
+    return a->x < x + rb->w && x < a->x + ra->w && a->y < y + rb->h && y < a->y + ra->h;
 }
 
 int lomhd_find(const LOMHD_PACK* pack, const WORD* frame, int width, int height, int pitch_px,
     PLACEMENT* out, int max)
 {
-    int w = pack->probe_width;
+    const int W = LOMHD_PROBE_W;
+    double score[LOMHD_MAX_PLACEMENTS];
     int found = 0;
 
-    if (!pack->count || width < w)
+    if (!pack->count || width < W || max > LOMHD_MAX_PLACEMENTS)
         return 0;
 
-    for (int y = 0; y < height && found < max; y++)
+    for (int y = 0; y < height; y++)
     {
         const WORD* row = frame + y * pitch_px;
-        unsigned long long h = row_hash(row, w);
+        unsigned long long h = run_hash(row, W);
 
-        for (int x = 0; x + w <= width && found < max; x++)
+        for (int x = 0; x + W <= width; x++)
         {
             if (x > 0)
-                h = (h - (row[x - 1] + 1ULL) * pack->pow) * HASH_BASE + row[x + w - 1] + 1;
+                h = (h - (row[x - 1] + 1ULL) * pack->pow) * HASH_BASE + row[x + W - 1] + 1;
 
-            for (int i = (int)(h & (LOMHD_TABLE - 1)); pack->table[i].portrait >= 0 && found < max;
+            for (int i = (int)(h & (LOMHD_TABLE - 1)); pack->table[i].portrait >= 0;
                  i = (i + 1) & (LOMHD_TABLE - 1))
             {
                 const PROBE* probe = &pack->table[i];
@@ -247,29 +369,55 @@ int lomhd_find(const LOMHD_PACK* pack, const WORD* frame, int width, int height,
                     continue;
 
                 const PORTRAIT* r = &pack->portraits[probe->portrait];
-                int top = y - probe->row;
+                int left = x - probe->col, top = y - probe->row;
 
-                if (top < 0 || top + r->h > height)
+                if (left < 0 || top < 0 || left + r->w > width || top + r->h > height)
                     continue;
 
-                /* The same portrait is reached from each probe row and both rules. */
-                BOOL duplicate = FALSE;
+                /* The same image is reached again from each probe row and both rules. */
+                BOOL seen = FALSE;
 
-                for (int k = 0; k < found; k++)
-                    if (out[k].x == x && out[k].y == top)
-                        duplicate = TRUE;
+                for (int k = 0; k < found && !seen; k++)
+                    seen = out[k].x == left && out[k].y == top && out[k].portrait == probe->portrait;
 
-                if (duplicate)
+                if (seen)
                     continue;
 
-                if (!enough_matches(frame, pitch_px, x, top, r, probe->rule,
-                        (int)(LOMHD_MATCH_FRACTION * r->w * r->h)))
+                if (!sparse_agrees(frame, pitch_px, left, top, r, probe->rule))
                     continue;
 
-                out[found].portrait = probe->portrait;
-                out[found].rule = probe->rule;
-                out[found].x = x;
-                out[found].y = top;
+                int matched = count_matches(frame, pitch_px, left, top, r, probe->rule,
+                    (int)(LOMHD_MATCH_FRACTION * r->w * r->h));
+
+                if (matched < 0)
+                    continue;
+
+                double s = (double)matched / (r->w * r->h);
+
+                /* Overlapping candidates are alternatives for one spot on screen: an upgraded
+                 * building matched 78% where the level below it matched 100% (2026-09-22). Keep
+                 * the best; a worse candidate never displaces a better one. */
+                int rival = -1;
+
+                for (int k = 0; k < found && rival < 0; k++)
+                    if (overlaps(&out[k], &pack->portraits[out[k].portrait], left, top, r))
+                        rival = k;
+
+                if (rival >= 0)
+                {
+                    if (s <= score[rival])
+                        continue;
+
+                    out[rival] = (PLACEMENT){ probe->portrait, probe->rule, left, top };
+                    score[rival] = s;
+                    continue;
+                }
+
+                if (found == max)
+                    continue;
+
+                out[found] = (PLACEMENT){ probe->portrait, probe->rule, left, top };
+                score[found] = s;
                 found++;
             }
         }
