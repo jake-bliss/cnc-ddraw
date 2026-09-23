@@ -43,6 +43,49 @@ static void record(const char* name, WORD w, WORD h, WORD hw, WORD hh)
     put_image(hw, hh, (DWORD)hw * hh);
 }
 
+/* Format 2: the upscale as zlib RGB. The test writes zlib by hand -- "stored" deflate blocks, no
+ * compression -- so it does not depend on a compressor it would then be trusting. */
+static unsigned long adler32(const BYTE* p, DWORD n)
+{
+    unsigned long a = 1, b = 0;
+    for (DWORD i = 0; i < n; i++) { a = (a + p[i]) % 65521; b = (b + a) % 65521; }
+    return (b << 16) | a;
+}
+
+static DWORD zlib_stored(BYTE* out, const BYTE* in, DWORD n)
+{
+    DWORD o = 0;
+    out[o++] = 0x78; out[o++] = 0x01;
+    for (DWORD at = 0; ; )
+    {
+        DWORD chunk = n - at > 65535 ? 65535 : n - at;
+        BOOL last = at + chunk == n;
+        out[o++] = last;
+        out[o++] = (BYTE)chunk; out[o++] = (BYTE)(chunk >> 8);
+        out[o++] = (BYTE)~chunk; out[o++] = (BYTE)(~chunk >> 8);
+        memcpy(out + o, in + at, chunk); o += chunk; at += chunk;
+        if (last) break;
+    }
+    unsigned long a = adler32(in, n);
+    out[o++] = (BYTE)(a >> 24); out[o++] = (BYTE)(a >> 16); out[o++] = (BYTE)(a >> 8); out[o++] = (BYTE)a;
+    return o;
+}
+
+static BYTE rgb_scratch[LOMHD_MAX_HD_SIDE * LOMHD_MAX_HD_SIDE * 3], z_scratch[LOMHD_MAX_HD_SIDE * LOMHD_MAX_HD_SIDE * 3 + 4096];
+
+/* declared_rgb lets a case lie about the inflated size; corrupt flips a byte of the stream. */
+static void record2(const char* name, WORD w, WORD h, WORD hw, WORD hh, DWORD real_rgb, int corrupt)
+{
+    BYTE n = (BYTE)strlen(name); put(&n, 1); put(name, n);
+    put_image(w, h, (DWORD)w * h);
+    for (DWORD i = 0; i < real_rgb; i++) rgb_scratch[i] = (BYTE)(i * 31 + 7);
+    DWORD z = zlib_stored(z_scratch, rgb_scratch, real_rgb);
+    if (corrupt) z_scratch[z - 1] ^= 0xFF;          /* the adler32 no longer matches */
+    put_u16(hw); put_u16(hh); put_u32(z); put(z_scratch, z);
+}
+
+static void begin2(DWORD count) { len = 0; put("LOMHDPK2", 8); put_u32(count); }
+
 static void expect(const char* what, BOOL want)
 {
     LOMHD_PACK pack; DWORD bad;
@@ -142,6 +185,46 @@ int main(void)
         printf("%-60s %s\n", "...refused at the oversized image, before pos can wrap", right ? "ok" : "FAIL");
         if (!right) failures++;
     }
+
+#ifndef LOMHD_CONTROL_RUN
+    /* --- format 2 --- */
+    begin2(2); record2("portrait", 70, 67, 140, 134, 140 * 134 * 3, 0); record2("llwizt1a", 143, 167, 286, 334, 286 * 334 * 3, 0);
+    expect("format 2: images of different widths are accepted", TRUE);
+    {
+        LOMHD_PACK pack; DWORD bad;
+        BOOL ok = lomhd_pack_parse(buf, len, &pack, &bad);
+        BOOL right = ok && pack.version == 2 && pack.count == 2 && pack.portraits[1].w == 143 &&
+            pack.portraits[1].hd_rgb[0] == 7 && pack.portraits[1].hd_rgb[286 * 334 * 3 - 1] == (BYTE)((286 * 334 * 3 - 1) * 31 + 7);
+        lomhd_pack_free(&pack);
+        printf("%-60s %s\n", "format 2: the upscale inflates to exactly its RGB", right ? "ok" : "FAIL");
+        if (!right) failures++;
+    }
+
+    DWORD full2 = len; int truncations2 = 0;
+    for (DWORD cut = 0; cut < full2; cut += 97)      /* every 97th byte: the full sweep is ~100k parses */
+    {
+        LOMHD_PACK pack; DWORD bad;
+        if (lomhd_pack_parse(buf, cut, &pack, &bad)) truncations2++;
+        lomhd_pack_free(&pack);
+    }
+    printf("%-60s %s\n", "format 2: a truncated pack is refused", truncations2 ? "FAIL" : "ok");
+    if (truncations2) failures++;
+
+    begin2(1); record2("a", 70, 67, 140, 134, 140 * 134 * 3, 1);
+    expect("format 2: a damaged zlib stream is refused", FALSE);
+
+    begin2(1); record2("a", 70, 67, 140, 134, 140 * 134 * 3 - 3, 0);
+    expect("format 2: an upscale that inflates short is refused", FALSE);
+
+    begin2(1); record2("a", 70, 67, 140, 134, 140 * 134 * 3 + 3, 0);
+    expect("format 2: an upscale that inflates long is refused", FALSE);
+
+    begin2(1); record2("a", LOMHD_PROBE_W - 1, 67, 62, 134, 62 * 134 * 3, 0);
+    expect("format 2: an image narrower than the probe slice is refused", FALSE);
+
+    begin2(1); record2("a", 70, 67, LOMHD_MAX_HD_SIDE + 1, 134, (LOMHD_MAX_HD_SIDE + 1) * 134 * 3, 0);
+    expect("format 2: an upscale wider than the draw can hold is refused", FALSE);
+#endif
 
     printf("%s\n", failures ? "FAILED" : "all passed");
     return failures ? 1 : 0;
