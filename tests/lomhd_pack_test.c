@@ -185,6 +185,34 @@ int main(void)
         check("a sprite larger than a large picture's threshold is refused", !opens(tp_len));
     }
 
+    /* Probe-table capacity: LOMHD_TABLE / 2 entries. A picture takes exactly 6 (3 rows x 2 rules),
+     * so 5,461 open, as in format 3; the first format-4 reader reserved 18 per picture and refused
+     * 5,460 (Claude review, 2026-09-23). A 48x8 sprite with busy rows takes 24 (4 rows x 3 bands
+     * x 2 rules): 1,365 fit and 1,366 do not. Every image's pixels differ, so probes do not pile
+     * onto one hash chain. */
+    {
+        static BYTE many[5462][48 * 8];
+        unsigned s = 12345;
+        for (int k = 0; k < 5462; k++)
+            for (int i = 0; i < 48 * 8; i++) { s ^= s << 13; s ^= s >> 17; s ^= s << 5; many[k][i] = (BYTE)(s % 240 + 8); }
+
+        char name[16];
+        tp_begin();
+        for (int k = 0; k < 5461; k++) { snprintf(name, sizeof name, "p%d", k); tp_add(name, 32, 4, many[k]); }
+        tp_finish();
+        check("5,461 pictures open", opens(tp_len));
+
+        tp_begin();
+        for (int k = 0; k < 1365; k++) { snprintf(name, sizeof name, "s%d", k); tp_add_sprite(name, 48, 8, many[k], 0); }
+        tp_finish();
+        check("1,365 sprites of 24 probes each open", opens(tp_len));
+
+        tp_begin();
+        for (int k = 0; k < 1366; k++) { snprintf(name, sizeof name, "s%d", k); tp_add_sprite(name, 48, 8, many[k], 0); }
+        tp_finish();
+        check("1,366 do not", !opens(tp_len));
+    }
+
     {
         /* The bound itself, not the size check after it: the cases above are refused by the exact
          * size check even with no bound, so they cannot catch a stream that exhausts a 32-bit

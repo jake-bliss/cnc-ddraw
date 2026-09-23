@@ -175,7 +175,7 @@ BOOL lomhd_pack_open(LOMHD_READ read, void* ctx, DWORD size, LOMHD_PACK* pack, D
     memset(pack, 0, sizeof(*pack));
     *bad_offset = 0;
 
-    if (size < 12 || !read(ctx, 0, 12, head) || memcmp(head, "LOMHDPK4", 8) != 0)
+    if (size < 12 || !read(ctx, 0, 12, head) || memcmp(head, LOMHD_PACK_MAGIC, 8) != 0)
         return FALSE;
 
     DWORD raw_count = u32_at(head + 8);
@@ -335,8 +335,11 @@ BOOL lomhd_pack_open(LOMHD_READ read, void* ctx, DWORD size, LOMHD_PACK* pack, D
 
         int nrows = r->masked ? (eligible < LOMHD_SPRITE_PROBE_ROWS ? eligible : LOMHD_SPRITE_PROBE_ROWS)
                               : LOMHD_PROBES;
+        int bands = r->masked ? 3 : 1;
 
-        if (eligible < LOMHD_PROBES || probes + 2 * 3 * nrows > LOMHD_TABLE / 2)
+        /* The most this image can insert: 2 rules x bands x rows. For a picture that is exactly
+         * what it inserts (6), so a pack of LOMHD_TABLE / 12 pictures still opens, as in format 3. */
+        if (eligible < LOMHD_PROBES || probes + 2 * bands * nrows > LOMHD_TABLE / 2)
         {
             free(idx);
             free(row565);
@@ -353,7 +356,7 @@ BOOL lomhd_pack_open(LOMHD_READ read, void* ctx, DWORD size, LOMHD_PACK* pack, D
              * trees overlap sideways, and a probe under the tree in front finds nothing. */
             int row = r->masked ? rows[(eligible - 1) * (k - 1) / (nrows > 1 ? nrows - 1 : 1)]
                                 : r->h * k / (LOMHD_PROBES + 1);
-            int bands = r->masked ? 3 : 1, starts = r->w - width + 1, last = -1;
+            int starts = r->w - width + 1, last = -1;
 
             for (int i = 0; i < r->w; i++)
             {
@@ -518,7 +521,10 @@ static int score(const WORD* frame, int pitch_px, int x, int y, const PORTRAIT* 
  * matched at one spot in a capture (2026-09-23). */
 static BOOL same_spot(const PLACEMENT* a, const PORTRAIT* ra, int x, int y, const PORTRAIT* rb)
 {
-    if (ra->masked || rb->masked)
+    if (ra->masked != rb->masked)
+        return FALSE;                   /* a sprite on a picture is on it, not instead of it */
+
+    if (ra->masked)
         return a->x == x && a->y == y;
 
     int right = a->x + ra->w < x + rb->w ? a->x + ra->w : x + rb->w;
@@ -617,7 +623,7 @@ int lomhd_find(const LOMHD_PACK* pack, const WORD* frame, int width, int height,
     const int W = LOMHD_PROBE_W, SW = LOMHD_SPRITE_PROBE_W;
     SEARCH s = { pack, frame, width, height, pitch_px, max, 0, out };
 
-    if (!pack->count || width < W || max > LOMHD_MAX_PLACEMENTS)
+    if (!pack->count || width < SW || max > LOMHD_MAX_PLACEMENTS)
         return 0;
 
     /* Two rolling hashes per row: pictures' 32-pixel probes and sprites' 16-pixel ones. The second
@@ -625,7 +631,7 @@ int lomhd_find(const LOMHD_PACK* pack, const WORD* frame, int width, int height,
     for (int y = 0; y < height; y++)
     {
         const WORD* row = frame + y * pitch_px;
-        unsigned long long h = run_hash(row, W), hs = run_hash(row, SW);
+        unsigned long long h = width >= W ? run_hash(row, W) : 0, hs = run_hash(row, SW);
 
         for (int x = 0; x + SW <= width; x++)
         {

@@ -9,7 +9,7 @@
 #include <string.h>
 #include "lomhd_match.h"
 
-#define TP_MAX 16
+#define TP_MAX 6000
 
 static BYTE tp_buf[1 << 24];
 static DWORD tp_len;
@@ -94,9 +94,9 @@ static void tp_u32(DWORD v) { tp_put(&v, 4); }
 static DWORD tp_finish(void)
 {
     static BYTE z[1 << 23], scratch[1 << 23];
-    DWORD zlen[TP_MAX][2];
+    static DWORD zlen[TP_MAX][2];
     tp_len = 0;
-    tp_put("LOMHDPK4", 8);
+    tp_put(LOMHD_PACK_MAGIC, 8);
     tp_u32((DWORD)tp_count);
 
     /* Streams first into z (to learn their lengths), then the index, then the streams. */

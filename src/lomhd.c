@@ -212,7 +212,10 @@ static BOOL lomhd_load_pack(void)
     DWORD got = 0;
     ReadFile(g_pack_file, head, 8, &got, NULL);
 
-    if (got == 8 && memcmp(head, "LOMHDPK", 7) == 0 && head[7] != '3')
+    /* Any other LOMHDPK version is one this build does not read. The version was once spelled out
+     * here as well as in the reader, and the format-4 reader shipped behind a format-3 check that
+     * refused every pack it could read (Claude review, 2026-09-23). */
+    if (got == 8 && memcmp(head, LOMHD_PACK_MAGIC, 7) == 0 && head[7] != LOMHD_PACK_MAGIC[7])
     {
         lomhd_log("pack: made by an older setup -- run lomhd_setup.py again. Overlay off");
         return FALSE;

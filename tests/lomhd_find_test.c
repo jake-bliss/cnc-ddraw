@@ -205,13 +205,41 @@ int main(void)
     background(22); draw_sprite(narrow, 20, 24, 300, 50);
     expect("a sprite too narrow for a picture's probe is found", (const char*[]){ "n@300,50" }, 1);
 
-    /* Trees in front of trees: the second copy covers part of the first, and both are there. The
-     * picture rule (half the smaller shared) would keep only one. */
+    /* Trees in front of trees: the second copy covers part of the first, and both are there. */
     begin(1); tp_add_sprite("t1", 40, 36, t1, 0);
     background(23); draw_sprite(t1, 40, 36, 100, 100); draw_sprite(t1, 40, 36, 124, 106);
     printf("    (the first copy keeps %d%% of its opaque pixels)\n", kept_percent(t1, 40, 36, 100, 100));
     expect("two overlapping copies of a sprite are both found",
         (const char*[]){ "t1@100,100", "t1@124,106" }, 2);
+
+    /* ... even when their boxes share half: a mostly transparent sprite (a post, opaque in its left
+     * quarter) stands over the right half of a wide one. Under the picture rule these are rivals
+     * of similar size and only the better (the post) would be kept. */
+    static BYTE wide[96 * 24], post[96 * 24];
+    picture(wide, 96, 24, 14);
+    picture(post, 96, 24, 15);
+    for (int j = 0; j < 24; j++) for (int i = 24; i < 96; i++) post[j * 96 + i] = 0;
+    begin(2); tp_add_sprite("wide", 96, 24, wide, 0); tp_add_sprite("post", 96, 24, post, 0);
+    background(29); draw_sprite(wide, 96, 24, 100, 300); draw_sprite(post, 96, 24, 148, 300);
+    printf("    (the wide one keeps %d%%)\n", kept_percent(wide, 96, 24, 100, 300));
+    expect("sprites whose boxes share half are both found",
+        (const char*[]){ "wide@100,300", "post@148,300" }, 2);
+
+    /* Its middle covered, a sprite is found by a probe in a side band: with one band per row, all
+     * probes sit in the middle. Columns 35-60 of 96 covered on every row. */
+    begin(1); tp_add_sprite("wide", 96, 24, wide, 0);
+    background(30); draw_sprite(wide, 96, 24, 200, 100);
+    for (int j = 0; j < 24; j++) for (int i = 35; i <= 60; i++) frame_idx[100 + j][200 + i] ^= 128;
+    printf("    (keeps %d%%)\n", kept_percent(wide, 96, 24, 200, 100));
+    expect("a sprite with its middle covered is found by a side probe", (const char*[]){ "wide@200,100" }, 1);
+
+    /* Only opaque pixels count toward the bar. The post is three quarters transparent; with 40% of
+     * its opaque pixels covered it must not pass, though 90% of its box still "matches". */
+    begin(1); tp_add_sprite("post", 96, 24, post, 0);
+    background(31); draw_sprite(post, 96, 24, 300, 200);
+    for (int j = 0; j < 10; j++) for (int i = 0; i < 24; i++) frame_idx[200 + j][300 + i] ^= 128;
+    printf("    (keeps %d%%)\n", kept_percent(post, 96, 24, 300, 200));
+    expect("a mostly transparent sprite with 40% of it covered is not found", (const char*[]){ 0 }, 0);
 
     /* Covered by something that is not a sprite: 25% of its rows still passes 70%, 40% does not. */
     begin(1); tp_add_sprite("t1", 40, 36, t1, 0);
@@ -235,26 +263,49 @@ int main(void)
     background(25); draw_sprite(t1b, 40, 36, 60, 60);
     expect("... in either pack order", (const char*[]){ "t1b@60,60" }, 1);
 
-    /* A forest: more copies than the old limit of eight placements. */
+    /* A forest: as many copies as there are placements. */
     {
-        static char names[40][16];
-        const char* want[40];
+        static char names[LOMHD_MAX_PLACEMENTS][16];
+        const char* want[LOMHD_MAX_PLACEMENTS];
         begin(1); tp_add_sprite("t2", 40, 36, t2, 0);
         background(26);
-        for (int k = 0; k < 40; k++)
+        for (int k = 0; k < 64; k++)
         {
-            int x = 10 + (k % 10) * 60, y = 10 + (k / 10) * 60;
+            int x = 4 + (k % 8) * 78, y = 4 + (k / 8) * 58;
             draw_sprite(t2, 40, 36, x, y);
             snprintf(names[k], sizeof names[k], "t2@%d,%d", x, y);
             want[k] = names[k];
         }
-        expect("forty sprites on one screen are all found", want, 40);
+        expect("64 sprites on one screen are all found", want, 64);
     }
 
     /* A picture and sprites in one pack: each is found by its own probe width. */
     begin(2); record("a", 70, 67, a); tp_add_sprite("t1", 40, 36, t1, 0);
     background(27); draw(a, 70, 67, 400, 300); draw_sprite(t1, 40, 36, 100, 100);
     expect("a picture and a sprite in one pack are both found", (const char*[]){ "a@400,300", "t1@100,100" }, 2);
+
+    /* A sprite at a picture's top-left is on the picture, not a rival to it: both are kept. */
+    begin(2); record("screen", 640, 480, screen); tp_add_sprite("t1", 40, 36, t1, 0);
+    clear(); draw(screen, 640, 480, 0, 0); draw_sprite(t1, 40, 36, 0, 0);
+    expect("a sprite at a screen's top-left: both are kept", (const char*[]){ "screen@0,0", "t1@0,0" }, 2);
+
+    /* A frame narrower than a picture's probe still finds a sprite. */
+    {
+        LOMHD_PACK pack; PLACEMENT out[LOMHD_MAX_PLACEMENTS];
+        static WORD narrow_frame[24 * 30];
+        for (int j = 0; j < 30; j++)
+            for (int i = 0; i < 24; i++)
+            {
+                int v = j < 24 && i < 20 && narrow[j * 20 + i] > 1 ? narrow[j * 20 + i] : (i * 31 + j * 17) % 120 + 4;
+                narrow_frame[j * 24 + i] = (WORD)(((v >> 3) << 11) | ((v >> 2) << 5) | (v >> 3));
+            }
+        tp_begin(); tp_add_sprite("n", 20, 24, narrow, 0);
+        int n = tp_open(tp_finish(), &pack, &mem) ? lomhd_find(&pack, narrow_frame, 24, 30, 24, out, LOMHD_MAX_PLACEMENTS) : -1;
+        BOOL ok = n == 1 && out[0].x == 0 && out[0].y == 0;
+        printf("%-66s %s\n", "a frame narrower than a picture's probe still finds a sprite", ok ? "ok" : "FAIL");
+        if (!ok) failures++;
+        if (n >= 0) lomhd_pack_free(&pack);
+    }
 
     printf("%s\n", failures ? "FAILED" : "all passed");
     return failures ? 1 : 0;

@@ -7,6 +7,7 @@
  * no files -- the pack is read through a callback -- so tests can run the exact shipped code
  * against captured frames. */
 
+#define LOMHD_PACK_MAGIC "LOMHDPK4"     /* the one place the format is named: reader and loader */
 #define LOMHD_MAX_PLACEMENTS 64        /* a map screen holds dozens of trees and buildings */
 #define LOMHD_PROBES 3                  /* rows per picture that can each start a match */
 #define LOMHD_SPRITE_PROBE_ROWS 4       /* rows per sprite, each probed in up to 3 column bands:
