@@ -216,14 +216,17 @@ typedef struct ucvector
   unsigned char* data;
   size_t size; /*used size*/
   size_t allocsize; /*allocated size*/
+  size_t max; /*lomhd: refuse to grow past this many bytes; 0 = no limit*/
 } ucvector;
 
 /*returns 1 if success, 0 if failure ==> nothing done*/
 static unsigned ucvector_reserve(ucvector* p, size_t allocsize)
 {
+  if(p->max && allocsize > p->max) return 0; /*lomhd: over the caller's bound*/
   if(allocsize > p->allocsize)
   {
     size_t newsize = (allocsize > p->allocsize * 2) ? allocsize : (allocsize * 3 / 2);
+    if(p->max && newsize > p->max) newsize = p->max;
     void* data = lodepng_realloc(p->data, newsize);
     if(data)
     {
@@ -256,6 +259,7 @@ static void ucvector_init(ucvector* p)
 {
   p->data = NULL;
   p->size = p->allocsize = 0;
+  p->max = 0;
 }
 #endif /*LODEPNG_COMPILE_PNG*/
 
@@ -266,6 +270,7 @@ static void ucvector_init_buffer(ucvector* p, unsigned char* buffer, size_t size
 {
   p->data = buffer;
   p->allocsize = p->size = size;
+  p->max = 0;
 }
 #endif /*LODEPNG_COMPILE_ZLIB*/
 
@@ -2162,6 +2167,31 @@ unsigned lodepng_zlib_decompress(unsigned char** out, size_t* outsize, const uns
   }
 
   return 0; /*no error*/
+}
+
+/*lomhd addition: lodepng_zlib_decompress that refuses to produce more than max_out bytes. The
+unbounded version grows its output until the stream ends or memory runs out; in a 32-bit game
+process, a small crafted stream could exhaust it before any size check ran (cross-model review,
+2026-09-23). Output past the bound fails with 83, as an allocation failure does.*/
+unsigned lodepng_zlib_decompress_bounded(unsigned char** out, size_t* outsize, const unsigned char* in,
+                                         size_t insize, size_t max_out)
+{
+  unsigned error;
+  ucvector v;
+
+  if(insize < 6) return 53;
+  if((in[0] * 256 + in[1]) % 31 != 0) return 24;
+  if((in[0] & 15) != 8 || ((in[0] >> 4) & 15) > 7) return 25;
+  if((in[1] >> 5) & 1) return 26;
+
+  ucvector_init(&v);
+  v.max = max_out;
+  error = lodepng_inflatev(&v, in + 2, insize - 2, &lodepng_default_decompress_settings);
+  *out = v.data;
+  *outsize = v.size;
+  if(error) return error;
+  if(adler32(v.data, (unsigned)v.size) != lodepng_read32bitInt(&in[insize - 4])) return 58;
+  return 0;
 }
 
 static unsigned zlib_decompress(unsigned char** out, size_t* outsize, const unsigned char* in,

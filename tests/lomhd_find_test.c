@@ -4,24 +4,16 @@
  *
  * Every image shares one grey palette, so index i draws as RGB565 rule 0 of (i, i, i), and
  * index i + 128 is always a different colour -- that is how a case "damages" pixels. */
-#include <windows.h>
 #include <stdio.h>
-#include <string.h>
-#include "lomhd_match.h"
+#include "lomhd_test_pack.h"
 
 #define FW 640
 #define FH 480
 
-static BYTE buf[1 << 22];
-static DWORD len;
 static int failures;
 static BYTE frame_idx[FH][FW];
 static WORD frame[FH * FW];
 static int frame_rule;              /* 0: truncating RGB565, 1: rounding */
-
-static void put(const void* p, DWORD n) { memcpy(buf + len, p, n); len += n; }
-static void put_u16(WORD v) { put(&v, 2); }
-static void put_u32(DWORD v) { put(&v, 4); }
 
 /* A picture's indices from a seed: busy enough that every 32-pixel slice is distinct. */
 static void picture(BYTE* out, int w, int h, unsigned seed)
@@ -30,34 +22,8 @@ static void picture(BYTE* out, int w, int h, unsigned seed)
     for (int i = 0; i < w * h; i++) { s ^= s << 13; s ^= s >> 17; s ^= s << 5; out[i] = (BYTE)(s % 120 + 4); }
 }
 
-static void begin(DWORD count) { len = 0; put("LOMHDPK2", 8); put_u32(count); }
-
-static void record(const char* name, int w, int h, const BYTE* idx)
-{
-    static BYTE z[1 << 20];
-    BYTE n = (BYTE)strlen(name), pal[768];
-    for (int i = 0; i < 768; i++) pal[i] = (BYTE)(i / 3);
-    put(&n, 1); put(name, n);
-    put_u16((WORD)w); put_u16((WORD)h); put(pal, 768); put(idx, (DWORD)(w * h));
-
-    /* Stored zlib of an all-zero upscale: only its size matters here. */
-    DWORD rgb = (DWORD)(2 * w) * (2 * h) * 3, o = 0;
-    z[o++] = 0x78; z[o++] = 0x01;
-    for (DWORD at = 0; ; )
-    {
-        DWORD chunk = rgb - at > 65535 ? 65535 : rgb - at;
-        BOOL last = at + chunk == rgb;
-        z[o++] = last; z[o++] = (BYTE)chunk; z[o++] = (BYTE)(chunk >> 8);
-        z[o++] = (BYTE)~chunk; z[o++] = (BYTE)(~chunk >> 8);
-        memset(z + o, 0, chunk); o += chunk; at += chunk;
-        if (last) break;
-    }
-    unsigned long a = 1, b = 0;
-    for (DWORD i = 0; i < rgb; i++) b = (b + a) % 65521;     /* adler32 of zeros */
-    unsigned long ad = (b << 16) | a;
-    z[o++] = (BYTE)(ad >> 24); z[o++] = (BYTE)(ad >> 16); z[o++] = (BYTE)(ad >> 8); z[o++] = (BYTE)ad;
-    put_u16((WORD)(2 * w)); put_u16((WORD)(2 * h)); put_u32(o); put(z, o);
-}
+static void begin(int n) { (void)n; tp_begin(); }
+static void record(const char* name, int w, int h, const BYTE* idx) { tp_add(name, w, h, idx); }
 
 static void clear(void) { memset(frame_idx, 0, sizeof frame_idx); }
 
@@ -72,6 +38,8 @@ static void damage_rows(int x, int y, int w, int from, int to)
         for (int i = 0; i < w; i++) frame_idx[y + j][x + i] = (BYTE)(frame_idx[y + j][x + i] + 128);
 }
 
+static TP_MEM mem;
+
 static int find(PLACEMENT* out, LOMHD_PACK* pack)
 {
     for (int y = 0; y < FH; y++)
@@ -81,8 +49,7 @@ static int find(PLACEMENT* out, LOMHD_PACK* pack)
             if (frame_rule) { r = (v + 4) >> 3; g = (v + 2) >> 2; r = r > 31 ? 31 : r; g = g > 63 ? 63 : g; }
             frame[y * FW + x] = (WORD)((r << 11) | (g << 5) | r);
         }
-    DWORD bad;
-    if (!lomhd_pack_parse(buf, len, pack, &bad)) { printf("pack refused near byte %lu\n", bad); return -1; }
+    if (!tp_open(tp_finish(), pack, &mem)) { printf("pack refused\n"); return -1; }
     return lomhd_find(pack, frame, FW, FH, FW, out, LOMHD_MAX_PLACEMENTS);
 }
 
@@ -172,6 +139,23 @@ int main(void)
     clear(); draw(r, 70, 67, 300, 300);
     expect("a picture's better colour rule counts, not its first", (const char*[]){ "r@300,300" }, 1);
     frame_rule = 0;
+
+    /* Full screens: scored on their 1-in-16 sample at LOMHD_LARGE_FRACTION (30%). Captured
+     * 2026-09-23, the main interface bar showed 30-38% of its pixels under the live map. */
+    static BYTE screen[640 * 480];
+    picture(screen, 640, 480, 9);
+    begin(1); record("screen", 640, 480, screen);
+    clear(); draw(screen, 640, 480, 0, 0); damage_rows(0, 0, 640, 0, 288);
+    expect("a screen with its top 60% covered is still found", (const char*[]){ "screen@0,0" }, 1);
+    begin(1); record("screen", 640, 480, screen);
+    clear(); draw(screen, 640, 480, 0, 0); damage_rows(0, 0, 640, 0, 360);
+    expect("a screen with 75% covered is not", (const char*[]){ 0 }, 0);
+
+    /* A portrait on a screen is not an alternative to the screen: both are drawn. The first
+     * version's rivalry rule (half of the smaller one shared) would have kept only one. */
+    begin(2); record("screen", 640, 480, screen); record("a", 70, 67, a);
+    clear(); draw(screen, 640, 480, 0, 0); draw(a, 70, 67, 100, 100);
+    expect("a portrait drawn on a screen: both are kept", (const char*[]){ "screen@0,0", "a@100,100" }, 2);
 
     printf("%s\n", failures ? "FAILED" : "all passed");
     return failures ? 1 : 0;

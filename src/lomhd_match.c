@@ -4,15 +4,14 @@
 #include "lomhd_match.h"
 #include "lodepng.h"
 
-/* Finding known images in a frame. Pure -- see lomhd_match.h.
+/* Finding known images in a frame. Pure -- see lomhd_match.h. The pack format (3) is described at
+ * lomhd_pack_open. Formats 1 and 2 held every upscale in memory at once; with full-screen art that
+ * is ~1.8 GB in a 32-bit process, so format 3 keeps upscales in the file until they are drawn, and
+ * the pack is rebuilt by the setup script rather than read in an older shape.
  *
- * Pack formats, little-endian, both "count u32, then records":
- *   LOMHDPK1  name; original (u16 w, u16 h, 768 palette, w*h indices); upscale in the same shape.
- *             Every original is the same width (portraits, 70x67).
- *   LOMHDPK2  name; original as above; upscale as u16 hw, u16 hh, u32 zlen, zlib(hw*hh*3 RGB).
- *             Any widths. Full colour: the overlay draws its own texture, so the upscale need not
- *             be squeezed into the original's 256 colours -- that remap, and the despeckle before
- *             it, were what lost detail in the first building upscales (2026-09-22). */
+ * Upscales are full colour: the overlay draws its own texture, so the upscale need not be squeezed
+ * into the original's 256 colours -- that remap, and the despeckle before it, were what lost
+ * detail in the first building upscales (2026-09-22). */
 
 #define HASH_BASE 1000003ULL
 
@@ -95,11 +94,8 @@ void lomhd_pack_free(LOMHD_PACK* pack)
     {
         for (int p = 0; p < pack->allocated; p++)
         {
-            for (int rule = 0; rule < 2; rule++)
-                if (pack->portraits[p].templ[rule])
-                    HeapFree(GetProcessHeap(), 0, pack->portraits[p].templ[rule]);
-
-            free(pack->portraits[p].hd_rgb);        /* malloc'd: lodepng allocates with malloc */
+            free(pack->portraits[p].idx);
+            free(pack->portraits[p].sample);
         }
 
         HeapFree(GetProcessHeap(), 0, pack->portraits);
@@ -111,40 +107,63 @@ void lomhd_pack_free(LOMHD_PACK* pack)
     memset(pack, 0, sizeof(*pack));
 }
 
-/* One image block: u16 w, u16 h, then (palette form) 768 + w*h, or (zlib form) u32 zlen + zlen.
- * Every bound is computed in 64 bits: the pack is untrusted input, and w * h reaches 2^32.
- * (32-bit wraparound found by cross-model review, 2026-09-22.) */
-static BOOL read_dims(const BYTE* data, DWORD size, DWORD pos, int* w, int* h)
+/* Inflate exactly `size` bytes or nothing. The bound is enforced while inflating, not after. */
+static BYTE* load_exact(LOMHD_READ read, void* ctx, DWORD off, DWORD len, size_t size)
 {
-    if ((unsigned long long)pos + 4 > size)
-        return FALSE;
+    BYTE* z = malloc(len ? len : 1);
+    unsigned char* out = NULL;
+    size_t got = 0;
 
-    *w = *(const WORD*)(data + pos);
-    *h = *(const WORD*)(data + pos + 2);
-    return *w > 0 && *h > 0;
+    if (z && read(ctx, off, len, z) &&
+        lodepng_zlib_decompress_bounded(&out, &got, z, len, size) == 0 && got == size)
+    {
+        free(z);
+        return out;
+    }
+
+    free(z);
+    free(out);
+    return NULL;
 }
 
-BOOL lomhd_pack_parse(const BYTE* data, DWORD size, LOMHD_PACK* pack, DWORD* bad_offset)
+BYTE* lomhd_load_indices(const LOMHD_PACK* pack, int p, LOMHD_READ read, void* ctx)
 {
-    DWORD pos = 12;
+    const PORTRAIT* r = &pack->portraits[p];
+    return load_exact(read, ctx, r->idx_off, r->idx_len, (size_t)r->w * r->h);
+}
+
+BYTE* lomhd_load_upscale(const LOMHD_PACK* pack, int p, LOMHD_READ read, void* ctx)
+{
+    const PORTRAIT* r = &pack->portraits[p];
+    return load_exact(read, ctx, r->hd_off, r->hd_len, (size_t)r->hw * r->hh * 3);
+}
+
+static DWORD u32_at(const BYTE* b) { return b[0] | b[1] << 8 | b[2] << 16 | (DWORD)b[3] << 24; }
+static int u16_at(const BYTE* b) { return b[0] | b[1] << 8; }
+
+/* Format 3, little-endian:
+ *   "LOMHDPK3", u32 count, then count index records:
+ *     u8 name_len, name, u16 w, u16 h, u16 hw, u16 hh, 768-byte palette, u32 idx_len, u32 hd_len
+ *   then the streams, in record order with nothing between them: zlib(w*h indices), then
+ *   zlib(hw*hh*3 RGB), for each record. The last stream ends at the end of the file.
+ * No offsets are stored, so none can point anywhere odd: each is the sum of the lengths before it,
+ * and every stream is checked to lie inside the file. Every image's indices are inflated here (to
+ * build its probes and sample), so a damaged index stream refuses the pack; a damaged upscale is
+ * found only when it is first drawn, and that image alone is then switched off. */
+BOOL lomhd_pack_open(LOMHD_READ read, void* ctx, DWORD size, LOMHD_PACK* pack, DWORD* bad_offset)
+{
+    BYTE head[12], rec[8 + 768 + 8];
+    unsigned long long pos = 12;
     memset(pack, 0, sizeof(*pack));
     *bad_offset = 0;
 
-    if (size < 12)
+    if (size < 12 || !read(ctx, 0, 12, head) || memcmp(head, "LOMHDPK3", 8) != 0)
         return FALSE;
 
-    if (memcmp(data, "LOMHDPK1", 8) == 0)
-        pack->version = 1;
-    else if (memcmp(data, "LOMHDPK2", 8) == 0)
-        pack->version = 2;
-    else
-        return FALSE;
-
-    DWORD raw_count = *(const DWORD*)(data + 8);
+    DWORD raw_count = u32_at(head + 8);
 
     /* count x 2 rules x LOMHD_PROBES entries must leave the table well under half full, or every
-     * miss walks a long probe chain on every pixel of every frame. 64-bit, so a huge count cannot
-     * overflow the multiply and pass. */
+     * miss walks a long probe chain on every pixel of every frame. */
     if (raw_count == 0 || (unsigned long long)raw_count * 2 * LOMHD_PROBES > LOMHD_TABLE / 2)
     {
         *bad_offset = 8;
@@ -152,14 +171,11 @@ BOOL lomhd_pack_parse(const BYTE* data, DWORD size, LOMHD_PACK* pack, DWORD* bad
     }
 
     int count = (int)raw_count;
-
     pack->portraits = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(PORTRAIT) * count);
     pack->allocated = pack->portraits ? count : 0;
     pack->table = HeapAlloc(GetProcessHeap(), 0, sizeof(PROBE) * LOMHD_TABLE);
 
-    /* An allocation failure is a refusal like any other, freed like any other. A test that ran
-     * 40,000 parses without freeing exhausted a 32-bit heap, and every case after it then
-     * "passed" by running out of memory -- caught only because a control run disagreed. */
+    /* An allocation failure is a refusal like any other, freed like any other. */
     if (!pack->portraits || !pack->table)
         goto corrupt;
 
@@ -169,105 +185,48 @@ BOOL lomhd_pack_parse(const BYTE* data, DWORD size, LOMHD_PACK* pack, DWORD* bad
     for (int p = 0; p < count; p++)
     {
         PORTRAIT* r = &pack->portraits[p];
+        BYTE n;
 
-        if ((unsigned long long)pos + 1 > size || (unsigned long long)pos + 1 + data[pos] > size)
+        if (pos + 1 > size || !read(ctx, (DWORD)pos, 1, &n) || pos + 1 + n + sizeof(rec) > size)
             goto corrupt;
 
-        int n = data[pos];
-        memcpy(r->name, data + pos + 1, n < (int)sizeof(r->name) - 1 ? n : (int)sizeof(r->name) - 1);
-        pos += 1 + n;
+        char name[256];
 
-        /* The original: always palette form. It is what the frame is matched against. */
-        int w, h;
-
-        if (!read_dims(data, size, pos, &w, &h) ||
-            (unsigned long long)pos + 4 + 768 + (unsigned long long)w * h > size)
+        if (!read(ctx, (DWORD)pos + 1, n, (BYTE*)name) || !read(ctx, (DWORD)(pos + 1 + n), sizeof(rec), rec))
             goto corrupt;
+
+        memcpy(r->name, name, n < (int)sizeof(r->name) - 1 ? n : (int)sizeof(r->name) - 1);
+        r->w = u16_at(rec);
+        r->h = u16_at(rec + 2);
+        r->hw = u16_at(rec + 4);
+        r->hh = u16_at(rec + 6);
+        r->idx_len = u32_at(rec + 8 + 768);
+        r->hd_len = u32_at(rec + 8 + 768 + 4);
 
         /* A probe hashes LOMHD_PROBE_W pixels of LOMHD_PROBES distinct rows; smaller images are
-         * refused rather than half-matched. v1 packs also keep their one fixed width. */
-        if (w < LOMHD_PROBE_W || h < LOMHD_PROBES + 1 || (pack->version == 1 && p > 0 && w != pack->portraits[0].w))
+         * refused rather than half-matched. An upscale over the side limit would never be drawn. */
+        if (r->w < LOMHD_PROBE_W || r->h < LOMHD_PROBES + 1 || r->hw < 1 || r->hh < 1 ||
+            r->hw > LOMHD_MAX_HD_SIDE || r->hh > LOMHD_MAX_HD_SIDE || !r->idx_len || !r->hd_len)
             goto corrupt;
-
-        const BYTE* pal = data + pos + 4;
-        const BYTE* idx = pal + 768;
-        r->w = w;
-        r->h = h;
 
         for (int rule = 0; rule < 2; rule++)
-        {
-            r->templ[rule] = HeapAlloc(GetProcessHeap(), 0, sizeof(WORD) * w * h);
+            for (int i = 0; i < 256; i++)
+                r->lut[rule][i] = rule ? rgb565_round(rec + 8 + i * 3) : rgb565_truncate(rec + 8 + i * 3);
 
-            if (!r->templ[rule])
-                goto corrupt;
+        pos += 1 + n + sizeof(rec);
+    }
 
-            for (int i = 0; i < w * h; i++)
-                r->templ[rule][i] = rule ? rgb565_round(pal + idx[i] * 3) : rgb565_truncate(pal + idx[i] * 3);
-        }
+    /* The streams: back to back after the index, ending exactly at the end of the file. */
+    for (int p = 0; p < count; p++)
+    {
+        PORTRAIT* r = &pack->portraits[p];
+        r->idx_off = (DWORD)pos;
+        pos += r->idx_len;
+        r->hd_off = (DWORD)pos;
+        pos += r->hd_len;
 
-        pos += 4 + 768 + w * h;
-
-        /* The upscale. Anything bigger than the draw's per-placement buffer would be packed and
-         * then silently never drawn, so it is refused here instead. */
-        int hw, hh;
-
-        if (!read_dims(data, size, pos, &hw, &hh) || hw > LOMHD_MAX_HD_SIDE || hh > LOMHD_MAX_HD_SIDE)
+        if (pos > size)
             goto corrupt;
-
-        size_t rgb_size = (size_t)hw * hh * 3;
-
-        if (pack->version == 1)
-        {
-            if ((unsigned long long)pos + 4 + 768 + (unsigned long long)hw * hh > size)
-                goto corrupt;
-
-            const BYTE* hpal = data + pos + 4;
-            const BYTE* hidx = hpal + 768;
-            r->hd_rgb = malloc(rgb_size);
-
-            if (!r->hd_rgb)
-                goto corrupt;
-
-            for (int i = 0; i < hw * hh; i++)
-                memcpy(r->hd_rgb + i * 3, hpal + hidx[i] * 3, 3);
-
-            pos += 4 + 768 + hw * hh;
-        }
-        else
-        {
-            if ((unsigned long long)pos + 8 > size)
-                goto corrupt;
-
-            DWORD zlen = *(const DWORD*)(data + pos + 4);
-
-            if ((unsigned long long)pos + 8 + zlen > size)
-                goto corrupt;
-
-            /* This lodepng has no output cap, so a crafted stream could allocate far more than
-             * rgb_size before the size check below refuses it. Accepted: the pack is built on the
-             * player's own machine by lomhd_setup.py and sits beside ddraw.dll, so whoever can
-             * write a hostile pack can replace the DLL itself. The check still refuses anything
-             * that is not exact. */
-            unsigned char* out = NULL;
-            size_t out_size = 0;
-            unsigned err = lodepng_zlib_decompress(&out, &out_size, data + pos + 8, zlen,
-                &lodepng_default_decompress_settings);
-
-            if (err || out_size != rgb_size)
-            {
-                free(out);
-                goto corrupt;
-            }
-
-            /* lodepng grows its buffer 1.5x at a time; keep only what is used, in a 32-bit
-             * process holding ~110 MB of these for the whole session. */
-            unsigned char* fitted = realloc(out, rgb_size);
-            r->hd_rgb = fitted ? fitted : out;
-            pos += 8 + zlen;
-        }
-
-        r->hw = hw;
-        r->hh = hh;
     }
 
     if (pos != size)
@@ -282,26 +241,74 @@ BOOL lomhd_pack_parse(const BYTE* data, DWORD size, LOMHD_PACK* pack, DWORD* bad
     for (int p = 0; p < count; p++)
     {
         PORTRAIT* r = &pack->portraits[p];
+        BYTE* idx = lomhd_load_indices(pack, p, read, ctx);
+        WORD* row565 = malloc(sizeof(WORD) * r->w);
+
+        pos = r->idx_off;
+
+        if (!idx || !row565)
+        {
+            free(idx);
+            free(row565);
+            goto corrupt;
+        }
+
+        r->sw = (r->w + 3) / 4;
+        r->sh = (r->h + 3) / 4;
+        r->sample = malloc((size_t)r->sw * r->sh);
+
+        if (!r->sample)
+        {
+            free(idx);
+            free(row565);
+            goto corrupt;
+        }
+
+        for (int j = 0; j < r->sh; j++)
+            for (int i = 0; i < r->sw; i++)
+                r->sample[j * r->sw + i] = idx[(j * 4) * r->w + i * 4];
 
         for (int k = 1; k <= LOMHD_PROBES; k++)
         {
             /* Several probe rows, so a cursor sitting on one does not hide the image. */
             int row = r->h * k / (LOMHD_PROBES + 1);
-            int col = busiest_slice(r->templ[0] + row * r->w, r->w);
+
+            for (int i = 0; i < r->w; i++)
+                row565[i] = r->lut[0][idx[row * r->w + i]];
+
+            int col = busiest_slice(row565, r->w);
 
             for (int rule = 0; rule < 2; rule++)
-                table_insert(pack->table, run_hash(r->templ[rule] + row * r->w + col, LOMHD_PROBE_W),
-                    p, rule, row, col);
+            {
+                for (int i = 0; i < r->w; i++)
+                    row565[i] = r->lut[rule][idx[row * r->w + i]];
+
+                table_insert(pack->table, run_hash(row565 + col, LOMHD_PROBE_W), p, rule, row, col);
+            }
         }
+
+        free(row565);
+
+        /* Small images keep every index for the full count; a large one keeps only its sample,
+         * and its full indices are loaded when it is found and needs a mask. */
+        if ((long long)r->w * r->h <= LOMHD_LARGE_PIXELS)
+            r->idx = idx;
+        else
+            free(idx);
     }
 
     pack->count = count;
     return TRUE;
 
 corrupt:
-    *bad_offset = pos;
+    *bad_offset = (DWORD)(pos > size ? size : pos);
     lomhd_pack_free(pack);
     return FALSE;
+}
+
+static BOOL is_large(const PORTRAIT* r)
+{
+    return (long long)r->w * r->h > LOMHD_LARGE_PIXELS;
 }
 
 /* How many pixels agree, or -1 as soon as fewer than `needed` can. The early exit matters: this
@@ -309,58 +316,103 @@ corrupt:
 static int count_matches(const WORD* frame, int pitch_px, int x, int y, const PORTRAIT* r, int rule,
     int needed)
 {
-    const WORD* t = r->templ[rule];
+    const WORD* lut = r->lut[rule];
     int allowed_misses = r->w * r->h - needed, misses = 0;
 
     for (int j = 0; j < r->h; j++)
     {
         const WORD* row = frame + (y + j) * pitch_px + x;
+        const BYTE* t = r->idx + j * r->w;
 
         for (int i = 0; i < r->w; i++)
-            if (row[i] != t[j * r->w + i] && ++misses > allowed_misses)
+            if (row[i] != lut[t[i]] && ++misses > allowed_misses)
                 return -1;
     }
 
     return r->w * r->h - misses;
 }
 
-/* A 1-in-16 sample of the image, held to a looser bar than the full count. It only exists to reject
- * a false hit cheaply: a false hit misses most samples and fails after a few dozen pixels. The bar
- * is loose because the sample grid over-weights the top and left edges -- held to the full 85%, a
- * tooltip over a portrait's top 10 rows failed the sample (54 misses, 46 allowed) while the full
- * count passed (700 misses, 704 allowed). Cross-model review, 2026-09-22. It can still refuse a
- * cover striped exactly along the grid (every 4th row); covers on screen are solid blocks. */
-#define LOMHD_SPARSE_FRACTION 0.6
-
-static BOOL sparse_agrees(const WORD* frame, int pitch_px, int x, int y, const PORTRAIT* r, int rule)
+/* The same over the 1-in-16 sample: every 4th pixel of every 4th row. */
+static int count_sample(const WORD* frame, int pitch_px, int x, int y, const PORTRAIT* r, int rule,
+    int needed)
 {
-    const WORD* t = r->templ[rule];
-    int samples = ((r->h + 3) / 4) * ((r->w + 3) / 4);
-    int allowed_misses = samples - (int)(LOMHD_SPARSE_FRACTION * samples), misses = 0;
+    const WORD* lut = r->lut[rule];
+    int total = r->sw * r->sh, allowed_misses = total - needed, misses = 0;
 
-    /* Too few samples to judge: one covered row of an 8-row image is half its sample rows. */
-    if (samples < 64)
-        return TRUE;
+    for (int j = 0; j < r->sh; j++)
+    {
+        const WORD* row = frame + (y + j * 4) * pitch_px + x;
+        const BYTE* t = r->sample + j * r->sw;
 
-    for (int j = 0; j < r->h; j += 4)
-        for (int i = 0; i < r->w; i += 4)
-            if (frame[(y + j) * pitch_px + x + i] != t[j * r->w + i] && ++misses > allowed_misses)
-                return FALSE;
+        for (int i = 0; i < r->sw; i++)
+            if (row[i * 4] != lut[t[i]] && ++misses > allowed_misses)
+                return -1;
+    }
 
-    return TRUE;
+    return total - misses;
 }
 
-/* Two placements are alternatives for one spot when they share at least half of the smaller one.
- * Upgrade levels of a building share nearly all of it; two different pictures that merely touch,
- * or share a border pixel, are both drawn. */
+/* A small image is scored on every pixel, after a cheap pre-check on its sample at a loose 60%: the
+ * sample only has to reject false hits, and its grid over-weights the top and left edges -- held to
+ * the full 85%, a tooltip over a portrait's top 10 rows failed the sample while the full count
+ * passed (cross-model review, 2026-09-22). Under 64 samples the pre-check is skipped.
+ *
+ * A large image (a full screen) is scored on its sample alone, at LOMHD_LARGE_FRACTION. Captured
+ * 2026-09-23: the start screen matched 99.5% of its pixels, a library page with text on it 76%,
+ * the main interface bar under the live map 30-38%. Nothing else in a frame matches 30% of a
+ * 20,000-point sample of a 640x480 picture exactly, and the overlay only draws where the frame
+ * still shows the original's exact pixel, so a partly covered screen still draws correctly. */
+#define LOMHD_SPARSE_FRACTION 0.6
+
+typedef struct
+{
+    int total, needed;                  /* pixels scored (all, or the sample), and the bar */
+} SCORING;
+
+static SCORING scoring(const PORTRAIT* r)
+{
+    SCORING sc;
+
+    if (is_large(r))
+    {
+        sc.total = r->sw * r->sh;
+        sc.needed = (int)(LOMHD_LARGE_FRACTION * sc.total);
+    }
+    else
+    {
+        sc.total = r->w * r->h;
+        sc.needed = (int)(LOMHD_MATCH_FRACTION * sc.total);
+    }
+
+    return sc;
+}
+
+static int score(const WORD* frame, int pitch_px, int x, int y, const PORTRAIT* r, int rule, int needed)
+{
+    if (is_large(r))
+        return count_sample(frame, pitch_px, x, y, r, rule, needed);
+
+    int samples = r->sw * r->sh;
+
+    if (samples >= 64 &&
+        count_sample(frame, pitch_px, x, y, r, rule, (int)(LOMHD_SPARSE_FRACTION * samples)) < 0)
+        return -1;
+
+    return count_matches(frame, pitch_px, x, y, r, rule, needed);
+}
+
+/* Two placements are alternatives for one spot when they share at least half of the smaller one
+ * AND are of a similar size (neither more than twice the other's area). Upgrade levels of a
+ * building are both; a portrait drawn on a full screen, or two pictures that touch, are not. */
 static BOOL same_spot(const PLACEMENT* a, const PORTRAIT* ra, int x, int y, const PORTRAIT* rb)
 {
     int right = a->x + ra->w < x + rb->w ? a->x + ra->w : x + rb->w;
     int bottom = a->y + ra->h < y + rb->h ? a->y + ra->h : y + rb->h;
     int w = right - (a->x > x ? a->x : x), h = bottom - (a->y > y ? a->y : y);
-    int smaller = ra->w * ra->h < rb->w * rb->h ? ra->w * ra->h : rb->w * rb->h;
+    int area_a = ra->w * ra->h, area_b = rb->w * rb->h;
+    int smaller = area_a < area_b ? area_a : area_b, larger = area_a < area_b ? area_b : area_a;
 
-    if (w <= 0 || h <= 0)
+    if (w <= 0 || h <= 0 || larger > 2 * smaller)
         return FALSE;
 
     return 2 * w * h >= smaller;
@@ -370,7 +422,7 @@ int lomhd_find(const LOMHD_PACK* pack, const WORD* frame, int width, int height,
     PLACEMENT* out, int max)
 {
     const int W = LOMHD_PROBE_W;
-    int matched_of[LOMHD_MAX_PLACEMENTS]; /* pixels matched; a score is this over the area */
+    int matched_of[LOMHD_MAX_PLACEMENTS], total_of[LOMHD_MAX_PLACEMENTS];
     int found = 0;
 
     if (!pack->count || width < W || max > LOMHD_MAX_PLACEMENTS)
@@ -400,36 +452,33 @@ int lomhd_find(const LOMHD_PACK* pack, const WORD* frame, int width, int height,
                 if (left < 0 || top < 0 || left + r->w > width || top + r->h > height)
                     continue;
 
-                /* Every candidate at the same spot must be beaten, not just the first found: a
-                 * candidate beating a weak placement while overlapping a strong one would draw its
-                 * worse upscale over the strong one. The same image, reached again from another
-                 * probe row or the other RGB565 rule, is just another candidate here -- skipping it
-                 * as already seen kept a 95% rule-0 match from its 100% rule-1 score. Needing more
-                 * than the best rival lets count_matches stop early on every repeat. */
-                int area = r->w * r->h;
-                int needed = (int)(LOMHD_MATCH_FRACTION * area);
+                /* Every candidate at the same spot must be beaten, not just the first found; the
+                 * same image seen again (another probe row, the other RGB565 rule) is just another
+                 * candidate. Needing more than the best rival lets the count stop early on repeats.
+                 * Scores are compared as fractions by cross-multiplying, in integers. */
+                SCORING sc = scoring(r);
+                int needed = sc.needed;
 
-                /* In integers: as doubles, 4060/4690 and 232/268 -- equal -- let the tie through. */
                 for (int k = 0; k < found; k++)
                 {
                     const PORTRAIT* rk = &pack->portraits[out[k].portrait];
-                    int beat = (int)((long long)matched_of[k] * area / (rk->w * rk->h)) + 1;
+                    int beat = (int)((long long)matched_of[k] * sc.total / total_of[k]) + 1;
 
                     if (same_spot(&out[k], rk, left, top, r) && beat > needed)
                         needed = beat;
                 }
 
-                if (needed > area || !sparse_agrees(frame, pitch_px, left, top, r, probe->rule))
+                if (needed > sc.total)
                     continue;
 
-                int matched = count_matches(frame, pitch_px, left, top, r, probe->rule, needed);
+                int matched = score(frame, pitch_px, left, top, r, probe->rule, needed);
 
                 if (matched < 0)
                     continue;
 
+                /* It beats everything at its spot: drop those, then add it. */
                 int kept = 0;
 
-                /* It beats everything at its spot: drop those, then add it. */
                 for (int k = 0; k < found; k++)
                 {
                     if (same_spot(&out[k], &pack->portraits[out[k].portrait], left, top, r))
@@ -437,6 +486,7 @@ int lomhd_find(const LOMHD_PACK* pack, const WORD* frame, int width, int height,
 
                     out[kept] = out[k];
                     matched_of[kept] = matched_of[k];
+                    total_of[kept] = total_of[k];
                     kept++;
                 }
 
@@ -447,6 +497,7 @@ int lomhd_find(const LOMHD_PACK* pack, const WORD* frame, int width, int height,
 
                 out[found] = (PLACEMENT){ probe->portrait, probe->rule, left, top };
                 matched_of[found] = matched;
+                total_of[found] = sc.total;
                 found++;
             }
         }

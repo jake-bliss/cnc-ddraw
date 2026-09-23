@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "dd.h"
 #include "ddsurface.h"
@@ -9,20 +10,27 @@
 
 /* Lords of Magic HD overlay.
  *
- * The game draws at 640x480 in 16 bpp, exactly as it always has. This finds portraits in the
- * finished frame and draws their upscaled versions over them after cnc-ddraw has scaled the frame
- * to the window. Nothing in lomse.exe is hooked: a portrait is recognised by its pixels, which the
- * engine copies into the frame as exact RGB565 values -- Observed 2026-09-22 for both the native
- * bottom-strip slot and the script-drawn info panel, 100% of pixels. So detection covers every
- * place a portrait can appear, including ones no script names.
+ * The game draws at 640x480 in 16 bpp, exactly as it always has. This finds known pictures --
+ * portraits, items, buildings, full screens -- in the finished frame and draws their upscaled
+ * versions over them after cnc-ddraw has scaled the frame to the window. Nothing in lomse.exe is
+ * hooked: a picture is recognised by its pixels, which the engine copies into the frame as exact
+ * RGB565 values -- Observed 2026-09-22 for portraits (100% of pixels) and 2026-09-23 for screens
+ * (loading 99.7%, start 99.5%, a keep 94.6%). So detection covers every place a picture appears.
  *
  * THE ONE RULE: the render thread never touches a file. It holds g_ddraw.cs whenever it calls in
  * here, and doing file I/O there wedged the render thread under Wine in an early build. The render
- * thread scans, copies and draws; one worker thread owns every file operation. */
+ * thread scans, masks and draws; one worker thread owns every file operation.
+ *
+ * Upscales are loaded lazily. With full screens the pack is ~900 MB and the game is a 32-bit
+ * process, so the worker reads only the index and matching data at start; the first time a
+ * picture is found, the render thread asks for its upscale (and, for a large picture, its full
+ * indices), the worker loads them, and the picture is drawn from then on. Until then the original
+ * shows -- for a frame or two. Each upscale is uploaded to the GPU once and kept, within a budget,
+ * least recently drawn first out. */
 
 static HANDLE g_worker_wake;
 static volatile LONG g_frames, g_want_frame, g_frame_ready, g_pack_ready;
-static volatile LONG g_seen_seq;
+static volatile LONG g_seen_seq, g_loaded_seq;
 
 /* Debug mode: a file named `lomhd_debug` beside lomse.exe when the game starts. Players get three
  * kinds of log line -- the pack loaded, the overlay turned itself off, or an error. Debug adds the
@@ -35,21 +43,46 @@ static volatile const char* g_gl_missing;   /* set by the render thread, logged 
 static BYTE* g_frame;
 static DWORD g_frame_w, g_frame_h, g_frame_bpp;
 
-static BYTE* g_pack_bytes;
+static HANDLE g_pack_file;                  /* worker only */
 static LOMHD_PACK g_pack;
 
-static PLACEMENT g_placements[LOMHD_MAX_PLACEMENTS];
-static int g_placement_count;
+/* Per picture, what has been loaded. The state is the handover between the two threads:
+ *   NONE -> REQUESTED   render thread, when the picture is found and not loaded
+ *   REQUESTED -> READY  worker, after filling rgb (and idx for a large picture); or -> FAILED
+ *   READY -> NONE       render thread, when it evicts the picture (freeing what it holds)
+ * The worker writes rgb/idx only while REQUESTED; from READY on they belong to the render thread,
+ * which uploads rgb to a texture once and frees it. InterlockedExchange orders the writes. */
+enum { IMG_NONE, IMG_REQUESTED, IMG_READY, IMG_FAILED };
+
+typedef struct
+{
+    volatile LONG state;
+    BYTE* rgb;                              /* hw*hh*3, until uploaded */
+    BYTE* idx;                              /* w*h, large pictures only (small ones keep theirs) */
+    GLuint tex;                             /* the upscale, in g_gl_context */
+    DWORD last_used;                        /* scan counter, for eviction */
+} LOMHD_IMG;
+
+static LOMHD_IMG* g_img;
+
+/* The GPU budget for upscales. A 1280x960 screen is ~4.9 MB as the driver likely stores it
+ * (RGBA8); 160 MB keeps ~30 screens plus every portrait in view. */
+#define LOMHD_TEX_BUDGET (160u << 20)
+static size_t g_tex_bytes;
+static DWORD g_scan_count;
 
 /* What lomhd_draw draws, built by lomhd_scan while g_ddraw.cs is held. The draw runs after the
  * renderer has RELEASED that lock, and cnc-ddraw frees the primary's buffer when the game releases
  * the surface -- so the draw must never read the game's frame or surface. It reads only these.
- * (Found by cross-model review, 2026-09-22: the first version built them inside the draw.) */
-#define LOMHD_MAX_HD_PIXELS (LOMHD_MAX_HD_SIDE * LOMHD_MAX_HD_SIDE)
-static DWORD* g_slot_rgba[LOMHD_MAX_PLACEMENTS];
-static int g_slot_w[LOMHD_MAX_PLACEMENTS], g_slot_h[LOMHD_MAX_PLACEMENTS];
+ * (Found by cross-model review, 2026-09-22: the first version built them inside the draw.) Each
+ * slot has its own mask: two copies of one picture can be covered differently. */
+static BYTE* g_slot_mask[LOMHD_MAX_PLACEMENTS];   /* w*h: 255 where the frame still shows it */
+static size_t g_slot_mask_cap[LOMHD_MAX_PLACEMENTS];
+static int g_slot_img[LOMHD_MAX_PLACEMENTS];
 static float g_quad[LOMHD_MAX_PLACEMENTS][4];      /* x0, y0, x1, y1 in NDC */
 static int g_slot_count;
+static PLACEMENT g_placements[LOMHD_MAX_PLACEMENTS];
+static int g_placement_count;
 static PLACEMENT g_seen[LOMHD_MAX_PLACEMENTS];   /* snapshot for the worker to log */
 static int g_seen_count;
 
@@ -147,50 +180,97 @@ static void lomhd_write_frame(void)
 }
 
 /* ------------------------------------------------------------------------------------------- */
-/* The portrait pack (worker thread, once)                                                     */
+/* The pack (worker thread)                                                                    */
 /* ------------------------------------------------------------------------------------------- */
+
+static BOOL pack_read(void* ctx, DWORD off, DWORD len, BYTE* out)
+{
+    HANDLE f = ctx;
+    DWORD got = 0;
+    return SetFilePointer(f, (LONG)off, NULL, FILE_BEGIN) != INVALID_SET_FILE_POINTER &&
+        ReadFile(f, out, len, &got, NULL) && got == len;
+}
 
 static BOOL lomhd_load_pack(void)
 {
     char path[MAX_PATH];
     lomhd_path(path, sizeof(path), "lomhd_portraits.pack");
 
-    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    g_pack_file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
 
-    if (f == INVALID_HANDLE_VALUE)
+    if (g_pack_file == INVALID_HANDLE_VALUE)
     {
+        g_pack_file = NULL;
         lomhd_log("pack: lomhd_portraits.pack not found -- overlay off, game unchanged");
         return FALSE;
     }
 
-    DWORD size = GetFileSize(f, NULL), got = 0, bad = 0;
-    g_pack_bytes = HeapAlloc(GetProcessHeap(), 0, size ? size : 1);
-    BOOL ok = g_pack_bytes && ReadFile(f, g_pack_bytes, size, &got, NULL) && got == size;
-    CloseHandle(f);
+    DWORD size = GetFileSize(g_pack_file, NULL), bad = 0;
+    char head[8] = { 0 };
+    DWORD got = 0;
+    ReadFile(g_pack_file, head, 8, &got, NULL);
 
-    BOOL parsed = ok && lomhd_pack_parse(g_pack_bytes, size, &g_pack, &bad);
-
-    /* The parse copies every image out -- templates, names, and the upscales expanded or inflated
-     * to RGB -- so the file's bytes are not needed after it. A format-2 pack with buildings is
-     * ~100 MB; keeping it would double the overlay's footprint in a 32-bit game. */
-    if (g_pack_bytes)
+    if (got == 8 && memcmp(head, "LOMHDPK", 7) == 0 && head[7] != '3')
     {
-        HeapFree(GetProcessHeap(), 0, g_pack_bytes);
-        g_pack_bytes = NULL;
+        lomhd_log("pack: made by an older setup -- run lomhd_setup.py again. Overlay off");
+        return FALSE;
     }
 
-    if (!parsed)
+    DWORD start = GetTickCount();
+
+    if (!lomhd_pack_open(pack_read, g_pack_file, size, &g_pack, &bad))
     {
         lomhd_logf("pack: unreadable or corrupt near byte %ld of %ld -- overlay off",
             (long)bad, (long)size, 0);
         return FALSE;
     }
 
+    g_img = calloc(g_pack.count, sizeof(LOMHD_IMG));
+
+    if (!g_img)
+    {
+        lomhd_log("pack: out of memory -- overlay off");
+        return FALSE;
+    }
+
     /* The probe width doubles as a build check: a stale object linked against an older
      * LOMHD_PACK layout once printed a pointer here instead of the width (2026-09-22). */
-    lomhd_logf("pack: %ld images loaded, format %ld, probe width %ld",
-        g_pack.count, g_pack.version, g_pack.probe_width);
+    lomhd_logf("pack: %ld images loaded, format 3, probe width %ld, %ld ms",
+        g_pack.count, g_pack.probe_width, (long)(GetTickCount() - start));
     return TRUE;
+}
+
+/* Fulfil every outstanding request. A picture whose stream will not load is switched off for the
+ * session and logged; the rest of the pack keeps working. */
+static void lomhd_serve_requests(void)
+{
+    for (int p = 0; p < g_pack.count; p++)
+    {
+        if (g_img[p].state != IMG_REQUESTED)
+            continue;
+
+        const PORTRAIT* r = &g_pack.portraits[p];
+        BYTE* rgb = lomhd_load_upscale(&g_pack, p, pack_read, g_pack_file);
+        BYTE* idx = r->idx ? NULL : lomhd_load_indices(&g_pack, p, pack_read, g_pack_file);
+
+        if (!rgb || (!r->idx && !idx))
+        {
+            free(rgb);
+            free(idx);
+            InterlockedExchange(&g_img[p].state, IMG_FAILED);
+
+            char line[160];
+            _snprintf(line, sizeof(line), "pack: %s would not load -- that picture stays vanilla", r->name);
+            line[sizeof(line) - 1] = 0;
+            lomhd_log(line);
+            continue;
+        }
+
+        g_img[p].rgb = rgb;
+        g_img[p].idx = idx;
+        InterlockedExchange(&g_img[p].state, IMG_READY);
+        InterlockedIncrement(&g_loaded_seq);
+    }
 }
 
 BOOL lomhd_wants_opengl(void)
@@ -235,6 +315,9 @@ static DWORD WINAPI lomhd_worker(LPVOID unused)
     {
         WaitForSingleObject(g_worker_wake, 250);
 
+        if (g_pack_ready)
+            lomhd_serve_requests();
+
         const char* renderer = (const char*)g_renderer;
 
         if (renderer != reported_renderer && (g_debug || reported_renderer))
@@ -257,7 +340,7 @@ static DWORD WINAPI lomhd_worker(LPVOID unused)
         if (missing && !reported_gl)
         {
             char line[200];
-            _snprintf(line, sizeof(line), "overlay OFF: missing %s -- portraits stay vanilla", missing);
+            _snprintf(line, sizeof(line), "overlay OFF: missing %s -- pictures stay vanilla", missing);
             line[sizeof(line) - 1] = 0;
             lomhd_log(line);
             reported_gl = TRUE;
@@ -277,7 +360,7 @@ static DWORD WINAPI lomhd_worker(LPVOID unused)
             LeaveCriticalSection(&g_ddraw.cs);
 
             if (n == 0)
-                lomhd_log("seen: no portraits");
+                lomhd_log("seen: nothing known");
 
             for (int i = 0; i < n; i++)
             {
@@ -302,8 +385,8 @@ static DWORD WINAPI lomhd_worker(LPVOID unused)
 
         if (g_debug && now - last_report >= 5000)
         {
-            lomhd_logf("watchdog: frames=%ld want_frame=%ld pack=%ld",
-                InterlockedExchange(&g_frames, 0), g_want_frame, g_pack_ready);
+            lomhd_logf("watchdog: frames=%ld want_frame=%ld textures=%ld KB",
+                InterlockedExchange(&g_frames, 0), g_want_frame, (long)(g_tex_bytes >> 10));
             last_report = now;
         }
     }
@@ -315,27 +398,22 @@ static DWORD WINAPI lomhd_worker(LPVOID unused)
 /* Matching (render thread, g_ddraw.cs held -- memory only)                                    */
 /* ------------------------------------------------------------------------------------------- */
 
-/* The upscale as RGBA, with alpha cleared wherever the frame no longer shows the original pixel
- * at that position -- the cursor, a tooltip, a dialog edge drawn on top. Each original pixel
- * decides the upscale pixels that cover it. */
-static void build_masked_rgba(const PLACEMENT* p, const WORD* frame, int pitch_px, DWORD* out)
+/* 255 wherever the frame still shows the original's exact pixel, 0 where something covers it --
+ * the cursor, a tooltip, text on a page, the live map under the interface bar. The shader draws
+ * the upscale only where this is set, so a partly covered picture is still drawn correctly. */
+static void build_mask(const PLACEMENT* pl, const BYTE* idx, const WORD* frame, int pitch_px, BYTE* out)
 {
-    const PORTRAIT* r = &g_pack.portraits[p->portrait];
-    const WORD* t = r->templ[p->rule];
+    const PORTRAIT* r = &g_pack.portraits[pl->portrait];
+    const WORD* lut = r->lut[pl->rule];
 
-    for (int y = 0; y < r->hh; y++)
+    for (int y = 0; y < r->h; y++)
     {
-        int sy = y * r->h / r->hh;
-        const WORD* frame_row = frame + (p->y + sy) * pitch_px + p->x;
+        const WORD* row = frame + (pl->y + y) * pitch_px + pl->x;
+        const BYTE* t = idx + y * r->w;
+        BYTE* m = out + y * r->w;
 
-        for (int x = 0; x < r->hw; x++)
-        {
-            int sx = x * r->w / r->hw;
-            const BYTE* c = r->hd_rgb + (y * r->hw + x) * 3;
-            BOOL visible = frame_row[sx] == t[sy * r->w + sx];
-
-            out[y * r->hw + x] = (visible ? 0xFF000000u : 0) | (c[2] << 16) | (c[1] << 8) | c[0];
-        }
+        for (int x = 0; x < r->w; x++)
+            m[x] = row[x] == lut[t[x]] ? 255 : 0;
     }
 }
 
@@ -370,26 +448,43 @@ static void lomhd_scan(void)
 
     memcpy(g_placements, result, sizeof(PLACEMENT) * found);
     g_placement_count = found;
+    g_scan_count++;
 
     int slots = 0;
+    BOOL requested = FALSE;
     float fw = (float)primary->width, fh = (float)primary->height;
 
     for (int i = 0; i < found; i++)
     {
-        const PORTRAIT* r = &g_pack.portraits[result[i].portrait];
+        int p = result[i].portrait;
+        const PORTRAIT* r = &g_pack.portraits[p];
+        LOMHD_IMG* img = &g_img[p];
 
-        if (r->hw * r->hh > LOMHD_MAX_HD_PIXELS)
-            continue;
+        img->last_used = g_scan_count;
 
-        if (!g_slot_rgba[slots])
-            g_slot_rgba[slots] = HeapAlloc(GetProcessHeap(), 0, LOMHD_MAX_HD_PIXELS * 4);
+        if (img->state == IMG_NONE)
+        {
+            InterlockedExchange(&img->state, IMG_REQUESTED);
+            requested = TRUE;
+        }
 
-        if (!g_slot_rgba[slots])
+        if (img->state != IMG_READY)
+            continue;                       /* drawn once loaded; the original shows until then */
+
+        size_t need = (size_t)r->w * r->h;
+
+        if (g_slot_mask_cap[slots] < need)
+        {
+            free(g_slot_mask[slots]);
+            g_slot_mask[slots] = malloc(need);
+            g_slot_mask_cap[slots] = g_slot_mask[slots] ? need : 0;
+        }
+
+        if (!g_slot_mask[slots])
             break;
 
-        build_masked_rgba(&result[i], frame, primary->pitch / 2, g_slot_rgba[slots]);
-        g_slot_w[slots] = r->hw;
-        g_slot_h[slots] = r->hh;
+        build_mask(&result[i], r->idx ? r->idx : img->idx, frame, primary->pitch / 2, g_slot_mask[slots]);
+        g_slot_img[slots] = p;
         g_quad[slots][0] = result[i].x / fw * 2 - 1;
         g_quad[slots][1] = 1 - result[i].y / fh * 2;
         g_quad[slots][2] = (result[i].x + r->w) / fw * 2 - 1;
@@ -398,6 +493,9 @@ static void lomhd_scan(void)
     }
 
     g_slot_count = slots;
+
+    if (requested)
+        SetEvent(g_worker_wake);
 
     if (changed)
     {
@@ -409,7 +507,7 @@ static void lomhd_scan(void)
 }
 
 /* ------------------------------------------------------------------------------------------- */
-/* Drawing (render thread, g_ddraw.cs held, the GL context current)                            */
+/* Drawing (render thread, the GL context current)                                             */
 /* ------------------------------------------------------------------------------------------- */
 
 static char LOMHD_VERT[] =
@@ -419,16 +517,18 @@ static char LOMHD_VERT[] =
     "out vec2 tc;\n"
     "void main() { gl_Position = vec4(pos, 0.0, 1.0); tc = uv; }\n";
 
-/* Discard rather than blend: the texture's alpha is a 0/1 mask of which pixels still show the
- * portrait, and discarding needs no blend state, which this context does not expose. */
+/* Discard rather than blend: the mask is 0/1 per original pixel, and discarding needs no blend
+ * state, which this context does not expose. The mask is sampled NEAREST, so each original pixel
+ * decides the upscale pixels over it. */
 static char LOMHD_FRAG[] =
     "#version 150\n"
     "uniform sampler2D tex;\n"
+    "uniform sampler2D mask;\n"
     "in vec2 tc;\n"
     "out vec4 color;\n"
-    "void main() { vec4 c = texture(tex, tc); if (c.a < 0.5) discard; color = vec4(c.rgb, 1.0); }\n";
+    "void main() { if (texture(mask, tc).r < 0.5) discard; color = vec4(texture(tex, tc).rgb, 1.0); }\n";
 
-static GLuint g_program, g_vao, g_vbo, g_ebo, g_tex[LOMHD_MAX_PLACEMENTS];
+static GLuint g_program, g_vao, g_vbo, g_ebo, g_mask_tex[LOMHD_MAX_PLACEMENTS];
 static PFNGLGETINTEGERVPROC lomhd_glGetIntegerv;
 static HGLRC g_gl_context;              /* the context g_program and friends were created in */
 
@@ -452,9 +552,28 @@ static BOOL lomhd_resolve_basics(void)
 
     return lomhd_glGetIntegerv && lomhd_wglGetCurrentContext;
 }
-static GLint g_pos_loc, g_uv_loc, g_tex_loc;
+static GLint g_pos_loc, g_uv_loc, g_tex_loc, g_mask_loc;
 static BOOL g_gl_failed;
 static BOOL g_gl_failed_permanently;   /* a missing entry point does not come back */
+
+/* Every texture this overlay made belongs to the context it was made in. */
+static void lomhd_forget_textures(void)
+{
+    for (int p = 0; g_img && p < g_pack.count; p++)
+    {
+        if (!g_img[p].tex)
+            continue;
+
+        /* The upscale's CPU copy was freed at upload, so the picture must be loaded again. */
+        g_img[p].tex = 0;
+        free(g_img[p].idx);
+        g_img[p].idx = NULL;
+        InterlockedExchange(&g_img[p].state, IMG_NONE);
+    }
+
+    g_tex_bytes = 0;
+    memset(g_mask_tex, 0, sizeof(g_mask_tex));
+}
 
 /* Whether the current context can run the overlay at all. Decided BEFORE lomhd_draw queries any
  * state: GL_VERTEX_ARRAY_BINDING is GL 3.0 state, and querying it in a 2.x context raises
@@ -465,16 +584,14 @@ static BOOL lomhd_gl_usable(void)
 {
     /* cnc-ddraw creates a fresh GL context every time its render thread starts -- window resize,
      * fullscreen toggle, display mode change -- and deletes the old one. Object names from the old
-     * context mean nothing in the new one, and binding a stale texture name leaves cnc-ddraw's own
-     * frame texture bound, which the upload below would then redefine at portrait size. So the
-     * objects are owned by the context they were made in, and remade when it changes.
-     * (Found by cross-model review, 2026-09-22.) */
+     * context mean nothing in the new one, so the objects are owned by the context they were made
+     * in, and remade when it changes. (Found by cross-model review, 2026-09-22.) */
     HGLRC current = lomhd_wglGetCurrentContext();
 
     if (current != g_gl_context)
     {
         g_program = g_vao = g_vbo = g_ebo = 0;
-        memset(g_tex, 0, sizeof(g_tex));
+        lomhd_forget_textures();
         g_gl_failed = FALSE;
         g_gl_context = current;
     }
@@ -494,7 +611,7 @@ static BOOL lomhd_gl_usable(void)
     }
 
     /* Every entry point lomhd_draw and lomhd_gl_init use, checked before the first call. A missing
-     * one turns the overlay off -- vanilla portraits -- and the worker logs which; never a crash. */
+     * one turns the overlay off -- vanilla pictures -- and the worker logs which; never a crash. */
     struct { const char* name; void* fn; } needed[] = {
         { "glGetIntegerv", (void*)lomhd_glGetIntegerv }, { "glUseProgram", (void*)glUseProgram },
         { "glGetAttribLocation", (void*)glGetAttribLocation },
@@ -507,6 +624,7 @@ static BOOL lomhd_gl_usable(void)
         { "glActiveTexture", (void*)glActiveTexture }, { "glGenTextures", (void*)glGenTextures },
         { "glBindTexture", (void*)glBindTexture }, { "glTexParameteri", (void*)glTexParameteri },
         { "glTexImage2D", (void*)glTexImage2D }, { "glDrawElements", (void*)glDrawElements },
+        { "glDeleteTextures", (void*)glDeleteTextures }, { "glPixelStorei", (void*)glPixelStorei },
     };
 
     for (size_t i = 0; i < sizeof(needed) / sizeof(needed[0]); i++)
@@ -521,6 +639,14 @@ static BOOL lomhd_gl_usable(void)
     }
 
     return TRUE;
+}
+
+static void texture_params(GLint filter)
+{
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 }
 
 /* Objects for the current context. lomhd_gl_usable has already vetted it. */
@@ -542,6 +668,7 @@ static BOOL lomhd_gl_init(void)
     g_pos_loc = glGetAttribLocation(g_program, "pos");
     g_uv_loc = glGetAttribLocation(g_program, "uv");
     g_tex_loc = glGetUniformLocation(g_program, "tex");
+    g_mask_loc = glGetUniformLocation(g_program, "mask");
 
     static const GLushort indices[6] = { 0, 1, 2, 0, 2, 3 };
 
@@ -560,18 +687,49 @@ static BOOL lomhd_gl_init(void)
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
     glBindVertexArray(0);
 
-    glGenTextures(LOMHD_MAX_PLACEMENTS, g_tex);
+    glGenTextures(LOMHD_MAX_PLACEMENTS, g_mask_tex);
 
     for (int i = 0; i < LOMHD_MAX_PLACEMENTS; i++)
     {
-        glBindTexture(GL_TEXTURE_2D, g_tex[i]);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_2D, g_mask_tex[i]);
+        texture_params(GL_NEAREST);
     }
 
     return TRUE;
+}
+
+static BOOL on_screen(int p)
+{
+    for (int i = 0; i < g_slot_count; i++)
+        if (g_slot_img[i] == p)
+            return TRUE;
+
+    return FALSE;
+}
+
+/* Over budget: drop the least recently drawn upscale that is not on screen this frame. */
+static void lomhd_evict(void)
+{
+    while (g_tex_bytes > LOMHD_TEX_BUDGET)
+    {
+        int oldest = -1;
+
+        for (int p = 0; p < g_pack.count; p++)
+            if (g_img[p].tex && !on_screen(p) && (oldest < 0 || g_img[p].last_used < g_img[oldest].last_used))
+                oldest = p;
+
+        if (oldest < 0)
+            return;
+
+        LOMHD_IMG* img = &g_img[oldest];
+        const PORTRAIT* r = &g_pack.portraits[oldest];
+        glDeleteTextures(1, &img->tex);
+        img->tex = 0;
+        g_tex_bytes -= (size_t)r->hw * r->hh * 4;
+        free(img->idx);
+        img->idx = NULL;
+        InterlockedExchange(&img->state, IMG_NONE);
+    }
 }
 
 void lomhd_draw(void)
@@ -593,14 +751,20 @@ void lomhd_draw(void)
         return;
 
     /* Captured BEFORE lomhd_gl_init, which binds objects of its own the first time it runs in a
-     * context; capturing after it would "restore" lomhd's bindings instead of cnc-ddraw's. */
-    GLint old_program, old_vao, old_active, old_tex, old_array_buffer;
+     * context; capturing after it would "restore" lomhd's bindings instead of cnc-ddraw's. Both
+     * texture units the shader samples, and the unpack state: cnc-ddraw sets its own row length
+     * for its frame upload, and R8 and RGB rows are rarely a multiple of four bytes. */
+    GLint old_program, old_vao, old_active, old_tex0, old_tex1, old_array_buffer, old_align, old_row;
     lomhd_glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_array_buffer);
     lomhd_glGetIntegerv(GL_CURRENT_PROGRAM, &old_program);
     lomhd_glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &old_vao);
     lomhd_glGetIntegerv(GL_ACTIVE_TEXTURE, &old_active);
+    lomhd_glGetIntegerv(GL_UNPACK_ALIGNMENT, &old_align);
+    lomhd_glGetIntegerv(GL_UNPACK_ROW_LENGTH, &old_row);
+    glActiveTexture(GL_TEXTURE1);
+    lomhd_glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_tex1);
     glActiveTexture(GL_TEXTURE0);
-    lomhd_glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_tex);
+    lomhd_glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_tex0);
 
     if (!lomhd_gl_init())
     {
@@ -608,16 +772,48 @@ void lomhd_draw(void)
         return;
     }
 
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+
+    /* Upscales that arrived since the last draw: upload once, then the CPU copy goes. */
+    for (int i = 0; i < g_slot_count; i++)
+    {
+        LOMHD_IMG* img = &g_img[g_slot_img[i]];
+        const PORTRAIT* r = &g_pack.portraits[g_slot_img[i]];
+
+        if (img->tex || !img->rgb)
+            continue;
+
+        glGenTextures(1, &img->tex);
+        glBindTexture(GL_TEXTURE_2D, img->tex);
+        texture_params(GL_LINEAR);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, r->hw, r->hh, 0, GL_RGB, GL_UNSIGNED_BYTE, img->rgb);
+        free(img->rgb);
+        img->rgb = NULL;
+        g_tex_bytes += (size_t)r->hw * r->hh * 4;
+    }
+
+    lomhd_evict();
+
     glUseProgram(g_program);
     glUniform1i(g_tex_loc, 0);
+    glUniform1i(g_mask_loc, 1);
     glBindVertexArray(g_vao);
     glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
 
     for (int i = 0; i < g_slot_count; i++)
     {
-        glBindTexture(GL_TEXTURE_2D, g_tex[i]);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_slot_w[i], g_slot_h[i], 0, GL_RGBA,
-            GL_UNSIGNED_BYTE, g_slot_rgba[i]);
+        LOMHD_IMG* img = &g_img[g_slot_img[i]];
+        const PORTRAIT* r = &g_pack.portraits[g_slot_img[i]];
+
+        if (!img->tex)
+            continue;
+
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, g_mask_tex[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, r->w, r->h, 0, GL_RED, GL_UNSIGNED_BYTE, g_slot_mask[i]);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, img->tex);
 
         /* Texture row 0 is the top of the picture, the convention cnc-ddraw uses for the frame. */
         float x0 = g_quad[i][0], y0 = g_quad[i][1], x1 = g_quad[i][2], y1 = g_quad[i][3];
@@ -632,9 +828,14 @@ void lomhd_draw(void)
         glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
     }
 
+    glPixelStorei(GL_UNPACK_ALIGNMENT, old_align);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, old_row);
     glBindVertexArray(old_vao);
     glBindBuffer(GL_ARRAY_BUFFER, old_array_buffer);
-    glBindTexture(GL_TEXTURE_2D, old_tex);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, old_tex1);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, old_tex0);
     glActiveTexture(old_active);
     glUseProgram(old_program);
 }
@@ -691,7 +892,15 @@ void lomhd_on_frame(const char* renderer)
     lomhd_copy_frame_if_wanted();
 
     /* Only the OpenGL renderer can draw the overlay, so only it pays for the scan. A frame that
-     * has not changed cannot have moved a portrait, so it keeps the last scan. */
-    if (strcmp(renderer, "opengl") == 0 && (g_ddraw.render.surface_updated || !g_placement_count))
+     * has not changed cannot have moved a picture, so it keeps the last scan -- unless an upscale
+     * arrived since: on a still screen nothing else would ever rebuild the slots to draw it. */
+    static LONG scanned_loads;
+    LONG loads = g_loaded_seq;
+
+    if (strcmp(renderer, "opengl") == 0 &&
+        (g_ddraw.render.surface_updated || !g_placement_count || loads != scanned_loads))
+    {
+        scanned_loads = loads;
         lomhd_scan();
+    }
 }

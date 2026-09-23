@@ -912,6 +912,10 @@ buffer and *outsize its size in bytes. out must be freed by user after usage.
 unsigned lodepng_zlib_decompress(unsigned char** out, size_t* outsize,
                                  const unsigned char* in, size_t insize,
                                  const LodePNGDecompressSettings* settings);
+
+/*lomhd: the same, refusing to produce more than max_out bytes (error 83). *out starts empty.*/
+unsigned lodepng_zlib_decompress_bounded(unsigned char** out, size_t* outsize,
+                                         const unsigned char* in, size_t insize, size_t max_out);
 #endif /*LODEPNG_COMPILE_DECODER*/
 
 #ifdef LODEPNG_COMPILE_ENCODER
