@@ -127,6 +127,18 @@ int main(void)
         lomhd_pack_free(&pack);
     }
 
+    /* What the loader asks before opening: this build's format opens, any other LOMHDPK version is
+     * "made by an older setup", anything else is not a pack. */
+    {
+        two(); tp_finish();
+        BOOL current = lomhd_pack_version(tp_buf, 8) == LOMHD_PACK_CURRENT && opens(tp_len);
+        BYTE older[8]; memcpy(older, "LOMHDPK3", 8);
+        check("the loader's version check passes the pack this reader opens", current);
+        check("... names an older LOMHDPK version as one", lomhd_pack_version(older, 8) == LOMHD_PACK_OTHER_VERSION);
+        check("... and anything else as no pack", lomhd_pack_version((const BYTE*)"PNG....x", 8) == LOMHD_PACK_UNKNOWN &&
+            lomhd_pack_version(tp_buf, 7) == LOMHD_PACK_UNKNOWN);
+    }
+
     /* Sprites (format 4). A sprite is probed on 16-pixel opaque runs; indices 0 (its key here) and
      * 1 (the shadow) are not part of it. */
     {

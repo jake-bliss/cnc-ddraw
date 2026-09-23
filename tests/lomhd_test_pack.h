@@ -5,13 +5,14 @@
 #define LOMHD_TEST_PACK_H
 
 #include <windows.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "lomhd_match.h"
 
 #define TP_MAX 6000
 
-static BYTE tp_buf[1 << 24];
+static BYTE tp_buf[1 << 25];
 static DWORD tp_len;
 
 typedef struct { const BYTE* data; DWORD size; } TP_MEM;
@@ -86,14 +87,22 @@ static TP_RECORD* tp_add_sprite(const char* name, int w, int h, const BYTE* idx,
     return r;
 }
 
-static void tp_put(const void* p, DWORD n) { memcpy(tp_buf + tp_len, p, n); tp_len += n; }
+/* The builders' buffers are fixed; a case too big for them stops the run rather than writing past
+ * them. The capacity cases once overran an 8 MB stream buffer and passed by layout luck (Claude
+ * review, 2026-09-23: AddressSanitizer). */
+static void tp_room(DWORD have, DWORD used, DWORD more)
+{
+    if ((unsigned long long)used + more > have) { printf("test pack buffer too small\n"); exit(2); }
+}
+
+static void tp_put(const void* p, DWORD n) { tp_room(sizeof tp_buf, tp_len, n); memcpy(tp_buf + tp_len, p, n); tp_len += n; }
 static void tp_u16(int v) { WORD x = (WORD)v; tp_put(&x, 2); }
 static void tp_u32(DWORD v) { tp_put(&v, 4); }
 
 /* Lay the pack out: header, index, then each record's two streams. Returns its size. */
 static DWORD tp_finish(void)
 {
-    static BYTE z[1 << 23], scratch[1 << 23];
+    static BYTE z[1 << 25], scratch[1 << 23];
     static DWORD zlen[TP_MAX][2];
     tp_len = 0;
     tp_put(LOMHD_PACK_MAGIC, 8);
@@ -105,10 +114,13 @@ static DWORD tp_finish(void)
     {
         TP_RECORD* r = &tp_records[i];
         DWORD n = r->idx_bytes ? r->idx_bytes : (DWORD)(r->w * r->h);
+        tp_room(sizeof scratch, 0, n);
         if (n <= (DWORD)(r->w * r->h)) memcpy(scratch, r->idx, n);
         else { memcpy(scratch, r->idx, r->w * r->h); memset(scratch + r->w * r->h, 0, n - r->w * r->h); }
+        tp_room(sizeof z, zpos, n + 5 * (n / 65535 + 1) + 6);
         zlen[i][0] = tp_zlib(z + zpos, scratch, n); zpos += zlen[i][0];
         DWORD m = r->hd_bytes ? r->hd_bytes : (DWORD)(r->hw * r->hh * ((r->flags & 1) ? 4 : 3));
+        tp_room(sizeof z, zpos, m + 5 * (m / 65535 + 1) + 6);
         zlen[i][1] = tp_zlib(z + zpos, NULL, m); zpos += zlen[i][1];
     }
     for (int i = 0; i < tp_count; i++)

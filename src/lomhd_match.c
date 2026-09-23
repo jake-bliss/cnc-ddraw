@@ -168,6 +168,14 @@ static int u16_at(const BYTE* b) { return b[0] | b[1] << 8; }
  * and every stream is checked to lie inside the file. Every image's indices are inflated here (to
  * build its probes and sample), so a damaged index stream refuses the pack; a damaged upscale is
  * found only when it is first drawn, and that image alone is then switched off. */
+int lomhd_pack_version(const BYTE* head, DWORD got)
+{
+    if (got < 8 || memcmp(head, LOMHD_PACK_MAGIC, 7) != 0)
+        return LOMHD_PACK_UNKNOWN;
+
+    return head[7] == (BYTE)LOMHD_PACK_MAGIC[7] ? LOMHD_PACK_CURRENT : LOMHD_PACK_OTHER_VERSION;
+}
+
 BOOL lomhd_pack_open(LOMHD_READ read, void* ctx, DWORD size, LOMHD_PACK* pack, DWORD* bad_offset)
 {
     BYTE head[12], rec[8 + 2 + 768 + 8];
@@ -469,10 +477,11 @@ static int count_sample(const WORD* frame, int pitch_px, int x, int y, const POR
  * still shows the original's exact pixel, so a partly covered screen still draws correctly.
  *
  * A sprite is scored on its opaque pixels only, at LOMHD_SPRITE_FRACTION: on the map, trees stand in
- * front of trees, and captured ones matched 81-88% (2026-09-23). Its pre-check is looser for the
- * same reason. Transparent and shadow pixels show whatever is behind, so they cannot count. */
+ * front of trees, and captured ones matched 81-88% (2026-09-23). It has no pre-check: a sprite is
+ * small, and a sample can fail where the full count passes -- cover only the sampled rows and 83%
+ * still matches (Codex review, 2026-09-23). Transparent and shadow pixels show whatever is behind,
+ * so they cannot count. */
 #define LOMHD_SPARSE_FRACTION 0.6
-#define LOMHD_SPRITE_SPARSE_FRACTION 0.5
 
 typedef struct
 {
@@ -503,9 +512,9 @@ static int score(const WORD* frame, int pitch_px, int x, int y, const PORTRAIT* 
         return count_sample(frame, pitch_px, x, y, r, rule, needed);
 
     int samples = r->opaque_sample;
-    double sparse = r->masked ? LOMHD_SPRITE_SPARSE_FRACTION : LOMHD_SPARSE_FRACTION;
 
-    if (samples >= 64 && count_sample(frame, pitch_px, x, y, r, rule, (int)(sparse * samples)) < 0)
+    if (!r->masked && samples >= 64 &&
+        count_sample(frame, pitch_px, x, y, r, rule, (int)(LOMHD_SPARSE_FRACTION * samples)) < 0)
         return -1;
 
     return count_matches(frame, pitch_px, x, y, r, rule, needed);

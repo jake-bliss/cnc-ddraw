@@ -233,6 +233,18 @@ int main(void)
     printf("    (keeps %d%%)\n", kept_percent(wide, 96, 24, 200, 100));
     expect("a sprite with its middle covered is found by a side probe", (const char*[]){ "wide@200,100" }, 1);
 
+    /* Covered only on the rows a 1-in-16 sample reads: 83% of it still matches, so it is found. A
+     * sampled pre-check at 50% rejected it (Codex review, 2026-09-23). */
+    {
+        static BYTE solid[40 * 36];
+        picture(solid, 40, 36, 16);
+        begin(1); tp_add_sprite("solid", 40, 36, solid, 0);
+        background(32); draw_sprite(solid, 40, 36, 400, 100);
+        for (int j = 4; j <= 24; j += 4) for (int i = 0; i < 40; i++) frame_idx[100 + j][400 + i] ^= 128;
+        printf("    (keeps %d%%)\n", kept_percent(solid, 40, 36, 400, 100));
+        expect("a sprite covered only on its sampled rows is found", (const char*[]){ "solid@400,100" }, 1);
+    }
+
     /* Only opaque pixels count toward the bar. The post is three quarters transparent; with 40% of
      * its opaque pixels covered it must not pass, though 90% of its box still "matches". */
     begin(1); tp_add_sprite("post", 96, 24, post, 0);

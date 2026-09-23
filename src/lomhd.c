@@ -215,9 +215,9 @@ static BOOL lomhd_load_pack(void)
     /* Any other LOMHDPK version is one this build does not read. The version was once spelled out
      * here as well as in the reader, and the format-4 reader shipped behind a format-3 check that
      * refused every pack it could read (Claude review, 2026-09-23). */
-    if (got == 8 && memcmp(head, LOMHD_PACK_MAGIC, 7) == 0 && head[7] != LOMHD_PACK_MAGIC[7])
+    if (lomhd_pack_version((const BYTE*)head, got) == LOMHD_PACK_OTHER_VERSION)
     {
-        lomhd_log("pack: made by an older setup -- run lomhd_setup.py again. Overlay off");
+        lomhd_log("pack: made by a different setup version -- run lomhd_setup.py again. Overlay off");
         return FALSE;
     }
 
@@ -240,8 +240,9 @@ static BOOL lomhd_load_pack(void)
 
     /* The probe width doubles as a build check: a stale object linked against an older
      * LOMHD_PACK layout once printed a pointer here instead of the width (2026-09-22). */
-    lomhd_logf("pack: %ld images loaded, format 4, probe width %ld, %ld ms",
-        g_pack.count, g_pack.probe_width, (long)(GetTickCount() - start));
+    lomhd_logf("pack: %ld images loaded, format %ld, probe width %ld", g_pack.count,
+        (long)(LOMHD_PACK_MAGIC[7] - '0'), g_pack.probe_width);
+    lomhd_logf("pack: opened in %ld ms", (long)(GetTickCount() - start), 0, 0);
     lomhd_logf("pack: %ld of them sprites, sprite probe width %ld", g_pack.sprites,
         LOMHD_SPRITE_PROBE_W, 0);
     return TRUE;

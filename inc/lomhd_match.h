@@ -67,6 +67,12 @@ typedef struct
     unsigned long long pow, sprite_pow; /* HASH_BASE^(width-1) for each probe width */
 } LOMHD_PACK;
 
+/* What the first 8 bytes of a file say: this build's pack, another LOMHDPK version (made by an
+ * older or newer setup -- the player should run it again), or not a pack at all. The loader asks this
+ * before opening; the version once lived there as its own literal and fell behind (2026-09-23). */
+enum { LOMHD_PACK_UNKNOWN, LOMHD_PACK_CURRENT, LOMHD_PACK_OTHER_VERSION };
+int lomhd_pack_version(const BYTE* head, DWORD got);
+
 /* Read a pack's index and every image's indices (which it inflates to build probes and samples,
  * so a damaged index stream is caught here). Upscales stay in the file. Returns FALSE, and sets
  * *bad_offset, on anything unexpected: a half-parsed pack would draw the wrong image somewhere. */
