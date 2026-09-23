@@ -237,8 +237,10 @@ static BOOL lomhd_load_pack(void)
 
     /* The probe width doubles as a build check: a stale object linked against an older
      * LOMHD_PACK layout once printed a pointer here instead of the width (2026-09-22). */
-    lomhd_logf("pack: %ld images loaded, format 3, probe width %ld, %ld ms",
+    lomhd_logf("pack: %ld images loaded, format 4, probe width %ld, %ld ms",
         g_pack.count, g_pack.probe_width, (long)(GetTickCount() - start));
+    lomhd_logf("pack: %ld of them sprites, sprite probe width %ld", g_pack.sprites,
+        LOMHD_SPRITE_PROBE_W, 0);
     return TRUE;
 }
 
@@ -401,8 +403,9 @@ static DWORD WINAPI lomhd_worker(LPVOID unused)
 /* ------------------------------------------------------------------------------------------- */
 
 /* 255 wherever the frame still shows the original's exact pixel, 0 where something covers it --
- * the cursor, a tooltip, text on a page, the live map under the interface bar. The shader draws
- * the upscale only where this is set, so a partly covered picture is still drawn correctly. */
+ * the cursor, a tooltip, text on a page, the live map under the interface bar, a unit in front of
+ * a tree. The shader draws the upscale only where this is set, so a partly covered picture is still
+ * drawn correctly. A sprite's transparent and shadow pixels are never its own: 0 as well. */
 static void build_mask(const PLACEMENT* pl, const BYTE* idx, const WORD* frame, int pitch_px, BYTE* out)
 {
     const PORTRAIT* r = &g_pack.portraits[pl->portrait];
@@ -415,7 +418,7 @@ static void build_mask(const PLACEMENT* pl, const BYTE* idx, const WORD* frame, 
         BYTE* m = out + y * r->w;
 
         for (int x = 0; x < r->w; x++)
-            m[x] = row[x] == lut[t[x]] ? 255 : 0;
+            m[x] = !r->skip[t[x]] && row[x] == lut[t[x]] ? 255 : 0;
     }
 }
 
@@ -537,16 +540,24 @@ static char LOMHD_VERT[] =
     "out vec2 tc;\n"
     "void main() { gl_Position = vec4(pos, 0.0, 1.0); tc = uv; }\n";
 
-/* Discard rather than blend: the mask is 0/1 per original pixel, and discarding needs no blend
- * state, which this context does not expose. The mask is sampled NEAREST, so each original pixel
- * decides the upscale pixels over it. */
+/* Discard rather than blend: discarding needs no blend state, which cnc-ddraw never sets and this
+ * overlay does not want to own. For a picture the mask is sampled NEAREST, so each original pixel
+ * decides the upscale pixels over it. A sprite's edge is its upscale's own alpha, times the mask
+ * sampled LINEAR, cut at one half: the outline follows the upscale at twice the resolution rather
+ * than the original's pixel steps, and a cover (a unit in front) still cuts it out. */
 static char LOMHD_FRAG[] =
     "#version 150\n"
     "uniform sampler2D tex;\n"
     "uniform sampler2D mask;\n"
+    "uniform int masked;\n"
     "in vec2 tc;\n"
     "out vec4 color;\n"
-    "void main() { if (texture(mask, tc).r < 0.5) discard; color = vec4(texture(tex, tc).rgb, 1.0); }\n";
+    "void main() {\n"
+    "  vec4 t = texture(tex, tc);\n"
+    "  float keep = masked != 0 ? t.a * texture(mask, tc).r : texture(mask, tc).r;\n"
+    "  if (keep < 0.5) discard;\n"
+    "  color = vec4(t.rgb, 1.0);\n"
+    "}\n";
 
 static GLuint g_program, g_vao, g_vbo, g_ebo, g_mask_tex[LOMHD_MAX_PLACEMENTS];
 static PFNGLGETINTEGERVPROC lomhd_glGetIntegerv;
@@ -572,7 +583,7 @@ static BOOL lomhd_resolve_basics(void)
 
     return lomhd_glGetIntegerv && lomhd_wglGetCurrentContext;
 }
-static GLint g_pos_loc, g_uv_loc, g_tex_loc, g_mask_loc;
+static GLint g_pos_loc, g_uv_loc, g_tex_loc, g_mask_loc, g_masked_loc;
 static BOOL g_gl_failed;
 static BOOL g_gl_failed_permanently;   /* a missing entry point does not come back */
 
@@ -693,6 +704,7 @@ static BOOL lomhd_gl_init(void)
     g_uv_loc = glGetAttribLocation(g_program, "uv");
     g_tex_loc = glGetUniformLocation(g_program, "tex");
     g_mask_loc = glGetUniformLocation(g_program, "mask");
+    g_masked_loc = glGetUniformLocation(g_program, "masked");
 
     static const GLushort indices[6] = { 0, 1, 2, 0, 2, 3 };
 
@@ -811,7 +823,10 @@ void lomhd_draw(void)
         glGenTextures(1, &img->tex);
         glBindTexture(GL_TEXTURE_2D, img->tex);
         texture_params(GL_LINEAR);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, r->hw, r->hh, 0, GL_RGB, GL_UNSIGNED_BYTE, img->rgb);
+        if (r->masked)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, r->hw, r->hh, 0, GL_RGBA, GL_UNSIGNED_BYTE, img->rgb);
+        else
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, r->hw, r->hh, 0, GL_RGB, GL_UNSIGNED_BYTE, img->rgb);
         free(img->rgb);
         img->rgb = NULL;
         g_tex_bytes += (size_t)r->hw * r->hh * 4;
@@ -835,7 +850,9 @@ void lomhd_draw(void)
 
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, g_mask_tex[i]);
+        texture_params(r->masked ? GL_LINEAR : GL_NEAREST);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, r->w, r->h, 0, GL_RED, GL_UNSIGNED_BYTE, g_slot_mask[i]);
+        glUniform1i(g_masked_loc, r->masked);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, img->tex);
 

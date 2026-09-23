@@ -4,10 +4,11 @@
 #include "lomhd_match.h"
 #include "lodepng.h"
 
-/* Finding known images in a frame. Pure -- see lomhd_match.h. The pack format (3) is described at
+/* Finding known images in a frame. Pure -- see lomhd_match.h. The pack format (4) is described at
  * lomhd_pack_open. Formats 1 and 2 held every upscale in memory at once; with full-screen art that
- * is ~1.8 GB in a 32-bit process, so format 3 keeps upscales in the file until they are drawn, and
- * the pack is rebuilt by the setup script rather than read in an older shape.
+ * is ~1.8 GB in a 32-bit process, so format 3 keeps upscales in the file until they are drawn.
+ * Format 4 adds sprites, which have pixels that are not part of them. The pack is rebuilt by the
+ * setup script rather than read in an older shape.
  *
  * Upscales are full colour: the overlay draws its own texture, so the upscale need not be squeezed
  * into the original's 256 colours -- that remap, and the despeckle before it, were what lost
@@ -38,7 +39,8 @@ static unsigned long long run_hash(const WORD* px, int n)
     return h;
 }
 
-static void table_insert(PROBE* table, unsigned long long hash, int portrait, int rule, int row, int col)
+static void table_insert(PROBE* table, unsigned long long hash, int portrait, int width, int rule,
+    int row, int col)
 {
     for (int i = (int)(hash & (LOMHD_TABLE - 1)); ; i = (i + 1) & (LOMHD_TABLE - 1))
     {
@@ -46,6 +48,7 @@ static void table_insert(PROBE* table, unsigned long long hash, int portrait, in
         {
             table[i].hash = hash;
             table[i].portrait = portrait;
+            table[i].width = width;
             table[i].rule = rule;
             table[i].row = row;
             table[i].col = col;
@@ -57,16 +60,26 @@ static void table_insert(PROBE* table, unsigned long long hash, int portrait, in
 /* Where in a row to take the probe slice: the 32 pixels with the most distinct colours. A flat
  * slice -- black, sky, bare parchment -- also occurs all over the frame, and every such hit costs a
  * full comparison of a large image: the first multi-width build took ~10 s a frame against 2.5 ms
- * (2026-09-22). Ties go to the middle, away from shared frame borders. */
-static int busiest_slice(const WORD* row, int w)
+ * (2026-09-22). Ties go to the middle, away from shared frame borders.
+ *
+ * A sprite's slice must also be wholly opaque -- behind a transparent pixel the frame shows
+ * whatever is underneath -- so `opaque` (NULL for a picture) limits the choice, every column is
+ * tried rather than every other one, and -1 means the row has no such slice. */
+static int busiest_slice(const WORD* row, int w, int width, const BYTE* opaque, int from, int to)
 {
-    int best = (w - LOMHD_PROBE_W) / 2, best_distinct = -1, mid = best;
+    int best = opaque ? -1 : (w - width) / 2, best_distinct = -1, mid = (from + to - 1) / 2;
 
-    for (int col = 0; col + LOMHD_PROBE_W <= w; col += 2)
+    for (int col = from; col < to && col + width <= w; col += opaque ? 1 : 2)
     {
-        int distinct = 0;
+        int distinct = 0, solid = 1;
 
-        for (int i = 0; i < LOMHD_PROBE_W; i++)
+        for (int i = 0; opaque && i < width && solid; i++)
+            solid = opaque[col + i];
+
+        if (!solid)
+            continue;
+
+        for (int i = 0; i < width; i++)
         {
             BOOL repeat = FALSE;
 
@@ -78,7 +91,7 @@ static int busiest_slice(const WORD* row, int w)
 
         int dist = col > mid ? col - mid : mid - col, best_dist = best > mid ? best - mid : mid - best;
 
-        if (distinct > best_distinct || (distinct == best_distinct && dist < best_dist))
+        if (best < 0 || distinct > best_distinct || (distinct == best_distinct && dist < best_dist))
         {
             best = col;
             best_distinct = distinct;
@@ -135,35 +148,41 @@ BYTE* lomhd_load_indices(const LOMHD_PACK* pack, int p, LOMHD_READ read, void* c
 BYTE* lomhd_load_upscale(const LOMHD_PACK* pack, int p, LOMHD_READ read, void* ctx)
 {
     const PORTRAIT* r = &pack->portraits[p];
-    return load_exact(read, ctx, r->hd_off, r->hd_len, (size_t)r->hw * r->hh * 3);
+    return load_exact(read, ctx, r->hd_off, r->hd_len, (size_t)r->hw * r->hh * (r->masked ? 4 : 3));
 }
 
 static DWORD u32_at(const BYTE* b) { return b[0] | b[1] << 8 | b[2] << 16 | (DWORD)b[3] << 24; }
 static int u16_at(const BYTE* b) { return b[0] | b[1] << 8; }
 
-/* Format 3, little-endian:
- *   "LOMHDPK3", u32 count, then count index records:
- *     u8 name_len, name, u16 w, u16 h, u16 hw, u16 hh, 768-byte palette, u32 idx_len, u32 hd_len
+/* Format 4, little-endian:
+ *   "LOMHDPK4", u32 count, then count index records:
+ *     u8 name_len, name, u16 w, u16 h, u16 hw, u16 hh, u8 flags, u8 key, 768-byte palette,
+ *     u32 idx_len, u32 hd_len
  *   then the streams, in record order with nothing between them: zlib(w*h indices), then
- *   zlib(hw*hh*3 RGB), for each record. The last stream ends at the end of the file.
+ *   zlib(hw*hh*3 RGB) -- or hw*hh*4 RGBA for a masked image -- for each record. The last stream
+ *   ends at the end of the file.
+ * flags bit 0 is MASKED, a sprite: pixels of index `key` (its colour key) or LOMHD_SHADOW_INDEX
+ * are not part of it. Every other bit must be clear, and an unmasked image's key must be 0. A
+ * sprite needs LOMHD_PROBES rows with a LOMHD_SPRITE_PROBE_W opaque run, and is never "large".
  * No offsets are stored, so none can point anywhere odd: each is the sum of the lengths before it,
  * and every stream is checked to lie inside the file. Every image's indices are inflated here (to
  * build its probes and sample), so a damaged index stream refuses the pack; a damaged upscale is
  * found only when it is first drawn, and that image alone is then switched off. */
 BOOL lomhd_pack_open(LOMHD_READ read, void* ctx, DWORD size, LOMHD_PACK* pack, DWORD* bad_offset)
 {
-    BYTE head[12], rec[8 + 768 + 8];
+    BYTE head[12], rec[8 + 2 + 768 + 8];
     unsigned long long pos = 12;
     memset(pack, 0, sizeof(*pack));
     *bad_offset = 0;
 
-    if (size < 12 || !read(ctx, 0, 12, head) || memcmp(head, "LOMHDPK3", 8) != 0)
+    if (size < 12 || !read(ctx, 0, 12, head) || memcmp(head, "LOMHDPK4", 8) != 0)
         return FALSE;
 
     DWORD raw_count = u32_at(head + 8);
 
-    /* count x 2 rules x LOMHD_PROBES entries must leave the table well under half full, or every
-     * miss walks a long probe chain on every pixel of every frame. */
+    /* The probes must leave the table well under half full, or every miss walks a long probe chain
+     * on every pixel of every frame. A picture has 2 rules x LOMHD_PROBES; a sprite up to 2 x 3 x
+     * LOMHD_SPRITE_PROBE_ROWS, counted as they are inserted (see `probes` below). */
     if (raw_count == 0 || (unsigned long long)raw_count * 2 * LOMHD_PROBES > LOMHD_TABLE / 2)
     {
         *bad_offset = 8;
@@ -200,18 +219,29 @@ BOOL lomhd_pack_open(LOMHD_READ read, void* ctx, DWORD size, LOMHD_PACK* pack, D
         r->h = u16_at(rec + 2);
         r->hw = u16_at(rec + 4);
         r->hh = u16_at(rec + 6);
-        r->idx_len = u32_at(rec + 8 + 768);
-        r->hd_len = u32_at(rec + 8 + 768 + 4);
+        BYTE flags = rec[8], key = rec[9];
+        const BYTE* pal = rec + 10;
+        r->masked = flags & 1;
+        r->idx_len = u32_at(rec + 10 + 768);
+        r->hd_len = u32_at(rec + 10 + 768 + 4);
 
-        /* A probe hashes LOMHD_PROBE_W pixels of LOMHD_PROBES distinct rows; smaller images are
-         * refused rather than half-matched. An upscale over the side limit would never be drawn. */
-        if (r->w < LOMHD_PROBE_W || r->h < LOMHD_PROBES + 1 || r->hw < 1 || r->hh < 1 ||
+        /* A probe hashes LOMHD_PROBE_W pixels (LOMHD_SPRITE_PROBE_W for a sprite) of LOMHD_PROBES
+         * distinct rows; smaller images are refused rather than half-matched. An upscale over the
+         * side limit would never be drawn. */
+        int min_w = r->masked ? LOMHD_SPRITE_PROBE_W : LOMHD_PROBE_W;
+
+        if ((flags & ~1) || (!r->masked && key) ||
+            (r->masked && (long long)r->w * r->h > LOMHD_LARGE_PIXELS) ||
+            r->w < min_w || r->h < LOMHD_PROBES + 1 || r->hw < 1 || r->hh < 1 ||
             r->hw > LOMHD_MAX_HD_SIDE || r->hh > LOMHD_MAX_HD_SIDE || !r->idx_len || !r->hd_len)
             goto corrupt;
 
+        if (r->masked)
+            r->skip[key] = r->skip[LOMHD_SHADOW_INDEX] = 1;
+
         for (int rule = 0; rule < 2; rule++)
             for (int i = 0; i < 256; i++)
-                r->lut[rule][i] = rule ? rgb565_round(rec + 8 + i * 3) : rgb565_truncate(rec + 8 + i * 3);
+                r->lut[rule][i] = rule ? rgb565_round(pal + i * 3) : rgb565_truncate(pal + i * 3);
 
         pos += 1 + n + sizeof(rec);
     }
@@ -233,23 +263,32 @@ BOOL lomhd_pack_open(LOMHD_READ read, void* ctx, DWORD size, LOMHD_PACK* pack, D
         goto corrupt;
 
     pack->probe_width = LOMHD_PROBE_W;
-    pack->pow = 1;
+    pack->pow = pack->sprite_pow = 1;
 
     for (int i = 1; i < LOMHD_PROBE_W; i++)
         pack->pow *= HASH_BASE;
+
+    for (int i = 1; i < LOMHD_SPRITE_PROBE_W; i++)
+        pack->sprite_pow *= HASH_BASE;
+
+    int probes = 0;
 
     for (int p = 0; p < count; p++)
     {
         PORTRAIT* r = &pack->portraits[p];
         BYTE* idx = lomhd_load_indices(pack, p, read, ctx);
         WORD* row565 = malloc(sizeof(WORD) * r->w);
+        BYTE* opaque = malloc(r->w);
+        int* rows = malloc(sizeof(int) * r->h);
 
         pos = r->idx_off;
 
-        if (!idx || !row565)
+        if (!idx || !row565 || !opaque || !rows)
         {
             free(idx);
             free(row565);
+            free(opaque);
+            free(rows);
             goto corrupt;
         }
 
@@ -261,6 +300,8 @@ BOOL lomhd_pack_open(LOMHD_READ read, void* ctx, DWORD size, LOMHD_PACK* pack, D
         {
             free(idx);
             free(row565);
+            free(opaque);
+            free(rows);
             goto corrupt;
         }
 
@@ -268,26 +309,87 @@ BOOL lomhd_pack_open(LOMHD_READ read, void* ctx, DWORD size, LOMHD_PACK* pack, D
             for (int i = 0; i < r->sw; i++)
                 r->sample[j * r->sw + i] = idx[(j * 4) * r->w + i * 4];
 
-        for (int k = 1; k <= LOMHD_PROBES; k++)
+        /* The pixels that count, and the rows a probe can start from: every row for a picture; for
+         * a sprite, the rows holding an opaque run a whole probe wide. */
+        int width = r->masked ? LOMHD_SPRITE_PROBE_W : LOMHD_PROBE_W, eligible = 0;
+        r->opaque = r->opaque_sample = 0;
+
+        for (int j = 0; j < r->h; j++)
         {
-            /* Several probe rows, so a cursor sitting on one does not hide the image. */
-            int row = r->h * k / (LOMHD_PROBES + 1);
+            int run = 0, longest = 0;
 
             for (int i = 0; i < r->w; i++)
-                row565[i] = r->lut[0][idx[row * r->w + i]];
-
-            int col = busiest_slice(row565, r->w);
-
-            for (int rule = 0; rule < 2; rule++)
             {
-                for (int i = 0; i < r->w; i++)
-                    row565[i] = r->lut[rule][idx[row * r->w + i]];
+                BOOL in = !r->skip[idx[j * r->w + i]];
+                r->opaque += in;
+                run = in ? run + 1 : 0;
+                longest = run > longest ? run : longest;
+            }
 
-                table_insert(pack->table, run_hash(row565 + col, LOMHD_PROBE_W), p, rule, row, col);
+            if (!r->masked || longest >= width)
+                rows[eligible++] = j;
+        }
+
+        for (int k = 0; k < r->sw * r->sh; k++)
+            r->opaque_sample += !r->skip[r->sample[k]];
+
+        int nrows = r->masked ? (eligible < LOMHD_SPRITE_PROBE_ROWS ? eligible : LOMHD_SPRITE_PROBE_ROWS)
+                              : LOMHD_PROBES;
+
+        if (eligible < LOMHD_PROBES || probes + 2 * 3 * nrows > LOMHD_TABLE / 2)
+        {
+            free(idx);
+            free(row565);
+            free(opaque);
+            free(rows);
+            goto corrupt;
+        }
+
+        for (int k = 1; k <= nrows; k++)
+        {
+            /* Several probe rows, so a cursor sitting on one does not hide the image. A picture's
+             * are at quarters of its height, as they always were, one slice each. A sprite's are
+             * spread over its eligible rows, with a slice in each third of the row that has one:
+             * trees overlap sideways, and a probe under the tree in front finds nothing. */
+            int row = r->masked ? rows[(eligible - 1) * (k - 1) / (nrows > 1 ? nrows - 1 : 1)]
+                                : r->h * k / (LOMHD_PROBES + 1);
+            int bands = r->masked ? 3 : 1, starts = r->w - width + 1, last = -1;
+
+            for (int i = 0; i < r->w; i++)
+            {
+                row565[i] = r->lut[0][idx[row * r->w + i]];
+                opaque[i] = !r->skip[idx[row * r->w + i]];
+            }
+
+            for (int b = 0; b < bands; b++)
+            {
+                int col = r->masked
+                    ? busiest_slice(row565, r->w, width, opaque, starts * b / bands, starts * (b + 1) / bands)
+                    : busiest_slice(row565, r->w, width, NULL, 0, starts);
+
+                if (col < 0 || col == last)
+                    continue;
+
+                last = col;
+
+                for (int rule = 0; rule < 2; rule++)
+                {
+                    for (int i = 0; i < r->w; i++)
+                        row565[i] = r->lut[rule][idx[row * r->w + i]];
+
+                    table_insert(pack->table, run_hash(row565 + col, width), p, width, rule, row, col);
+                    probes++;
+                }
+
+                for (int i = 0; i < r->w; i++)
+                    row565[i] = r->lut[0][idx[row * r->w + i]];
             }
         }
 
         free(row565);
+        free(opaque);
+        free(rows);
+        pack->sprites += r->masked;
 
         /* Small images keep every index for the full count; a large one keeps only its sample,
          * and its full indices are loaded when it is found and needs a mask. */
@@ -317,7 +419,7 @@ static int count_matches(const WORD* frame, int pitch_px, int x, int y, const PO
     int needed)
 {
     const WORD* lut = r->lut[rule];
-    int allowed_misses = r->w * r->h - needed, misses = 0;
+    int allowed_misses = r->opaque - needed, misses = 0;
 
     for (int j = 0; j < r->h; j++)
     {
@@ -325,11 +427,11 @@ static int count_matches(const WORD* frame, int pitch_px, int x, int y, const PO
         const BYTE* t = r->idx + j * r->w;
 
         for (int i = 0; i < r->w; i++)
-            if (row[i] != lut[t[i]] && ++misses > allowed_misses)
+            if (!r->skip[t[i]] && row[i] != lut[t[i]] && ++misses > allowed_misses)
                 return -1;
     }
 
-    return r->w * r->h - misses;
+    return r->opaque - misses;
 }
 
 /* The same over the 1-in-16 sample: every 4th pixel of every 4th row. */
@@ -337,7 +439,7 @@ static int count_sample(const WORD* frame, int pitch_px, int x, int y, const POR
     int needed)
 {
     const WORD* lut = r->lut[rule];
-    int total = r->sw * r->sh, allowed_misses = total - needed, misses = 0;
+    int total = r->opaque_sample, allowed_misses = total - needed, misses = 0;
 
     for (int j = 0; j < r->sh; j++)
     {
@@ -345,7 +447,7 @@ static int count_sample(const WORD* frame, int pitch_px, int x, int y, const POR
         const BYTE* t = r->sample + j * r->sw;
 
         for (int i = 0; i < r->sw; i++)
-            if (row[i * 4] != lut[t[i]] && ++misses > allowed_misses)
+            if (!r->skip[t[i]] && row[i * 4] != lut[t[i]] && ++misses > allowed_misses)
                 return -1;
     }
 
@@ -361,8 +463,13 @@ static int count_sample(const WORD* frame, int pitch_px, int x, int y, const POR
  * 2026-09-23: the start screen matched 99.5% of its pixels, a library page with text on it 76%,
  * the main interface bar under the live map 30-38%. Nothing else in a frame matches 30% of a
  * 20,000-point sample of a 640x480 picture exactly, and the overlay only draws where the frame
- * still shows the original's exact pixel, so a partly covered screen still draws correctly. */
+ * still shows the original's exact pixel, so a partly covered screen still draws correctly.
+ *
+ * A sprite is scored on its opaque pixels only, at LOMHD_SPRITE_FRACTION: on the map, trees stand in
+ * front of trees, and captured ones matched 81-88% (2026-09-23). Its pre-check is looser for the
+ * same reason. Transparent and shadow pixels show whatever is behind, so they cannot count. */
 #define LOMHD_SPARSE_FRACTION 0.6
+#define LOMHD_SPRITE_SPARSE_FRACTION 0.5
 
 typedef struct
 {
@@ -380,8 +487,8 @@ static SCORING scoring(const PORTRAIT* r)
     }
     else
     {
-        sc.total = r->w * r->h;
-        sc.needed = (int)(LOMHD_MATCH_FRACTION * sc.total);
+        sc.total = r->opaque;
+        sc.needed = (int)((r->masked ? LOMHD_SPRITE_FRACTION : LOMHD_MATCH_FRACTION) * sc.total);
     }
 
     return sc;
@@ -392,10 +499,10 @@ static int score(const WORD* frame, int pitch_px, int x, int y, const PORTRAIT* 
     if (is_large(r))
         return count_sample(frame, pitch_px, x, y, r, rule, needed);
 
-    int samples = r->sw * r->sh;
+    int samples = r->opaque_sample;
+    double sparse = r->masked ? LOMHD_SPRITE_SPARSE_FRACTION : LOMHD_SPARSE_FRACTION;
 
-    if (samples >= 64 &&
-        count_sample(frame, pitch_px, x, y, r, rule, (int)(LOMHD_SPARSE_FRACTION * samples)) < 0)
+    if (samples >= 64 && count_sample(frame, pitch_px, x, y, r, rule, (int)(sparse * samples)) < 0)
         return -1;
 
     return count_matches(frame, pitch_px, x, y, r, rule, needed);
@@ -403,9 +510,17 @@ static int score(const WORD* frame, int pitch_px, int x, int y, const PORTRAIT* 
 
 /* Two placements are alternatives for one spot when they share at least half of the smaller one
  * AND are of a similar size (neither more than twice the other's area). Upgrade levels of a
- * building are both; a portrait drawn on a full screen, or two pictures that touch, are not. */
+ * building are both; a portrait drawn on a full screen, or two pictures that touch, are not.
+ *
+ * A sprite is an alternative only at the very same top-left. On the map, sprites overlap all the
+ * time -- a forest is trees in front of trees -- and each is really there; what is not is a
+ * look-alike matched where another stands, and those line up exactly: three library levels
+ * matched at one spot in a capture (2026-09-23). */
 static BOOL same_spot(const PLACEMENT* a, const PORTRAIT* ra, int x, int y, const PORTRAIT* rb)
 {
+    if (ra->masked || rb->masked)
+        return a->x == x && a->y == y;
+
     int right = a->x + ra->w < x + rb->w ? a->x + ra->w : x + rb->w;
     int bottom = a->y + ra->h < y + rb->h ? a->y + ra->h : y + rb->h;
     int w = right - (a->x > x ? a->x : x), h = bottom - (a->y > y ? a->y : y);
@@ -418,90 +533,119 @@ static BOOL same_spot(const PLACEMENT* a, const PORTRAIT* ra, int x, int y, cons
     return 2 * w * h >= smaller;
 }
 
+typedef struct
+{
+    const LOMHD_PACK* pack;
+    const WORD* frame;
+    int width, height, pitch_px, max, found;
+    PLACEMENT* out;
+    int matched_of[LOMHD_MAX_PLACEMENTS], total_of[LOMHD_MAX_PLACEMENTS];
+} SEARCH;
+
+/* Every probe of this width whose hash is `h`, for the window starting at (x, y). */
+static void try_probes(SEARCH* s, unsigned long long h, int probe_width, int x, int y)
+{
+    const LOMHD_PACK* pack = s->pack;
+    PLACEMENT* out = s->out;
+
+    for (int i = (int)(h & (LOMHD_TABLE - 1)); pack->table[i].portrait >= 0; i = (i + 1) & (LOMHD_TABLE - 1))
+    {
+        const PROBE* probe = &pack->table[i];
+
+        if (probe->hash != h || probe->width != probe_width)
+            continue;
+
+        const PORTRAIT* r = &pack->portraits[probe->portrait];
+        int left = x - probe->col, top = y - probe->row;
+
+        if (left < 0 || top < 0 || left + r->w > s->width || top + r->h > s->height)
+            continue;
+
+        /* Every candidate at the same spot must be beaten, not just the first found; the same
+         * image seen again (another probe row, the other RGB565 rule) is just another candidate.
+         * Needing more than the best rival lets the count stop early on repeats. Scores are
+         * compared as fractions by cross-multiplying, in integers. */
+        SCORING sc = scoring(r);
+        int needed = sc.needed;
+
+        for (int k = 0; k < s->found; k++)
+        {
+            const PORTRAIT* rk = &pack->portraits[out[k].portrait];
+            int beat = (int)((long long)s->matched_of[k] * sc.total / s->total_of[k]) + 1;
+
+            if (same_spot(&out[k], rk, left, top, r) && beat > needed)
+                needed = beat;
+        }
+
+        if (needed > sc.total)
+            continue;
+
+        int matched = score(s->frame, s->pitch_px, left, top, r, probe->rule, needed);
+
+        if (matched < 0)
+            continue;
+
+        /* It beats everything at its spot: drop those, then add it. */
+        int kept = 0;
+
+        for (int k = 0; k < s->found; k++)
+        {
+            if (same_spot(&out[k], &pack->portraits[out[k].portrait], left, top, r))
+                continue;
+
+            out[kept] = out[k];
+            s->matched_of[kept] = s->matched_of[k];
+            s->total_of[kept] = s->total_of[k];
+            kept++;
+        }
+
+        s->found = kept;
+
+        if (s->found == s->max)
+            continue;
+
+        out[s->found] = (PLACEMENT){ probe->portrait, probe->rule, left, top };
+        s->matched_of[s->found] = matched;
+        s->total_of[s->found] = sc.total;
+        s->found++;
+    }
+}
+
 int lomhd_find(const LOMHD_PACK* pack, const WORD* frame, int width, int height, int pitch_px,
     PLACEMENT* out, int max)
 {
-    const int W = LOMHD_PROBE_W;
-    int matched_of[LOMHD_MAX_PLACEMENTS], total_of[LOMHD_MAX_PLACEMENTS];
-    int found = 0;
+    const int W = LOMHD_PROBE_W, SW = LOMHD_SPRITE_PROBE_W;
+    SEARCH s = { pack, frame, width, height, pitch_px, max, 0, out };
 
     if (!pack->count || width < W || max > LOMHD_MAX_PLACEMENTS)
         return 0;
 
+    /* Two rolling hashes per row: pictures' 32-pixel probes and sprites' 16-pixel ones. The second
+     * costs nothing in a pack without sprites. */
     for (int y = 0; y < height; y++)
     {
         const WORD* row = frame + y * pitch_px;
-        unsigned long long h = run_hash(row, W);
+        unsigned long long h = run_hash(row, W), hs = run_hash(row, SW);
 
-        for (int x = 0; x + W <= width; x++)
+        for (int x = 0; x + SW <= width; x++)
         {
-            if (x > 0)
-                h = (h - (row[x - 1] + 1ULL) * pack->pow) * HASH_BASE + row[x + W - 1] + 1;
-
-            for (int i = (int)(h & (LOMHD_TABLE - 1)); pack->table[i].portrait >= 0;
-                 i = (i + 1) & (LOMHD_TABLE - 1))
+            if (x + W <= width)
             {
-                const PROBE* probe = &pack->table[i];
+                if (x > 0)
+                    h = (h - (row[x - 1] + 1ULL) * pack->pow) * HASH_BASE + row[x + W - 1] + 1;
 
-                if (probe->hash != h)
-                    continue;
+                try_probes(&s, h, W, x, y);
+            }
 
-                const PORTRAIT* r = &pack->portraits[probe->portrait];
-                int left = x - probe->col, top = y - probe->row;
+            if (pack->sprites)
+            {
+                if (x > 0)
+                    hs = (hs - (row[x - 1] + 1ULL) * pack->sprite_pow) * HASH_BASE + row[x + SW - 1] + 1;
 
-                if (left < 0 || top < 0 || left + r->w > width || top + r->h > height)
-                    continue;
-
-                /* Every candidate at the same spot must be beaten, not just the first found; the
-                 * same image seen again (another probe row, the other RGB565 rule) is just another
-                 * candidate. Needing more than the best rival lets the count stop early on repeats.
-                 * Scores are compared as fractions by cross-multiplying, in integers. */
-                SCORING sc = scoring(r);
-                int needed = sc.needed;
-
-                for (int k = 0; k < found; k++)
-                {
-                    const PORTRAIT* rk = &pack->portraits[out[k].portrait];
-                    int beat = (int)((long long)matched_of[k] * sc.total / total_of[k]) + 1;
-
-                    if (same_spot(&out[k], rk, left, top, r) && beat > needed)
-                        needed = beat;
-                }
-
-                if (needed > sc.total)
-                    continue;
-
-                int matched = score(frame, pitch_px, left, top, r, probe->rule, needed);
-
-                if (matched < 0)
-                    continue;
-
-                /* It beats everything at its spot: drop those, then add it. */
-                int kept = 0;
-
-                for (int k = 0; k < found; k++)
-                {
-                    if (same_spot(&out[k], &pack->portraits[out[k].portrait], left, top, r))
-                        continue;
-
-                    out[kept] = out[k];
-                    matched_of[kept] = matched_of[k];
-                    total_of[kept] = total_of[k];
-                    kept++;
-                }
-
-                found = kept;
-
-                if (found == max)
-                    continue;
-
-                out[found] = (PLACEMENT){ probe->portrait, probe->rule, left, top };
-                matched_of[found] = matched;
-                total_of[found] = sc.total;
-                found++;
+                try_probes(&s, hs, SW, x, y);
             }
         }
     }
 
-    return found;
+    return s.found;
 }

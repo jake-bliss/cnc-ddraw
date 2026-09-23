@@ -38,6 +38,39 @@ static void damage_rows(int x, int y, int w, int from, int to)
         for (int i = 0; i < w; i++) frame_idx[y + j][x + i] = (BYTE)(frame_idx[y + j][x + i] + 128);
 }
 
+/* A sprite: a busy picture inside an ellipse, key (0) outside it, and a shadow (1) patch low down. */
+static void sprite(BYTE* out, int w, int h, unsigned seed)
+{
+    picture(out, w, h, seed);
+    for (int j = 0; j < h; j++)
+        for (int i = 0; i < w; i++)
+        {
+            double dx = (i + 0.5 - w / 2.0) / (w / 2.0), dy = (j + 0.5 - h / 2.0) / (h / 2.0);
+            if (dx * dx + dy * dy > 1) out[j * w + i] = 0;
+            else if (j > h * 3 / 4 && i < w / 3) out[j * w + i] = 1;
+        }
+}
+
+/* Every pixel a different value from any sprite's at the same place is not guaranteed, only
+ * likely; `background` values are drawn from the same 4..123 range the sprites use. */
+static void background(unsigned seed) { picture(&frame_idx[0][0], FW, FH, seed + 1000); }
+
+static void draw_sprite(const BYTE* idx, int w, int h, int x, int y)
+{
+    for (int j = 0; j < h; j++)
+        for (int i = 0; i < w; i++)
+            if (idx[j * w + i] > 1) frame_idx[y + j][x + i] = idx[j * w + i];
+}
+
+static int kept_percent(const BYTE* idx, int w, int h, int x, int y)
+{
+    int opaque = 0, same = 0;
+    for (int j = 0; j < h; j++)
+        for (int i = 0; i < w; i++)
+            if (idx[j * w + i] > 1) { opaque++; same += frame_idx[y + j][x + i] == idx[j * w + i]; }
+    return 100 * same / opaque;
+}
+
 static TP_MEM mem;
 
 static int find(PLACEMENT* out, LOMHD_PACK* pack)
@@ -156,6 +189,72 @@ int main(void)
     begin(2); record("screen", 640, 480, screen); record("a", 70, 67, a);
     clear(); draw(screen, 640, 480, 0, 0); draw(a, 70, 67, 100, 100);
     expect("a portrait drawn on a screen: both are kept", (const char*[]){ "screen@0,0", "a@100,100" }, 2);
+
+    /* Sprites (format 4): index 0 is the key here, 1 the shadow. Only opaque pixels are drawn over
+     * a busy background, so everything around and under a sprite differs from it. */
+    static BYTE t1[40 * 36], t2[40 * 36], narrow[20 * 24];
+    sprite(t1, 40, 36, 11);
+    sprite(t2, 40, 36, 12);
+    sprite(narrow, 20, 24, 13);
+
+    begin(1); tp_add_sprite("t1", 40, 36, t1, 0);
+    background(21); draw_sprite(t1, 40, 36, 100, 100);
+    expect("a sprite on a busy background is found once", (const char*[]){ "t1@100,100" }, 1);
+
+    begin(1); tp_add_sprite("n", 20, 24, narrow, 0);
+    background(22); draw_sprite(narrow, 20, 24, 300, 50);
+    expect("a sprite too narrow for a picture's probe is found", (const char*[]){ "n@300,50" }, 1);
+
+    /* Trees in front of trees: the second copy covers part of the first, and both are there. The
+     * picture rule (half the smaller shared) would keep only one. */
+    begin(1); tp_add_sprite("t1", 40, 36, t1, 0);
+    background(23); draw_sprite(t1, 40, 36, 100, 100); draw_sprite(t1, 40, 36, 124, 106);
+    printf("    (the first copy keeps %d%% of its opaque pixels)\n", kept_percent(t1, 40, 36, 100, 100));
+    expect("two overlapping copies of a sprite are both found",
+        (const char*[]){ "t1@100,100", "t1@124,106" }, 2);
+
+    /* Covered by something that is not a sprite: 25% of its rows still passes 70%, 40% does not. */
+    begin(1); tp_add_sprite("t1", 40, 36, t1, 0);
+    background(24); draw_sprite(t1, 40, 36, 200, 200); damage_rows(200, 200, 40, 0, 9);
+    printf("    (keeps %d%%)\n", kept_percent(t1, 40, 36, 200, 200));
+    expect("a sprite with its top quarter covered is still found", (const char*[]){ "t1@200,200" }, 1);
+    begin(1); tp_add_sprite("t1", 40, 36, t1, 0);
+    background(24); draw_sprite(t1, 40, 36, 200, 200); damage_rows(200, 200, 40, 0, 16);
+    printf("    (keeps %d%%)\n", kept_percent(t1, 40, 36, 200, 200));
+    expect("... with its top 44% covered it is not", (const char*[]){ 0 }, 0);
+
+    /* Look-alikes at one spot -- three library levels matched at one place in a capture -- are
+     * rivals, and the one drawn wins in either pack order. */
+    static BYTE t1b[40 * 36];
+    memcpy(t1b, t1, sizeof t1);
+    for (int i = 30 * 40; i < 36 * 40; i++) if (t1b[i] > 1) t1b[i] = (BYTE)(t1b[i] + 128);
+    begin(2); tp_add_sprite("t1", 40, 36, t1, 0); tp_add_sprite("t1b", 40, 36, t1b, 0);
+    background(25); draw_sprite(t1, 40, 36, 60, 60);
+    expect("of two look-alike sprites at one spot the drawn one wins", (const char*[]){ "t1@60,60" }, 1);
+    begin(2); tp_add_sprite("t1b", 40, 36, t1b, 0); tp_add_sprite("t1", 40, 36, t1, 0);
+    background(25); draw_sprite(t1b, 40, 36, 60, 60);
+    expect("... in either pack order", (const char*[]){ "t1b@60,60" }, 1);
+
+    /* A forest: more copies than the old limit of eight placements. */
+    {
+        static char names[40][16];
+        const char* want[40];
+        begin(1); tp_add_sprite("t2", 40, 36, t2, 0);
+        background(26);
+        for (int k = 0; k < 40; k++)
+        {
+            int x = 10 + (k % 10) * 60, y = 10 + (k / 10) * 60;
+            draw_sprite(t2, 40, 36, x, y);
+            snprintf(names[k], sizeof names[k], "t2@%d,%d", x, y);
+            want[k] = names[k];
+        }
+        expect("forty sprites on one screen are all found", want, 40);
+    }
+
+    /* A picture and sprites in one pack: each is found by its own probe width. */
+    begin(2); record("a", 70, 67, a); tp_add_sprite("t1", 40, 36, t1, 0);
+    background(27); draw(a, 70, 67, 400, 300); draw_sprite(t1, 40, 36, 100, 100);
+    expect("a picture and a sprite in one pack are both found", (const char*[]){ "a@400,300", "t1@100,100" }, 2);
 
     printf("%s\n", failures ? "FAILED" : "all passed");
     return failures ? 1 : 0;

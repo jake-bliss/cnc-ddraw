@@ -1,7 +1,7 @@
 /* The pack parser's refusal paths, asserted. The pack is untrusted input: every malformed shape
  * here must be refused, and a valid one accepted. First written after cross-model review built a
  * 140 KB pack that the first parser accepted with a 65535x65535 upscale inside it; rewritten for
- * format 3, whose upscales are read lazily and whose inflation is bounded. */
+ * format 3, whose upscales are read lazily and whose inflation is bounded; format 4 adds sprites. */
 #include <stdio.h>
 #include "lomhd_test_pack.h"
 #include "lodepng.h"
@@ -81,8 +81,8 @@ int main(void)
     two(); tp_finish();
     {
         /* The first stream is a's indices: its last byte is the adler32's last byte. */
-        DWORD index_end = 12 + 2 * (2 + 8 + 768 + 8);
-        DWORD idx_len = *(DWORD*)(tp_buf + 12 + 2 + 8 + 768);
+        DWORD index_end = 12 + 2 * (2 + 8 + 2 + 768 + 8);
+        DWORD idx_len = *(DWORD*)(tp_buf + 12 + 2 + 8 + 2 + 768);
         tp_buf[index_end + idx_len - 1] ^= 0xFF;
         check("an index stream failing its checksum is refused", !opens(tp_len));
     }
@@ -90,7 +90,7 @@ int main(void)
     two(); tp_finish();
     {
         /* Lengths that no longer add up to the file: a's index stream claims one byte more. */
-        (*(DWORD*)(tp_buf + 12 + 2 + 8 + 768))++;
+        (*(DWORD*)(tp_buf + 12 + 2 + 8 + 2 + 768))++;
         check("stream lengths that do not add up to the file are refused", !opens(tp_len));
     }
 
@@ -125,6 +125,64 @@ int main(void)
         check("a 640x480 screen keeps only its sample resident",
             ok && r->idx == NULL && r->sample && r->sw == 160 && r->sh == 120 && r->sample[1] == big[4]);
         lomhd_pack_free(&pack);
+    }
+
+    /* Sprites (format 4). A sprite is probed on 16-pixel opaque runs; indices 0 (its key here) and
+     * 1 (the shadow) are not part of it. */
+    {
+        static BYTE s[24 * 20];
+        for (int i = 0; i < 24 * 20; i++) s[i] = (BYTE)(i * 13 % 120 + 4);
+
+        tp_begin(); tp_add_sprite("s", 24, 20, s, 0); tp_finish();
+        LOMHD_PACK pack; TP_MEM mem;
+        BOOL ok = tp_open(tp_len, &pack, &mem);
+        BYTE* hd = ok ? lomhd_load_upscale(&pack, 0, tp_read, &mem) : NULL;
+        check("a sprite opens and its upscale loads as RGBA", ok && hd && pack.portraits[0].masked &&
+            pack.sprites == 1 && pack.portraits[0].opaque == 24 * 20);
+        free(hd);
+        lomhd_pack_free(&pack);
+
+        tp_begin(); tp_add_sprite("s", 24, 20, s, 0)->hd_bytes = 48 * 40 * 3; tp_finish();
+        ok = tp_open(tp_len, &pack, &mem);
+        hd = ok ? lomhd_load_upscale(&pack, 0, tp_read, &mem) : NULL;
+        check("a sprite's upscale the size of an RGB one will not load", ok && !hd);
+        free(hd);
+        lomhd_pack_free(&pack);
+
+        /* Opaque runs: rows 0-1 hold a 16-pixel run, the rest only 15, broken by the key. Row 2 is
+         * then given its break, at column 15 (a 15-pixel run) or 16 (16), made of `gap`. */
+        static BYTE runs[24 * 20];
+        #define RUNS(key, col, gap) do { \
+            for (int j = 0; j < 20; j++) \
+                for (int i = 0; i < 24; i++) \
+                    runs[j * 24 + i] = (BYTE)(i == (j < 2 ? 16 : 15) ? (key) : i * 7 % 100 + 10); \
+            for (int i = 0; i < 24; i++) runs[2 * 24 + i] = (BYTE)(i == (col) ? (gap) : i * 7 % 100 + 10); \
+            tp_begin(); tp_add_sprite("s", 24, 20, runs, key); tp_finish(); } while (0)
+
+        RUNS(0, 16, 0);
+        check("a sprite with three rows holding a 16-pixel opaque run is accepted", opens(tp_len));
+        RUNS(0, 15, 0);
+        check("a sprite with only two such rows is refused", !opens(tp_len));
+        RUNS(5, 16, 1);
+        check("... with key 5, a row broken at 16 by the shadow index still counts", opens(tp_len));
+        RUNS(5, 15, 1);
+        check("... and one broken at 15 by the shadow index does not", !opens(tp_len));
+        RUNS(5, 15, 0);
+        check("... while index 0 is opaque when it is not the key", opens(tp_len));
+
+        tp_begin(); tp_add_sprite("s", 15, 20, s, 0); tp_finish();
+        check("a sprite narrower than its probe is refused", !opens(tp_len));
+
+        tp_begin(); tp_add("a", 70, 67, idx_a)->flags = 2; tp_finish();
+        check("an unknown flag bit is refused", !opens(tp_len));
+
+        tp_begin(); tp_add("a", 70, 67, idx_a)->key = 3; tp_finish();
+        check("a picture with a colour key is refused", !opens(tp_len));
+
+        static BYTE big[260 * 260];
+        for (int i = 0; i < 260 * 260; i++) big[i] = (BYTE)(i % 97 + 4);
+        tp_begin(); tp_add_sprite("big", 260, 260, big, 0)->hw = 520; tp_finish();
+        check("a sprite larger than a large picture's threshold is refused", !opens(tp_len));
     }
 
     {

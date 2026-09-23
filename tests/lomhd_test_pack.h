@@ -1,4 +1,4 @@
-/* Building format-3 packs in memory for the tests, and reading them back through the same callback
+/* Building format-4 packs in memory for the tests, and reading them back through the same callback
  * the overlay uses for its file. zlib is written by hand -- "stored" deflate blocks, no compression
  * -- so the tests do not depend on a compressor they would then be trusting. */
 #ifndef LOMHD_TEST_PACK_H
@@ -59,6 +59,7 @@ typedef struct
     int w, h, hw, hh;
     const BYTE* idx;                    /* w*h */
     const BYTE* pal;                    /* 768, or NULL for grey (i, i, i) */
+    BYTE flags, key;                    /* flags bit 0: masked (a sprite), key its colour key */
     DWORD idx_bytes, hd_bytes;          /* what the streams really inflate to; 0 = the right size */
 } TP_RECORD;
 
@@ -76,6 +77,15 @@ static TP_RECORD* tp_add(const char* name, int w, int h, const BYTE* idx)
     return r;
 }
 
+/* A sprite: indices `key` and LOMHD_SHADOW_INDEX are not part of it; its upscale is RGBA. */
+static TP_RECORD* tp_add_sprite(const char* name, int w, int h, const BYTE* idx, BYTE key)
+{
+    TP_RECORD* r = tp_add(name, w, h, idx);
+    r->flags = 1;
+    r->key = key;
+    return r;
+}
+
 static void tp_put(const void* p, DWORD n) { memcpy(tp_buf + tp_len, p, n); tp_len += n; }
 static void tp_u16(int v) { WORD x = (WORD)v; tp_put(&x, 2); }
 static void tp_u32(DWORD v) { tp_put(&v, 4); }
@@ -86,7 +96,7 @@ static DWORD tp_finish(void)
     static BYTE z[1 << 23], scratch[1 << 23];
     DWORD zlen[TP_MAX][2];
     tp_len = 0;
-    tp_put("LOMHDPK3", 8);
+    tp_put("LOMHDPK4", 8);
     tp_u32((DWORD)tp_count);
 
     /* Streams first into z (to learn their lengths), then the index, then the streams. */
@@ -98,7 +108,7 @@ static DWORD tp_finish(void)
         if (n <= (DWORD)(r->w * r->h)) memcpy(scratch, r->idx, n);
         else { memcpy(scratch, r->idx, r->w * r->h); memset(scratch + r->w * r->h, 0, n - r->w * r->h); }
         zlen[i][0] = tp_zlib(z + zpos, scratch, n); zpos += zlen[i][0];
-        DWORD m = r->hd_bytes ? r->hd_bytes : (DWORD)(r->hw * r->hh * 3);
+        DWORD m = r->hd_bytes ? r->hd_bytes : (DWORD)(r->hw * r->hh * ((r->flags & 1) ? 4 : 3));
         zlen[i][1] = tp_zlib(z + zpos, NULL, m); zpos += zlen[i][1];
     }
     for (int i = 0; i < tp_count; i++)
@@ -108,6 +118,7 @@ static DWORD tp_finish(void)
         for (int k = 0; k < 768; k++) pal[k] = r->pal ? r->pal[k] : (BYTE)(k / 3);
         tp_put(&n, 1); tp_put(r->name, n);
         tp_u16(r->w); tp_u16(r->h); tp_u16(r->hw); tp_u16(r->hh);
+        tp_put(&r->flags, 1); tp_put(&r->key, 1);
         tp_put(pal, 768);
         tp_u32(zlen[i][0]); tp_u32(zlen[i][1]);
     }

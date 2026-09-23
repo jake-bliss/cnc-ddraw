@@ -51,8 +51,8 @@ int main(int argc, char** argv)
         resident += sizeof(*r) + (r->idx ? (size_t)r->w * r->h : 0) + (size_t)r->sw * r->sh;
         large += r->idx == NULL;
     }
-    printf("pack: %d images (%d large), probe width %d, opened in %.0f ms, %.1f MB resident\n",
-        pack.count, large, pack.probe_width, now_ms() - t0,
+    printf("pack: %d images (%d large, %d sprites), probe width %d, opened in %.0f ms, %.1f MB resident\n",
+        pack.count, large, pack.sprites, pack.probe_width, now_ms() - t0,
         (resident + sizeof(PROBE) * LOMHD_TABLE) / 1048576.0);
 
     double worst = 0, total = 0; int frames = 0;
