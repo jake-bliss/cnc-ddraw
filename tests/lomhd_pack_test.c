@@ -4,6 +4,7 @@
  * format 3, whose upscales are read lazily and whose inflation is bounded. */
 #include <stdio.h>
 #include "lomhd_test_pack.h"
+#include "lodepng.h"
 
 static int failures;
 static BYTE idx_a[70 * 67], idx_b[70 * 67];
@@ -124,6 +125,18 @@ int main(void)
         check("a 640x480 screen keeps only its sample resident",
             ok && r->idx == NULL && r->sample && r->sw == 160 && r->sh == 120 && r->sample[1] == big[4]);
         lomhd_pack_free(&pack);
+    }
+
+    {
+        /* The bound itself, not the size check after it: the cases above are refused by the exact
+         * size check even with no bound, so they cannot catch a stream that exhausts a 32-bit
+         * process while inflating. (Claude review, 2026-09-23: a mutant with no bound passed.) */
+        static BYTE z[(1 << 20) + 1024];
+        DWORD zl = tp_zlib(z, NULL, 1 << 20);
+        unsigned char* out = NULL; size_t got = 0;
+        unsigned err = lodepng_zlib_decompress_bounded(&out, &got, z, zl, 4096);
+        check("a 1 MB stream bounded at 4 KB stops at the bound", err == 83 && got <= 4096);
+        free(out);
     }
 
     printf("%s\n", failures ? "FAILED" : "all passed");

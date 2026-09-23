@@ -70,6 +70,8 @@ static LOMHD_IMG* g_img;
 #define LOMHD_TEX_BUDGET (160u << 20)
 static size_t g_tex_bytes;
 static DWORD g_scan_count;
+static BOOL g_rescan;
+#define LOMHD_STALE_SCANS 60                       /* render thread: scan next frame even if unchanged */
 
 /* What lomhd_draw draws, built by lomhd_scan while g_ddraw.cs is held. The draw runs after the
  * renderer has RELEASED that lock, and cnc-ddraw frees the primary's buffer when the game releases
@@ -494,6 +496,24 @@ static void lomhd_scan(void)
 
     g_slot_count = slots;
 
+    /* A picture that finished loading after it left the screen -- a loading screen seen for one
+     * frame -- would keep its upscale in memory for the session, outside the texture budget: only
+     * the upload frees it. So a loaded picture unseen for LOMHD_STALE_SCANS scans is dropped, to
+     * be loaded again if it comes back. From READY on the buffers are the render thread's.
+     * (Claude review, 2026-09-23.) */
+    for (int p = 0; p < g_pack.count; p++)
+    {
+        LOMHD_IMG* img = &g_img[p];
+
+        if (img->state == IMG_READY && !img->tex && g_scan_count - img->last_used > LOMHD_STALE_SCANS)
+        {
+            free(img->rgb);
+            free(img->idx);
+            img->rgb = img->idx = NULL;
+            InterlockedExchange(&img->state, IMG_NONE);
+        }
+    }
+
     if (requested)
         SetEvent(g_worker_wake);
 
@@ -573,6 +593,10 @@ static void lomhd_forget_textures(void)
 
     g_tex_bytes = 0;
     memset(g_mask_tex, 0, sizeof(g_mask_tex));
+
+    /* The slots already built name pictures that are now unloaded. On a still screen nothing else
+     * would rescan, so they would never be asked for again. (Codex review, 2026-09-23.) */
+    g_rescan = TRUE;
 }
 
 /* Whether the current context can run the overlay at all. Decided BEFORE lomhd_draw queries any
@@ -898,9 +922,10 @@ void lomhd_on_frame(const char* renderer)
     LONG loads = g_loaded_seq;
 
     if (strcmp(renderer, "opengl") == 0 &&
-        (g_ddraw.render.surface_updated || !g_placement_count || loads != scanned_loads))
+        (g_ddraw.render.surface_updated || !g_placement_count || loads != scanned_loads || g_rescan))
     {
         scanned_loads = loads;
+        g_rescan = FALSE;
         lomhd_scan();
     }
 }
