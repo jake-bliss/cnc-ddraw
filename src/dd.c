@@ -1869,7 +1869,13 @@ HRESULT dd_CreateEx(GUID* lpGuid, LPVOID* lplpDD, REFIID iid, IUnknown* pUnkOute
         }
         else /* auto */
         {
-            if (!IsWine() && !lomhd_wants_opengl() && d3d9_is_available())
+            /* A portrait pack prefers OpenGL, but only when OpenGL loads: otherwise auto keeps its
+             * Direct3D 9 fallback rather than dropping to GDI. (Codex review.) */
+            if (lomhd_wants_opengl() && oglu_load_dll())
+            {
+                g_ddraw.renderer = ogl_render_main;
+            }
+            else if (!IsWine() && d3d9_is_available())
             {
                 g_ddraw.renderer = d3d9_render_main;
             }

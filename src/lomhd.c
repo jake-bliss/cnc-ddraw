@@ -186,7 +186,10 @@ BOOL lomhd_wants_opengl(void)
      * the Steam install on Windows has no ddraw.ini, so renderer=auto chose Direct3D 9 there. */
     char path[MAX_PATH];
     lomhd_path(path, sizeof(path), "lomhd_portraits.pack");
-    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+    DWORD attributes = GetFileAttributesA(path);
+
+    /* A directory by that name is not a pack. (Codex review.) */
+    return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
 }
 
 /* ------------------------------------------------------------------------------------------- */
