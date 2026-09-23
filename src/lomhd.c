@@ -168,7 +168,18 @@ static BOOL lomhd_load_pack(void)
     BOOL ok = g_pack_bytes && ReadFile(f, g_pack_bytes, size, &got, NULL) && got == size;
     CloseHandle(f);
 
-    if (!ok || !lomhd_pack_parse(g_pack_bytes, size, &g_pack, &bad))
+    BOOL parsed = ok && lomhd_pack_parse(g_pack_bytes, size, &g_pack, &bad);
+
+    /* The parse copies every image out -- templates, names, and the upscales expanded or inflated
+     * to RGB -- so the file's bytes are not needed after it. A format-2 pack with buildings is
+     * ~100 MB; keeping it would double the overlay's footprint in a 32-bit game. */
+    if (g_pack_bytes)
+    {
+        HeapFree(GetProcessHeap(), 0, g_pack_bytes);
+        g_pack_bytes = NULL;
+    }
+
+    if (!parsed)
     {
         lomhd_logf("pack: unreadable or corrupt near byte %ld of %ld -- overlay off",
             (long)bad, (long)size, 0);
