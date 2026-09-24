@@ -448,6 +448,11 @@ static void build_mask(const PLACEMENT* pl, const BYTE* idx, const WORD* frame, 
         for (int x = 0; x < r->w; x++)
             m[x] = !skip[t[x]] && row[pl->mirror ? r->w - 1 - x : x] == lut[t[x]] ? 255 : 0;
     }
+
+    /* A picture's edge against anything else is drawn from the frame, not the upscale. A sprite
+     * keeps its edge: its upscale's own alpha draws it, at twice the resolution. */
+    if (!r->masked)
+        lomhd_erode_mask(out, r->w, r->h);
 }
 
 /* Touch the next LOMHD_PREFETCH frames of p's group: keep them from going stale, ask for those not

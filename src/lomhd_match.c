@@ -931,3 +931,36 @@ int lomhd_group_ahead(const LOMHD_PACK* pack, int p, int max, int* out)
 
     return n;
 }
+
+void lomhd_erode_mask(BYTE* m, int w, int h)
+{
+    /* Mark first (128), clear after: a pixel cleared in this pass must not clear its neighbours. */
+    for (int y = 0; y < h; y++)
+    {
+        for (int x = 0; x < w; x++)
+        {
+            if (m[y * w + x] != 255)
+                continue;
+
+            for (int dy = -1; dy <= 1 && m[y * w + x] == 255; dy++)
+            {
+                for (int dx = -1; dx <= 1; dx++)
+                {
+                    int nx = x + dx, ny = y + dy;
+
+                    if (nx >= 0 && nx < w && ny >= 0 && ny < h && m[ny * w + nx] == 0)
+                    {
+                        m[y * w + x] = 128;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < w * h; i++)
+    {
+        if (m[i] == 128)
+            m[i] = 0;
+    }
+}

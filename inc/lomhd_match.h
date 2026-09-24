@@ -124,6 +124,12 @@ BOOL lomhd_pack_open(LOMHD_READ read, void* ctx, DWORD file_size, LOMHD_PACK* pa
 /* Release everything lomhd_pack_open allocated. Safe on a zeroed or already-freed pack. */
 void lomhd_pack_free(LOMHD_PACK* pack);
 
+/* Clear every set pixel of a w*h mask (255 = draw) that has an unset neighbour, of the eight: a
+ * picture's upscale is wrong there, carrying whatever the original held next to it -- the key green
+ * above the interface bar, the button baked under an icon (2026-09-24, seen live as a fringe and
+ * as squares). Outside the image counts as set, so a picture drawn whole keeps its border. */
+void lomhd_erode_mask(BYTE* m, int w, int h);
+
 /* The frames to load ahead of frame p: the next `max` of its animated sprite's group, wrapping to
  * its first frames (a looping animation's first frames follow its last) and never p itself. Writes
  * their indices to out and returns how many; 0 for a record in no group. */

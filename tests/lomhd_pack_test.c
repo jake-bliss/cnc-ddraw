@@ -352,6 +352,30 @@ int main(void)
         if (ok) lomhd_pack_free(&pack);
     }
 
+    {
+        /* Erosion: the eight neighbours of an unset pixel clear, and no further -- a pixel cleared
+         * in the pass must not clear its own neighbours. Outside the image counts as set. */
+        BYTE m[6 * 5], want[6 * 5];
+        memset(m, 255, sizeof m);
+        m[2 * 6 + 2] = 0;
+        memcpy(want, m, sizeof m);
+        for (int y = 1; y <= 3; y++) for (int x = 1; x <= 3; x++) want[y * 6 + x] = 0;
+        lomhd_erode_mask(m, 6, 5);
+        check("erosion clears the eight neighbours of an unset pixel, no more", memcmp(m, want, sizeof m) == 0);
+
+        memset(m, 255, sizeof m);
+        lomhd_erode_mask(m, 6, 5);
+        int all = 1;
+        for (int i = 0; i < 30; i++) all &= m[i] == 255;
+        check("... and leaves a mask with nothing unset whole, border included", all);
+
+        memset(m, 255, sizeof m);
+        m[0] = 0;
+        lomhd_erode_mask(m, 6, 5);
+        check("... and at a corner clears only the neighbours inside",
+            m[1] == 0 && m[6] == 0 && m[7] == 0 && m[2] == 255 && m[12] == 255 && m[14] == 255);
+    }
+
     printf("%s\n", failures ? "FAILED" : "all passed");
     return failures ? 1 : 0;
 }
