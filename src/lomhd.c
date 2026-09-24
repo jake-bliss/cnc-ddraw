@@ -1072,7 +1072,7 @@ void lomhd_on_frame(const char* renderer)
     InterlockedIncrement(&g_frames);
 
     if (strcmp(renderer, "opengl") == 0)
-        lomhd_terrain_frame();
+        lomhd_terrain_frame();         /* holds the terrain lock until lomhd_on_frame_uploaded */
     lomhd_copy_frame_if_wanted();
 
     /* Only the OpenGL renderer can draw the overlay, so only it pays for the scan. A frame that
@@ -1088,4 +1088,9 @@ void lomhd_on_frame(const char* renderer)
         g_rescan = FALSE;
         lomhd_scan();
     }
+}
+
+void lomhd_on_frame_uploaded(void)
+{
+    lomhd_terrain_frame_done();
 }

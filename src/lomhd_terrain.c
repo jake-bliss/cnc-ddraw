@@ -32,7 +32,7 @@ static volatile LONG g_state;            /* 0 unknown, 1 off, 2 on */
 static CRITICAL_SECTION g_cs;
 static LOMHD_TERRAIN g_t;
 static BOOL g_t_ready;
-static volatile DWORD g_inside;          /* thread id making a nested call on our behalf */
+static __thread int g_nesting;           /* this thread is inside a call made on our behalf */
 static void* g_map_1x;                   /* the map surface while it holds a 1x picture */
 static volatile LONG g_gen;              /* bumped whenever the record changes */
 static volatile LONG g_copies, g_builds, g_starts;
@@ -102,19 +102,24 @@ static BOOL is_primary(IDirectDrawSurfaceImpl* s)
     return s && (s->caps & DDSCAPS_PRIMARYSURFACE);
 }
 
+/* Per thread: another thread's wrapped call must neither look nested nor end our nesting, and a
+ * nested call can pump window messages (util_pull_messages) whose handler nests again. (Claude and
+ * Codex review.) */
 static BOOL nested(void)
 {
-    return g_inside == GetCurrentThreadId();
+    return g_nesting > 0;
 }
 
-static void enter_nested(void)
+static DWORD enter_nested(void)
 {
-    g_inside = GetCurrentThreadId();
+    g_nesting++;
+    return 0;
 }
 
-static void leave_nested(void)
+static void leave_nested(DWORD unused)
 {
-    g_inside = 0;
+    (void)unused;
+    g_nesting--;
 }
 
 /* g_cs held. The record needs the frame's size, which only the back buffer knows. */
@@ -201,10 +206,10 @@ BOOL lomhd_terrain_bltfast(IDirectDrawSurfaceImpl* This, DWORD dwX, DWORD dwY,
                 doubled(&s, &s2);
                 DWORD flags = DDBLT_WAIT | ((dwFlags & DDBLTFAST_SRCCOLORKEY) ? DDBLT_KEYSRC : 0) |
                     ((dwFlags & DDBLTFAST_DESTCOLORKEY) ? DDBLT_KEYDEST : 0);
-                enter_nested();
-                *ret = dds_Blt(This, &covered, map, &s2, flags, NULL);
-                leave_nested();
                 forget(This, back, &covered);
+                DWORD was = enter_nested();
+                *ret = dds_Blt(This, &covered, map, &s2, flags, NULL);
+                leave_nested(was);
             }
             else
                 *ret = DD_OK;
@@ -241,9 +246,9 @@ BOOL lomhd_terrain_bltfast(IDirectDrawSurfaceImpl* This, DWORD dwX, DWORD dwY,
         if (lpSrcRect)
             doubled(lpSrcRect, &s2);
 
-        enter_nested();
+        DWORD was = enter_nested();
         *ret = dds_BltFast(map, dwX * 2, dwY * 2, map, lpSrcRect ? &s2 : NULL, dwFlags);
-        leave_nested();
+        leave_nested(was);
         return TRUE;
     }
 
@@ -254,17 +259,24 @@ BOOL lomhd_terrain_bltfast(IDirectDrawSurfaceImpl* This, DWORD dwX, DWORD dwY,
 
         /* A 1x picture copied in (the movie player saving the screen): doubled, so copying it
          * back out halves it to exactly what went in. */
-        RECT s = { 0, 0, src->width, src->height };
+        /* Clipped as BltFast would, in the map's 1x extent, before doubling: dds_Blt given an
+         * out-of-range source would rescale where BltFast crops. (Claude review.) */
+        RECT s;
+        POINT p;
 
-        if (lpSrcRect)
-            s = *lpSrcRect;
+        if (!lt_clip_fast(lpSrcRect, src->width, src->height, (long)dwX, (long)dwY, map->width / 2,
+            map->height / 2, &s, &p))
+        {
+            *ret = DD_OK;
+            return TRUE;
+        }
 
-        RECT d = { (LONG)dwX * 2, (LONG)dwY * 2, ((LONG)dwX + s.right - s.left) * 2,
-            ((LONG)dwY + s.bottom - s.top) * 2 };
-        DWORD flags = DDBLT_WAIT | ((dwFlags & DDBLTFAST_SRCCOLORKEY) ? DDBLT_KEYSRC : 0);
-        enter_nested();
+        RECT d = { p.x * 2, p.y * 2, (p.x + s.right - s.left) * 2, (p.y + s.bottom - s.top) * 2 };
+        DWORD flags = DDBLT_WAIT | ((dwFlags & DDBLTFAST_SRCCOLORKEY) ? DDBLT_KEYSRC : 0) |
+            ((dwFlags & DDBLTFAST_DESTCOLORKEY) ? DDBLT_KEYDEST : 0);
+        DWORD was = enter_nested();
         *ret = dds_Blt(map, &d, src, &s, flags, NULL);
-        leave_nested();
+        leave_nested(was);
         return TRUE;
     }
 
@@ -273,9 +285,9 @@ BOOL lomhd_terrain_bltfast(IDirectDrawSurfaceImpl* This, DWORD dwX, DWORD dwY,
         /* The present: carry the record to the primary with the pixels, under one lock, so the
          * render thread never pairs new pixels with an old record or the reverse. */
         EnterCriticalSection(&g_cs);
-        enter_nested();
+        DWORD was = enter_nested();
         *ret = dds_BltFast(This, dwX, dwY, src, lpSrcRect, dwFlags);
-        leave_nested();
+        leave_nested(was);
 
         RECT s;
         POINT d;
@@ -283,7 +295,15 @@ BOOL lomhd_terrain_bltfast(IDirectDrawSurfaceImpl* This, DWORD dwX, DWORD dwY,
         if (g_t_ready && lt_clip_fast(lpSrcRect, back->width, back->height, (long)dwX, (long)dwY,
             This->width, This->height, &s, &d))
         {
-            lt_back_to_primary(&g_t, &s, d);
+            /* A keyed copy skips pixels, and the record would claim them anyway. (Codex review.) */
+            if (dwFlags & (DDBLTFAST_SRCCOLORKEY | DDBLTFAST_DESTCOLORKEY))
+            {
+                RECT covered = { d.x, d.y, d.x + (s.right - s.left), d.y + (s.bottom - s.top) };
+                lt_forget_primary(&g_t, &covered);
+            }
+            else
+                lt_back_to_primary(&g_t, &s, d);
+
             InterlockedIncrement(&g_gen);
         }
 
@@ -316,8 +336,17 @@ BOOL lomhd_terrain_blt(IDirectDrawSurfaceImpl* This, LPRECT lpDestRect, IDirectD
     IDirectDrawSurfaceImpl* map = game_surface(LOM_MAP_SURFACE);
     IDirectDrawSurfaceImpl* back = game_surface(LOM_BACK_SURFACE);
 
-    if (!map || still_1x(map))
+    if (!map)
         return FALSE;
+
+    if (still_1x(map))
+    {
+        /* Stock behaviour, but a frame surface covered still forgets. (Claude review.) */
+        if ((This == back && !(dwFlags & DDBLT_KEYSRC)) || is_primary(This))
+            forget(This, back, lpDestRect);
+
+        return FALSE;
+    }
 
     if (This == map || src == map)
     {
@@ -335,9 +364,9 @@ BOOL lomhd_terrain_blt(IDirectDrawSurfaceImpl* This, LPRECT lpDestRect, IDirectD
         if (This != map)
             forget(This, back, lpDestRect);
 
-        enter_nested();
+        DWORD was = enter_nested();
         *ret = dds_Blt(This, d, src, s, dwFlags, (LPDDBLTFX)lpDDBltFx);
-        leave_nested();
+        leave_nested(was);
         return TRUE;
     }
 
@@ -409,43 +438,60 @@ void lomhd_terrain_flip(void)
     LeaveCriticalSection(&g_cs);
 }
 
-/* Render thread, g_ddraw.cs held. */
+/* Render thread, g_ddraw.cs held. Takes g_cs and keeps it until lomhd_terrain_frame_done, after
+ * the renderer has uploaded the frame: the game's presents take only g_cs, so without that the
+ * frame drawn could be newer than the one the mask was built from, and a unit that moved in
+ * between would be painted over by terrain for a frame. (Claude review.) */
+static BOOL g_frame_held;
+
 void lomhd_terrain_frame(void)
 {
     if (!lomhd_terrain_active())
         return;
 
+    EnterCriticalSection(&g_cs);
+    g_frame_held = TRUE;
+
     IDirectDrawSurfaceImpl* primary = g_ddraw.primary;
     LONG gen = g_gen;
 
-    if (!primary || primary->bpp != 16 || (gen == g_built_gen && !g_ddraw.render.surface_updated))
+    if (!primary || primary->bpp != 16 || !g_t_ready || g_t.w != (int)primary->width ||
+        g_t.h != (int)primary->height)
+    {
+        g_drawn = 0;                       /* nothing this frame, rather than the last mask */
+        return;
+    }
+
+    if (gen == g_built_gen && !g_ddraw.render.surface_updated)
         return;
 
     WORD* frame = dds_GetBuffer(primary);
 
-    if (!frame)
-        return;
-
-    EnterCriticalSection(&g_cs);
-
-    if (g_t_ready && g_t.w == (int)primary->width && g_t.h == (int)primary->height)
+    if (!g_mask)
     {
-        if (!g_mask)
-        {
-            g_mask = malloc((size_t)g_t.w * g_t.h);
-            g_hd = malloc((size_t)g_t.w * g_t.h * 4 * sizeof(WORD));
-        }
-
-        if (g_mask && g_hd)
-        {
-            g_drawn = lt_build(&g_t, frame, primary->pitch / 2, g_mask, g_hd, 200);
-            g_built_gen = gen;
-            g_snap_gen++;
-            InterlockedIncrement(&g_builds);
-        }
+        g_mask = malloc((size_t)g_t.w * g_t.h);
+        g_hd = malloc((size_t)g_t.w * g_t.h * 4 * sizeof(WORD));
     }
 
-    LeaveCriticalSection(&g_cs);
+    if (!frame || !g_mask || !g_hd)
+    {
+        g_drawn = 0;
+        return;
+    }
+
+    g_drawn = lt_build(&g_t, frame, primary->pitch / 2, g_mask, g_hd, 200);
+    g_built_gen = gen;
+    g_snap_gen++;
+    InterlockedIncrement(&g_builds);
+}
+
+void lomhd_terrain_frame_done(void)
+{
+    if (g_frame_held)
+    {
+        g_frame_held = FALSE;
+        LeaveCriticalSection(&g_cs);
+    }
 }
 
 /* Render thread. What lomhd_draw draws: NULL when nothing. The buffers stay valid until the next

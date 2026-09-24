@@ -1144,6 +1144,7 @@ static void ogl_render()
                 LeaveCriticalSection(&g_ddraw.primary->cs);
         }
 
+        lomhd_on_frame_uploaded();
         LeaveCriticalSection(&g_ddraw.cs);
 
         if (g_ddraw.render.viewport.x != 0 || g_ddraw.render.viewport.y != 0)

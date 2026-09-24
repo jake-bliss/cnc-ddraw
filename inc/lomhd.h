@@ -9,6 +9,11 @@
 /* Called by the renderer with g_ddraw.cs held, once per rendered frame. */
 void lomhd_on_frame(const char* renderer);
 
+/* Called by the OpenGL renderer once it has uploaded the frame, still holding g_ddraw.cs. The HD
+ * terrain holds the game's presents off from its mask build until here, so the mask and the frame
+ * it is drawn over are the same frame. */
+void lomhd_on_frame_uploaded(void);
+
 /* Called by the OpenGL renderer after it has drawn the scaled frame, before SwapBuffers. */
 void lomhd_draw(void);
 
@@ -29,6 +34,7 @@ BOOL lomhd_terrain_blt(struct IDirectDrawSurfaceImpl* This, LPRECT lpDestRect,
 void lomhd_terrain_lock(struct IDirectDrawSurfaceImpl* This, void* return_address, void* frame);
 void lomhd_terrain_flip(void);
 void lomhd_terrain_frame(void);
+void lomhd_terrain_frame_done(void);
 /* For the debug log: [0] map copies and [1] mask builds since the last call, [2] pixels drawn by the
  * latest build, [3] start-screen locks since the last call. Then every distinct game caller of
  * Lock on the map surface seen so far (the start-screen check keys on one of them). */
