@@ -254,6 +254,10 @@ BOOL lomhd_terrain_bltfast(IDirectDrawSurfaceImpl* This, DWORD dwX, DWORD dwY,
         if (!dst_px || !map_px)
             return FALSE;
 
+        /* A back buffer that no longer matches the record's size (a mode change) is copied to but
+         * not recorded, and the rect it covers is forgotten -- the record describes a frame that
+         * is gone, and lomhd_terrain_frame draws nothing while the sizes differ. (Codex review:
+         * 887f0e5 left that stale record alone; forgetting it is the intended change.) */
         EnterCriticalSection(&g_cs);
         BOOL record = c.dst_back && record_ready(back);
         lt_map_to_1x(&g_t, map_px, map->pitch / 2, map->width, map->height, lpSrcRect, (long)dwX,
