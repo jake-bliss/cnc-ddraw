@@ -372,6 +372,9 @@ int main(void)
         memset(m, 255, sizeof m);
         m[0] = 0;
         lomhd_erode_mask(m, 6, 5);
+        PORTRAIT picture = { 0 }, sprite = { 0 };
+        sprite.masked = TRUE;
+        check("pictures erode, sprites do not", lomhd_mask_erodes(&picture) && !lomhd_mask_erodes(&sprite));
         check("... and at a corner clears only the neighbours inside",
             m[1] == 0 && m[6] == 0 && m[7] == 0 && m[2] == 255 && m[12] == 255 && m[14] == 255);
     }

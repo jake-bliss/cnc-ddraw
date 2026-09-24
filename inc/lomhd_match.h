@@ -130,6 +130,9 @@ void lomhd_pack_free(LOMHD_PACK* pack);
  * as squares). Outside the image counts as set, so a picture drawn whole keeps its border. */
 void lomhd_erode_mask(BYTE* m, int w, int h);
 
+/* Whether a record's mask is eroded: pictures only. A sprite's edge is its upscale's own alpha. */
+BOOL lomhd_mask_erodes(const PORTRAIT* r);
+
 /* The frames to load ahead of frame p: the next `max` of its animated sprite's group, wrapping to
  * its first frames (a looping animation's first frames follow its last) and never p itself. Writes
  * their indices to out and returns how many; 0 for a record in no group. */

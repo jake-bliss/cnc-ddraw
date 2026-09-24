@@ -451,7 +451,7 @@ static void build_mask(const PLACEMENT* pl, const BYTE* idx, const WORD* frame, 
 
     /* A picture's edge against anything else is drawn from the frame, not the upscale. A sprite
      * keeps its edge: its upscale's own alpha draws it, at twice the resolution. */
-    if (!r->masked)
+    if (lomhd_mask_erodes(r))
         lomhd_erode_mask(out, r->w, r->h);
 }
 

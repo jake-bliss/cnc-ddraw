@@ -964,3 +964,8 @@ void lomhd_erode_mask(BYTE* m, int w, int h)
             m[i] = 0;
     }
 }
+
+BOOL lomhd_mask_erodes(const PORTRAIT* r)
+{
+    return !r->masked;
+}
