@@ -58,4 +58,38 @@ void lt_forget_primary(LOMHD_TERRAIN* t, const RECT* r);     /* NULL = all */
 int lt_build(LOMHD_TERRAIN* t, const WORD* frame, int frame_pitch_px, BYTE* mask, WORD* hd,
     int min_permille);
 
+/* Which path a game Blt/BltFast takes -- the decision alone, so it can be tested without
+ * DirectDraw. lomhd_terrain.c carries each one out. */
+typedef enum
+{
+    LT_PASS,          /* stock call, the record untouched */
+    LT_FORGET_PASS,   /* stock call; the covered part of a frame surface is forgotten first */
+    LT_DOWNSAMPLE,    /* map -> 16-bit surface: 2:1, recorded if the destination is the back buffer */
+    LT_STRETCH_OUT,   /* map -> anything else: cnc-ddraw stretches the doubled rect, nothing recorded */
+    LT_SELF,          /* map -> map: both sides doubled */
+    LT_INTO_MAP,      /* 1x surface -> map: destination doubled, upscaled by duplication */
+    LT_PRESENT,       /* back buffer -> primary: the record goes along (or, keyed, is forgotten) */
+    LT_DOUBLE         /* Blt with the map on either side: its rects doubled */
+} LT_ROUTE;
+
+typedef struct
+{
+    BOOL src_map, dst_map;        /* the game's map surface on each side */
+    BOOL src_back, dst_back;      /* the game's back buffer */
+    BOOL dst_primary;
+    BOOL map_1x;                  /* the map holds a 1x picture (the start screen) */
+    BOOL src_key, dst_key;        /* SRCCOLORKEY / DESTCOLORKEY */
+    BOOL both_16bit;              /* source and destination are 16 bits per pixel */
+} LT_CALL;
+
+LT_ROUTE lt_route_bltfast(const LT_CALL* c);
+LT_ROUTE lt_route_blt(const LT_CALL* c);
+
+/* The doubled Blt rects for LT_INTO_MAP: the game's BltFast(map, x, y, src, rect) clipped as
+ * BltFast would against the map's 1x extent, then the destination doubled. FALSE when empty. */
+BOOL lt_plan_into_map(const RECT* src_in, int src_w, int src_h, long x, long y, int map_w, int map_h,
+    RECT* src_out, RECT* dst_out);
+
+void lt_double(const RECT* r, RECT* out);
+
 #endif

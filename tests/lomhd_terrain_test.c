@@ -181,6 +181,171 @@ static void test_isolated_coincidence(void)
     lt_free(&t);
 }
 
+
+/* dds_BltFast's own clipping, copied from src/ddsurface.c (the stock lines, without the surfaces),
+ * so lt_clip_fast is held to what cnc-ddraw actually copies rather than to hand-picked numbers.
+ * (Claude review.) */
+static BOOL stock_clip(const RECT* in, int src_w, int src_h, int dst_x, int dst_y, DWORD dst_w_max,
+    DWORD dst_h_max, int* sx, int* sy, RECT* out)
+{
+    RECT src_rect = { 0, 0, src_w, src_h };
+
+    if (in)
+        src_rect = *in;
+
+    if (dst_x < 0) { src_rect.left += abs(dst_x); dst_x = 0; }
+    if (dst_y < 0) { src_rect.top += abs(dst_y); dst_y = 0; }
+    if (src_rect.right < 0) src_rect.right = 0;
+    if (src_rect.left < 0) src_rect.left = 0;
+    if (src_rect.bottom < 0) src_rect.bottom = 0;
+    if (src_rect.top < 0) src_rect.top = 0;
+    if (src_rect.right > src_w) src_rect.right = src_w;
+    if (src_rect.left > src_rect.right) src_rect.left = src_rect.right;
+    if (src_rect.bottom > src_h) src_rect.bottom = src_h;
+    if (src_rect.top > src_rect.bottom) src_rect.top = src_rect.bottom;
+
+    *sx = src_rect.left;
+    *sy = src_rect.top;
+    RECT d = { dst_x, dst_y, (src_rect.right - src_rect.left) + dst_x, (src_rect.bottom - src_rect.top) + dst_y };
+    if (d.right < 0) d.right = 0;
+    if (d.left < 0) d.left = 0;
+    if (d.bottom < 0) d.bottom = 0;
+    if (d.top < 0) d.top = 0;
+    if (d.right > (LONG)dst_w_max) d.right = dst_w_max;
+    if (d.left > d.right) d.left = d.right;
+    if (d.bottom > (LONG)dst_h_max) d.bottom = dst_h_max;
+    if (d.top > d.bottom) d.top = d.bottom;
+    *out = d;
+    return d.right > d.left && d.bottom > d.top;
+}
+
+static int rnd(unsigned* seed, int n)
+{
+    *seed = *seed * 1103515245u + 12345u;
+    return (int)((*seed >> 8) % (unsigned)n);
+}
+
+static void test_clip_matches_stock(void)
+{
+    unsigned seed = 12345;
+    int bad = 0;
+
+    for (int i = 0; i < 200000; i++)
+    {
+        int sw = 1 + rnd(&seed, 800), sh = 1 + rnd(&seed, 600);
+        int dw = 1 + rnd(&seed, 800), dh = 1 + rnd(&seed, 600);
+        RECT r;
+        r.left = rnd(&seed, 900) - 100;
+        r.top = rnd(&seed, 700) - 100;
+        r.right = rnd(&seed, 900) - 100;
+        r.bottom = rnd(&seed, 700) - 100;
+        int x = rnd(&seed, 900) - 150;
+        int y = rnd(&seed, 700) - 150;
+        BOOL whole = rnd(&seed, 8) == 0;
+        int sx, sy;
+        RECT want;
+        BOOL stock = stock_clip(whole ? NULL : &r, sw, sh, x, y, dw, dh, &sx, &sy, &want);
+
+        RECT s;
+        POINT d;
+        BOOL ours = lt_clip_fast(whole ? NULL : &r, sw, sh, x, y, dw, dh, &s, &d);
+
+        if (stock != ours || (ours && (s.left != sx || s.top != sy || d.x != want.left || d.y != want.top ||
+            s.right - s.left != want.right - want.left || s.bottom - s.top != want.bottom - want.top)))
+        {
+            if (bad++ < 3)
+                printf("  clip differs: rect %d,%d,%d,%d src %dx%d at %d,%d dst %dx%d (stock %d, ours %d)\n",
+                    r.left, r.top, r.right, r.bottom, sw, sh, x, y, dw, dh, stock, ours);
+        }
+    }
+
+    CHECK(!bad, "lt_clip_fast differs from dds_BltFast in %d of 200000 cases", bad);
+}
+
+static LT_CALL call(void)
+{
+    LT_CALL c;
+    memset(&c, 0, sizeof(c));
+    c.both_16bit = TRUE;
+    return c;
+}
+
+static void test_routes(void)
+{
+    LT_CALL c = call();
+
+    /* The calls the game makes (2026-09-24 trace and static analysis). */
+    c.src_map = TRUE; c.dst_back = TRUE;
+    CHECK(lt_route_bltfast(&c) == LT_DOWNSAMPLE, "map -> back");
+    c.map_1x = TRUE;
+    CHECK(lt_route_bltfast(&c) == LT_FORGET_PASS, "start screen map -> back");
+
+    c = call(); c.src_map = TRUE; c.dst_map = TRUE;
+    CHECK(lt_route_bltfast(&c) == LT_SELF, "buffer scroll");
+    c.map_1x = TRUE;
+    CHECK(lt_route_bltfast(&c) == LT_PASS, "start screen self copy");
+
+    c = call(); c.dst_map = TRUE;
+    CHECK(lt_route_bltfast(&c) == LT_INTO_MAP, "movie save into the map");
+
+    c = call(); c.src_back = TRUE; c.dst_primary = TRUE;
+    CHECK(lt_route_bltfast(&c) == LT_PRESENT, "present");
+
+    /* Unusual ones: never recorded. */
+    c = call(); c.src_map = TRUE; c.dst_back = TRUE; c.src_key = TRUE;
+    CHECK(lt_route_bltfast(&c) == LT_STRETCH_OUT, "keyed map copy");
+    c = call(); c.src_map = TRUE; c.dst_primary = TRUE;
+    CHECK(lt_route_bltfast(&c) == LT_STRETCH_OUT, "map straight to the primary");
+    c = call(); c.src_map = TRUE; c.both_16bit = FALSE;
+    CHECK(lt_route_bltfast(&c) == LT_STRETCH_OUT, "map to an 8-bit surface");
+
+    /* Something else onto the frame: forgotten unless it is a keyed sprite on the back buffer. */
+    c = call(); c.dst_back = TRUE;
+    CHECK(lt_route_bltfast(&c) == LT_FORGET_PASS, "opaque copy onto the back buffer");
+    c.src_key = TRUE;
+    CHECK(lt_route_bltfast(&c) == LT_PASS, "keyed sprite onto the back buffer");
+    c = call(); c.dst_primary = TRUE;
+    CHECK(lt_route_bltfast(&c) == LT_FORGET_PASS, "other source onto the primary");
+    c = call();
+    CHECK(lt_route_bltfast(&c) == LT_PASS, "surfaces the terrain does not care about");
+
+    /* Blt: the map on either side doubles, except while it holds the start screen. */
+    c = call(); c.dst_map = TRUE;
+    CHECK(lt_route_blt(&c) == LT_DOUBLE, "colour fill on the map");
+    c.map_1x = TRUE;
+    CHECK(lt_route_blt(&c) == LT_PASS, "colour fill on the start screen");
+    c = call(); c.src_map = TRUE; c.dst_back = TRUE;
+    CHECK(lt_route_blt(&c) == LT_DOUBLE, "map Blt to the back buffer");
+    c.map_1x = TRUE;
+    CHECK(lt_route_blt(&c) == LT_FORGET_PASS, "start screen Blt to the back buffer");
+    c = call(); c.dst_primary = TRUE;
+    CHECK(lt_route_blt(&c) == LT_FORGET_PASS, "Blt onto the primary");
+}
+
+static void test_plan_into_map(void)
+{
+    /* The buffer scroll's self copy and every map-side Blt go through this. */
+    RECT one = { 60, 1, 700, 383 }, two;
+    lt_double(&one, &two);
+    CHECK(two.left == 120 && two.top == 2 && two.right == 1400 && two.bottom == 766, "doubled %d,%d,%d,%d",
+        two.left, two.top, two.right, two.bottom);
+
+    /* The movie save: BltFast(map, 0, 0, surface 0, (0,0,640,480)) -> Blt to (0,0,1280,960). */
+    RECT in = { 0, 0, 640, 480 }, s, d;
+    CHECK(lt_plan_into_map(&in, 640, 480, 0, 0, MW, MH, &s, &d), "movie save");
+    CHECK(s.right == 640 && s.bottom == 480 && d.right == 1280 && d.bottom == 960, "movie save rects %d,%d -> %d,%d",
+        s.right, s.bottom, d.right, d.bottom);
+
+    /* A source rect past its surface is cropped, not rescaled. */
+    RECT over = { 600, 0, 700, 10 };
+    CHECK(lt_plan_into_map(&over, 640, 480, 10, 20, MW, MH, &s, &d), "cropped");
+    CHECK(s.right == 640 && d.left == 20 && d.top == 40 && d.right - d.left == 80, "cropped to %d, dst %d,%d w %d",
+        s.right, d.left, d.top, d.right - d.left);
+
+    /* Clipped by the map's 1x extent (760x504), then doubled. */
+    CHECK(lt_plan_into_map(&in, 640, 480, 700, 0, MW, MH, &s, &d) && d.right == MW, "clipped to the map: %d", d.right);
+}
+
 int main(void)
 {
     LOMHD_TERRAIN t;
@@ -193,6 +358,9 @@ int main(void)
     test_not_recorded(&t, map, back);
     test_present_and_build(&t, map, back);
     test_isolated_coincidence();
+    test_clip_matches_stock();
+    test_routes();
+    test_plan_into_map();
 
     lt_free(&t);
     free(map);

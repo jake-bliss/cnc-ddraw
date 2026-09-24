@@ -276,3 +276,59 @@ int lt_build(LOMHD_TERRAIN* t, const WORD* frame, int frame_pitch_px, BYTE* mask
 
     return drawn;
 }
+
+void lt_double(const RECT* r, RECT* out)
+{
+    SetRect(out, r->left * 2, r->top * 2, r->right * 2, r->bottom * 2);
+}
+
+/* A frame surface covered by something that is not the map: forget that part of the record. A
+ * source-keyed copy (a sprite) leaves the terrain showing through, which the pixel comparison
+ * handles, so it does not forget. */
+static BOOL covers_frame(const LT_CALL* c)
+{
+    return (c->dst_back && !c->src_key) || c->dst_primary;
+}
+
+LT_ROUTE lt_route_bltfast(const LT_CALL* c)
+{
+    if (c->src_map && !c->dst_map)
+    {
+        if (c->map_1x)
+            return LT_FORGET_PASS;
+
+        if (c->src_key || c->dst_key || !c->both_16bit || c->dst_primary)
+            return LT_STRETCH_OUT;
+
+        return LT_DOWNSAMPLE;
+    }
+
+    if (c->dst_map)
+        return c->map_1x ? LT_PASS : c->src_map ? LT_SELF : LT_INTO_MAP;
+
+    if (c->dst_primary && c->src_back)
+        return LT_PRESENT;
+
+    return covers_frame(c) ? LT_FORGET_PASS : LT_PASS;
+}
+
+LT_ROUTE lt_route_blt(const LT_CALL* c)
+{
+    if ((c->src_map || c->dst_map) && !c->map_1x)
+        return LT_DOUBLE;
+
+    return covers_frame(c) ? LT_FORGET_PASS : LT_PASS;
+}
+
+BOOL lt_plan_into_map(const RECT* src_in, int src_w, int src_h, long x, long y, int map_w, int map_h,
+    RECT* src_out, RECT* dst_out)
+{
+    POINT p;
+
+    if (!lt_clip_fast(src_in, src_w, src_h, x, y, map_w / 2, map_h / 2, src_out, &p))
+        return FALSE;
+
+    SetRect(dst_out, p.x * 2, p.y * 2, (p.x + src_out->right - src_out->left) * 2,
+        (p.y + src_out->bottom - src_out->top) * 2);
+    return TRUE;
+}

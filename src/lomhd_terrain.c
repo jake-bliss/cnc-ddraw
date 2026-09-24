@@ -132,11 +132,6 @@ static BOOL record_ready(IDirectDrawSurfaceImpl* back)
     return g_t_ready;
 }
 
-static void doubled(const RECT* r, RECT* out)
-{
-    SetRect(out, r->left * 2, r->top * 2, r->right * 2, r->bottom * 2);
-}
-
 /* Something other than the map covered part of a frame surface. g_cs taken here. */
 static void forget(IDirectDrawSurfaceImpl* dst, IDirectDrawSurfaceImpl* back, const RECT* r)
 {
@@ -163,6 +158,33 @@ static BOOL still_1x(IDirectDrawSurfaceImpl* map)
     return g_map_1x != NULL;
 }
 
+static void describe(LT_CALL* c, IDirectDrawSurfaceImpl* This, IDirectDrawSurfaceImpl* src,
+    IDirectDrawSurfaceImpl* map, IDirectDrawSurfaceImpl* back, BOOL map_1x, BOOL src_key, BOOL dst_key)
+{
+    c->src_map = src && src == map;
+    c->dst_map = This == map;
+    c->src_back = src && src == back;
+    c->dst_back = back && This == back;
+    c->dst_primary = is_primary(This);
+    c->map_1x = map_1x;
+    c->src_key = src_key;
+    c->dst_key = dst_key;
+    c->both_16bit = src && src->bpp == 16 && This->bpp == 16;
+}
+
+/* The part of dst a BltFast of src_w x src_h at (x, y) covers, clipped as dds_BltFast clips. */
+static BOOL fast_covers(const RECT* rect, int src_w, int src_h, DWORD x, DWORD y,
+    IDirectDrawSurfaceImpl* dst, RECT* s, RECT* covered)
+{
+    POINT d;
+
+    if (!lt_clip_fast(rect, src_w, src_h, (long)x, (long)y, dst->width, dst->height, s, &d))
+        return FALSE;
+
+    SetRect(covered, d.x, d.y, d.x + (s->right - s->left), d.y + (s->bottom - s->top));
+    return TRUE;
+}
+
 BOOL lomhd_terrain_bltfast(IDirectDrawSurfaceImpl* This, DWORD dwX, DWORD dwY,
     IDirectDrawSurfaceImpl* src, LPRECT lpSrcRect, DWORD dwFlags, HRESULT* ret)
 {
@@ -177,48 +199,55 @@ BOOL lomhd_terrain_bltfast(IDirectDrawSurfaceImpl* This, DWORD dwX, DWORD dwY,
     if (!map)
         return FALSE;
 
-    BOOL map_1x = still_1x(map);
+    BOOL src_key = (dwFlags & DDBLTFAST_SRCCOLORKEY) != 0;
+    BOOL dst_key = (dwFlags & DDBLTFAST_DESTCOLORKEY) != 0;
+    LT_CALL c;
+    describe(&c, This, src, map, back, still_1x(map), src_key, dst_key);
 
-    if (src == map && This != map)
+    /* The source's extent as the game sees it: a 2x map is half its real size. */
+    int src_w = src->width, src_h = src->height;
+
+    if (c.src_map && !c.map_1x)
     {
-        RECT s;
-        POINT d;
-        BOOL any = lt_clip_fast(lpSrcRect, map->width / (map_1x ? 1 : 2), map->height / (map_1x ? 1 : 2),
-            (long)dwX, (long)dwY, This->width, This->height, &s, &d);
-        RECT covered = { d.x, d.y, d.x + (s.right - s.left), d.y + (s.bottom - s.top) };
+        src_w /= 2;
+        src_h /= 2;
+    }
 
-        if (map_1x)
+    RECT s, covered;
+    DWORD was;
+
+    switch (lt_route_bltfast(&c))
+    {
+    case LT_PASS:
+        return FALSE;
+
+    case LT_FORGET_PASS:
+        if (fast_covers(lpSrcRect, src_w, src_h, dwX, dwY, This, &s, &covered))
+            forget(This, back, &covered);
+
+        return FALSE;
+
+    case LT_STRETCH_OUT:
+    {
+        /* Never seen in the game: let cnc-ddraw stretch it, and remember nothing. */
+        *ret = DD_OK;
+
+        if (fast_covers(lpSrcRect, src_w, src_h, dwX, dwY, This, &s, &covered))
         {
-            /* The start screen: stock behaviour, nothing to remember. */
-            if (any)
-                forget(This, back, &covered);
-
-            return FALSE;
+            RECT s2;
+            lt_double(&s, &s2);
+            forget(This, back, &covered);
+            was = enter_nested();
+            *ret = dds_Blt(This, &covered, map, &s2, DDBLT_WAIT | (src_key ? DDBLT_KEYSRC : 0) |
+                (dst_key ? DDBLT_KEYDEST : 0), NULL);
+            leave_nested(was);
         }
 
-        BOOL plain = !(dwFlags & (DDBLTFAST_SRCCOLORKEY | DDBLTFAST_DESTCOLORKEY)) &&
-            map->bpp == 16 && This->bpp == 16 && !is_primary(This);
+        return TRUE;
+    }
 
-        if (!plain)
-        {
-            /* Never seen in the game: let cnc-ddraw stretch it, and remember nothing. */
-            if (any)
-            {
-                RECT s2;
-                doubled(&s, &s2);
-                DWORD flags = DDBLT_WAIT | ((dwFlags & DDBLTFAST_SRCCOLORKEY) ? DDBLT_KEYSRC : 0) |
-                    ((dwFlags & DDBLTFAST_DESTCOLORKEY) ? DDBLT_KEYDEST : 0);
-                forget(This, back, &covered);
-                DWORD was = enter_nested();
-                *ret = dds_Blt(This, &covered, map, &s2, flags, NULL);
-                leave_nested(was);
-            }
-            else
-                *ret = DD_OK;
-
-            return TRUE;
-        }
-
+    case LT_DOWNSAMPLE:
+    {
         WORD* dst_px = dds_GetBuffer(This);
         WORD* map_px = dds_GetBuffer(map);
 
@@ -226,9 +255,9 @@ BOOL lomhd_terrain_bltfast(IDirectDrawSurfaceImpl* This, DWORD dwX, DWORD dwY,
             return FALSE;
 
         EnterCriticalSection(&g_cs);
-        BOOL record = This == back && record_ready(back);
+        BOOL record = c.dst_back && record_ready(back);
         lt_map_to_1x(&g_t, map_px, map->pitch / 2, map->width, map->height, lpSrcRect, (long)dwX,
-            (long)dwY, dst_px, This->pitch / 2, This->width, This->height, record, record);
+            (long)dwY, dst_px, This->pitch / 2, This->width, This->height, c.dst_back && g_t_ready, record);
         InterlockedIncrement(&g_gen);
         InterlockedIncrement(&g_copies);
         LeaveCriticalSection(&g_cs);
@@ -237,74 +266,59 @@ BOOL lomhd_terrain_bltfast(IDirectDrawSurfaceImpl* This, DWORD dwX, DWORD dwY,
         return TRUE;
     }
 
-    if (src == map && This == map)
+    case LT_SELF:
     {
-        if (map_1x)
-            return FALSE;
-
         /* The buffer scroll: the whole picture moves by the margin, in 2x pixels. */
         RECT s2;
 
         if (lpSrcRect)
-            doubled(lpSrcRect, &s2);
+            lt_double(lpSrcRect, &s2);
 
-        DWORD was = enter_nested();
+        was = enter_nested();
         *ret = dds_BltFast(map, dwX * 2, dwY * 2, map, lpSrcRect ? &s2 : NULL, dwFlags);
         leave_nested(was);
         return TRUE;
     }
 
-    if (This == map)
+    case LT_INTO_MAP:
     {
-        if (map_1x)
-            return FALSE;
-
         /* A 1x picture copied in (the movie player saving the screen): doubled, so copying it
-         * back out halves it to exactly what went in. */
-        /* Clipped as BltFast would, in the map's 1x extent, before doubling: dds_Blt given an
-         * out-of-range source would rescale where BltFast crops. (Claude review.) */
-        RECT s;
-        POINT p;
+         * back out halves it to exactly what went in. Clipped as BltFast would before doubling:
+         * dds_Blt given an out-of-range source rescales where BltFast crops. (Claude review.) */
+        RECT d;
+        *ret = DD_OK;
 
-        if (!lt_clip_fast(lpSrcRect, src->width, src->height, (long)dwX, (long)dwY, map->width / 2,
-            map->height / 2, &s, &p))
+        if (lt_plan_into_map(lpSrcRect, src->width, src->height, (long)dwX, (long)dwY, map->width,
+            map->height, &s, &d))
         {
-            *ret = DD_OK;
-            return TRUE;
+            was = enter_nested();
+            *ret = dds_Blt(map, &d, src, &s, DDBLT_WAIT | (src_key ? DDBLT_KEYSRC : 0) |
+                (dst_key ? DDBLT_KEYDEST : 0), NULL);
+            leave_nested(was);
         }
 
-        RECT d = { p.x * 2, p.y * 2, (p.x + s.right - s.left) * 2, (p.y + s.bottom - s.top) * 2 };
-        DWORD flags = DDBLT_WAIT | ((dwFlags & DDBLTFAST_SRCCOLORKEY) ? DDBLT_KEYSRC : 0) |
-            ((dwFlags & DDBLTFAST_DESTCOLORKEY) ? DDBLT_KEYDEST : 0);
-        DWORD was = enter_nested();
-        *ret = dds_Blt(map, &d, src, &s, flags, NULL);
-        leave_nested(was);
         return TRUE;
     }
 
-    if (is_primary(This) && src == back && back)
+    case LT_PRESENT:
     {
-        /* The present: carry the record to the primary with the pixels, under one lock, so the
-         * render thread never pairs new pixels with an old record or the reverse. */
+        /* Carry the record to the primary with the pixels, under one lock, so the render thread
+         * never pairs new pixels with an old record or the reverse. */
         EnterCriticalSection(&g_cs);
-        DWORD was = enter_nested();
+        was = enter_nested();
         *ret = dds_BltFast(This, dwX, dwY, src, lpSrcRect, dwFlags);
         leave_nested(was);
 
-        RECT s;
-        POINT d;
-
-        if (g_t_ready && lt_clip_fast(lpSrcRect, back->width, back->height, (long)dwX, (long)dwY,
-            This->width, This->height, &s, &d))
+        if (g_t_ready && fast_covers(lpSrcRect, src_w, src_h, dwX, dwY, This, &s, &covered))
         {
             /* A keyed copy skips pixels, and the record would claim them anyway. (Codex review.) */
-            if (dwFlags & (DDBLTFAST_SRCCOLORKEY | DDBLTFAST_DESTCOLORKEY))
-            {
-                RECT covered = { d.x, d.y, d.x + (s.right - s.left), d.y + (s.bottom - s.top) };
+            if (src_key || dst_key)
                 lt_forget_primary(&g_t, &covered);
-            }
             else
+            {
+                POINT d = { covered.left, covered.top };
                 lt_back_to_primary(&g_t, &s, d);
+            }
 
             InterlockedIncrement(&g_gen);
         }
@@ -313,20 +327,9 @@ BOOL lomhd_terrain_bltfast(IDirectDrawSurfaceImpl* This, DWORD dwX, DWORD dwY,
         return TRUE;
     }
 
-    if ((This == back && !(dwFlags & DDBLTFAST_SRCCOLORKEY)) || is_primary(This))
-    {
-        RECT s;
-        POINT d;
-
-        if (lt_clip_fast(lpSrcRect, src->width, src->height, (long)dwX, (long)dwY, This->width,
-            This->height, &s, &d))
-        {
-            RECT covered = { d.x, d.y, d.x + (s.right - s.left), d.y + (s.bottom - s.top) };
-            forget(This, back, &covered);
-        }
+    default:
+        return FALSE;
     }
-
-    return FALSE;
 }
 
 BOOL lomhd_terrain_blt(IDirectDrawSurfaceImpl* This, LPRECT lpDestRect, IDirectDrawSurfaceImpl* src,
@@ -341,41 +344,39 @@ BOOL lomhd_terrain_blt(IDirectDrawSurfaceImpl* This, LPRECT lpDestRect, IDirectD
     if (!map)
         return FALSE;
 
-    if (still_1x(map))
+    LT_CALL c;
+    describe(&c, This, src, map, back, still_1x(map), (dwFlags & DDBLT_KEYSRC) != 0,
+        (dwFlags & DDBLT_KEYDEST) != 0);
+
+    switch (lt_route_blt(&c))
     {
-        /* Stock behaviour, but a frame surface covered still forgets. (Claude review.) */
-        if ((This == back && !(dwFlags & DDBLT_KEYSRC)) || is_primary(This))
-            forget(This, back, lpDestRect);
-
-        return FALSE;
-    }
-
-    if (This == map || src == map)
+    case LT_DOUBLE:
     {
         RECT d2, s2;
 
-        if (This == map && lpDestRect)
-            doubled(lpDestRect, &d2);
+        if (c.dst_map && lpDestRect)
+            lt_double(lpDestRect, &d2);
 
-        if (src == map && lpSrcRect)
-            doubled(lpSrcRect, &s2);
+        if (c.src_map && lpSrcRect)
+            lt_double(lpSrcRect, &s2);
 
-        LPRECT d = This == map && lpDestRect ? &d2 : lpDestRect;
-        LPRECT s = src == map && lpSrcRect ? &s2 : lpSrcRect;
-
-        if (This != map)
+        if (!c.dst_map)
             forget(This, back, lpDestRect);
 
         DWORD was = enter_nested();
-        *ret = dds_Blt(This, d, src, s, dwFlags, (LPDDBLTFX)lpDDBltFx);
+        *ret = dds_Blt(This, c.dst_map && lpDestRect ? &d2 : lpDestRect, src,
+            c.src_map && lpSrcRect ? &s2 : lpSrcRect, dwFlags, (LPDDBLTFX)lpDDBltFx);
         leave_nested(was);
         return TRUE;
     }
 
-    if ((This == back && !(dwFlags & DDBLT_KEYSRC)) || is_primary(This))
+    case LT_FORGET_PASS:
         forget(This, back, lpDestRect);
+        return FALSE;
 
-    return FALSE;
+    default:
+        return FALSE;
+    }
 }
 
 void lomhd_terrain_lock(IDirectDrawSurfaceImpl* This, void* return_address, void* frame)
