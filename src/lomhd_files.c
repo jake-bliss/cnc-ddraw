@@ -31,6 +31,7 @@ static CLOSE_FILE real_close;
 
 static char g_dir[MAX_PATH];             /* ...\lomhd_terrain\ */
 static volatile LONG g_served;
+static volatile LONG g_on;               /* all four slots are ours */
 
 /* Our handles, so a Storm handle is never mistaken for one: a small set, not a tag in memory the
  * hook would have to dereference. The game has one file open at a time (0x4fe720 opens, reads,
@@ -76,6 +77,13 @@ static BOOL WINAPI hook_open(HANDLE archive, const char* name, DWORD scope, HAND
 
         HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
 
+        /* A regular file only: a name like "con" opens a device. (Codex review.) */
+        if (f != INVALID_HANDLE_VALUE && GetFileType(f) != FILE_TYPE_DISK)
+        {
+            CloseHandle(f);
+            f = INVALID_HANDLE_VALUE;
+        }
+
         if (f != INVALID_HANDLE_VALUE)
         {
             EnterCriticalSection(&g_cs);
@@ -103,28 +111,32 @@ static BOOL WINAPI hook_open(HANDLE archive, const char* name, DWORD scope, HAND
     return real_open(archive, name, scope, out);
 }
 
-static BOOL ours(HANDLE h)
-{
-    EnterCriticalSection(&g_cs);
-    BOOL found = slot_of(h) >= 0;
-    LeaveCriticalSection(&g_cs);
-    return found;
-}
-
+/* Size and read hold g_cs across the operation, so a close on another thread cannot free the
+ * handle between "it is ours" and its use. (Codex review.) */
 static DWORD WINAPI hook_size(HANDLE h, DWORD* high)
 {
-    if (ours(h))
-        return GetFileSize(h, high);
+    EnterCriticalSection(&g_cs);
 
+    if (slot_of(h) >= 0)
+    {
+        DWORD size = GetFileSize(h, high);
+        LeaveCriticalSection(&g_cs);
+        return size;
+    }
+
+    LeaveCriticalSection(&g_cs);
     return real_size(h, high);
 }
 
 static BOOL WINAPI hook_read(HANDLE h, void* buf, DWORD n, DWORD* got, void* overlapped)
 {
-    if (ours(h))
+    EnterCriticalSection(&g_cs);
+
+    if (slot_of(h) >= 0)
     {
         DWORD read = 0;
         BOOL ok = ReadFile(h, buf, n, &read, NULL);
+        LeaveCriticalSection(&g_cs);
 
         if (got)
             *got = read;
@@ -132,6 +144,7 @@ static BOOL WINAPI hook_read(HANDLE h, void* buf, DWORD n, DWORD* got, void* ove
         return ok && read == n;
     }
 
+    LeaveCriticalSection(&g_cs);
     return real_read(h, buf, n, got, overlapped);
 }
 
@@ -226,11 +239,27 @@ void lomhd_files_install(void)
     real_read = (READ_FILE)r;
     real_close = (CLOSE_FILE)c;
 
-    /* Close, read and size first: once open is replaced, a handle of ours can reach any of them. */
-    write_slot(SLOT_CLOSE_FILE, (void*)hook_close);
-    write_slot(SLOT_READ_FILE, (void*)hook_read);
-    write_slot(SLOT_GET_FILE_SIZE, (void*)hook_size);
-    write_slot(SLOT_OPEN_FILE_EX, (void*)hook_open);
+    /* Close, read and size first: once open is replaced, a handle of ours can reach any of them.
+     * Those three only forward what is not ours, so they are harmless alone; open goes last and
+     * only if all three took, and a partial install is undone. (Codex review.) */
+    if (!write_slot(SLOT_CLOSE_FILE, (void*)hook_close))
+        return;
+
+    if (!write_slot(SLOT_READ_FILE, (void*)hook_read))
+    {
+        write_slot(SLOT_CLOSE_FILE, c);
+        return;
+    }
+
+    if (!write_slot(SLOT_GET_FILE_SIZE, (void*)hook_size))
+    {
+        write_slot(SLOT_READ_FILE, r);
+        write_slot(SLOT_CLOSE_FILE, c);
+        return;
+    }
+
+    if (write_slot(SLOT_OPEN_FILE_EX, (void*)hook_open))
+        InterlockedExchange(&g_on, 1);
 }
 
 long lomhd_files_served(void)
@@ -240,5 +269,5 @@ long lomhd_files_served(void)
 
 BOOL lomhd_files_on(void)
 {
-    return real_open != NULL;
+    return g_on != 0;
 }
