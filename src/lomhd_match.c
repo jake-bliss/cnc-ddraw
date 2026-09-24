@@ -917,3 +917,17 @@ int lomhd_find(const LOMHD_PACK* pack, const WORD* frame, int width, int height,
 
     return s.found;
 }
+
+int lomhd_group_ahead(const LOMHD_PACK* pack, int p, int max, int* out)
+{
+    const PORTRAIT* r = &pack->portraits[p];
+    int n = 0;
+
+    if (!r->group)
+        return 0;
+
+    for (int k = 1; k <= max && k < r->group_count; k++)
+        out[n++] = r->group_first + (p - r->group_first + k) % r->group_count;
+
+    return n;
+}

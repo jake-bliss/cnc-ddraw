@@ -24,6 +24,23 @@ static BOOL opens(DWORD size)
     return ok;
 }
 
+/* tp_buf with `gap` bytes of zeros inserted at `split`: a pack larger than memory. */
+typedef struct { DWORD split, gap; } BIG_MEM;
+
+static BOOL big_read(void* ctx, DWORD off, DWORD len, BYTE* out)
+{
+    BIG_MEM* m = ctx;
+    for (DWORD i = 0; i < len; i++)
+    {
+        unsigned long long at = (unsigned long long)off + i;
+        if (at < m->split) out[i] = tp_buf[at];
+        else if (at < (unsigned long long)m->split + m->gap) out[i] = 0;
+        else if (at - m->gap < tp_len) out[i] = tp_buf[at - m->gap];
+        else return FALSE;
+    }
+    return TRUE;
+}
+
 static void two(void)
 {
     tp_begin(); tp_add("a", 70, 67, idx_a); tp_add("b", 70, 67, idx_b);
@@ -224,6 +241,15 @@ int main(void)
             pack.portraits[4].group_first == 4 && pack.portraits[4].group_count == 1 &&
             pack.portraits[0].mirror && !pack.portraits[4].mirror);
 
+        /* Loading ahead: from the last frame of group 7 the next frames are its first two, and a
+         * frame alone in its group or in none has nothing ahead. (Codex review, 2026-09-23.) */
+        int ahead[8], n = ok ? lomhd_group_ahead(&pack, 2, 8, ahead) : -1;
+        check("ahead of a group's last frame come its first frames", n == 2 && ahead[0] == 0 && ahead[1] == 1);
+        n = ok ? lomhd_group_ahead(&pack, 1, 1, ahead) : -1;
+        check("... no more than asked for", n == 1 && ahead[0] == 2);
+        check("... none for a one-frame group or a picture",
+            ok && lomhd_group_ahead(&pack, 4, 8, ahead) == 0 && lomhd_group_ahead(&pack, 3, 8, ahead) == 0);
+
         /* Palettes: the three frames of group 7 share one; the picture and group 9 have their own
          * (the picture's is the same colours, but a picture keys nothing). */
         check("consecutive frames with one palette share it", ok && pack.palette_count == 3 &&
@@ -303,6 +329,27 @@ int main(void)
         unsigned err = lodepng_zlib_decompress_bounded(&out, &got, z, zl, 4096);
         check("a 1 MB stream bounded at 4 KB stops at the bound", err == 83 && got <= 4096);
         free(out);
+    }
+
+    {
+        /* A stream past 2 GB: an animated pack reaches 1.8 GB, so offsets must stay unsigned all the
+         * way to the read. Record a's upscale is claimed 2 GB longer than written; the reader serves
+         * zeros for the gap, and b's indices, now past 0x80000000, must still load exactly.
+         * (Codex review, 2026-09-23.) The Win32 seek in lomhd.c is not reachable from here. */
+        two(); tp_finish();
+        const DWORD entry = 1 + 1 + 8 + 4 + 768 + 8, first = 12 + 2 * entry, gap = 0x80000000u;
+        DWORD idx_len, hd_len;
+        memcpy(&idx_len, tp_buf + 12 + entry - 8, 4);
+        memcpy(&hd_len, tp_buf + 12 + entry - 4, 4);
+        DWORD grown = hd_len + gap;
+        memcpy(tp_buf + 12 + entry - 4, &grown, 4);
+        BIG_MEM big = { first + idx_len + hd_len, gap };
+        LOMHD_PACK pack; DWORD bad;
+        BOOL ok = lomhd_pack_open(big_read, &big, tp_len + gap, &pack, &bad);
+        BYTE* idx = ok ? lomhd_load_indices(&pack, 1, big_read, &big) : NULL;
+        check("a stream starting past 2 GB loads exactly",
+            ok && pack.portraits[1].idx_off >= gap && idx && memcmp(idx, idx_b, sizeof idx_b) == 0);
+        if (ok) lomhd_pack_free(&pack);
     }
 
     printf("%s\n", failures ? "FAILED" : "all passed");

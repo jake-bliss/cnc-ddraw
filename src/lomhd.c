@@ -454,16 +454,13 @@ static void build_mask(const PLACEMENT* pl, const BYTE* idx, const WORD* frame, 
  * loaded, and queue those loaded but not yet uploaded. Returns TRUE if any were asked for. */
 static BOOL prefetch(int p)
 {
-    const PORTRAIT* r = &g_pack.portraits[p];
+    int ahead[LOMHD_PREFETCH];
+    int n = lomhd_group_ahead(&g_pack, p, LOMHD_PREFETCH, ahead);
     BOOL requested = FALSE;
 
-    if (!r->group)
-        return FALSE;
-
-    /* Wrapping: a looping animation's first frames follow its last. */
-    for (int k = 1; k <= LOMHD_PREFETCH && k < r->group_count; k++)
+    for (int k = 0; k < n; k++)
     {
-        int q = r->group_first + (p - r->group_first + k) % r->group_count;
+        int q = ahead[k];
         LOMHD_IMG* img = &g_img[q];
         img->last_used = g_scan_count;
 

@@ -124,6 +124,11 @@ BOOL lomhd_pack_open(LOMHD_READ read, void* ctx, DWORD file_size, LOMHD_PACK* pa
 /* Release everything lomhd_pack_open allocated. Safe on a zeroed or already-freed pack. */
 void lomhd_pack_free(LOMHD_PACK* pack);
 
+/* The frames to load ahead of frame p: the next `max` of its animated sprite's group, wrapping to
+ * its first frames (a looping animation's first frames follow its last) and never p itself. Writes
+ * their indices to out and returns how many; 0 for a record in no group. */
+int lomhd_group_ahead(const LOMHD_PACK* pack, int p, int max, int* out);
+
 /* Inflate one image's full indices (w*h) or upscale (hw*hh*3 RGB, *4 RGBA if masked) into a
  * malloc'd buffer the caller frees. Exactly that size or nothing: output past it is refused while
  * inflating. */
