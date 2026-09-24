@@ -1,3 +1,26 @@
+# cnc-ddraw, Lords of Magic HD fork
+
+This is a fork of [FunkyFr3sh/cnc-ddraw](https://github.com/FunkyFr3sh/cnc-ddraw) that adds an HD
+layer for *Lords of Magic: Special Edition*. It is the `ddraw.dll` shipped by the HD overlay release
+of [lords-of-magic-modding](https://github.com/jake-bliss/lords-of-magic-modding), whose setup script
+builds everything it draws from the player's own copy of the game. No game art is in this repository.
+
+What the fork adds, all in `src/lomhd*.c` and `inc/lomhd*.h`, with one-line hooks in the upstream files:
+
+- **HD pictures and sprites** (`lomhd.c`, `lomhd_match.c`): finds known original images in each frame
+  and draws their upscales over them with the OpenGL renderer, masked wherever the game drew on top.
+- **HD terrain** (`lomhd_terrain.c`, `lomhd_terrain_core.c`): with the patched "hybrid" `lomse.exe`,
+  the game rasterizes its terrain at 2x while everything else stays 640x480; this doubles the map
+  surface's rects, hands the game a 2:1 downsample, and draws the 2x terrain back at present time.
+- **Terrain art from a folder** (`lomhd_files.c`): serves `til\*` from `lomhd_terrain\til\` beside
+  the exe instead of `pic.mpq`, so installing it never rewrites the game's archive.
+- **A surface trace** (`lomhd_trace.c`): off unless a file named `lomhd_trace` sits beside the game.
+
+Everything is inert for any other game, and the terrain parts for any exe but the patched one. The
+upstream README follows; cnc-ddraw is MIT licensed (see `LICENSE`), and so are the additions.
+
+---
+
 # cnc-ddraw
 cnc-ddraw can fix compatibility issues in older 2D games, such as black screen, bad performance, crashes or defective Alt+Tab. It does also add new features such as borderless mode, windowed mode and upscaling via shaders.
 
