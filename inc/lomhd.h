@@ -42,6 +42,12 @@ void lomhd_terrain_stats(long out[4]);
 int lomhd_terrain_lock_callers(DWORD* out, int max);
 BOOL lomhd_terrain_snapshot(const BYTE** mask, const WORD** hd, int* w, int* h, LONG* gen);
 
+/* Terrain art served from lomhd_terrain\til\ beside the exe instead of pic.mpq; see
+ * lomhd_files.c. Inert unless the hybrid exe is running and that folder exists. */
+void lomhd_files_install(void);
+BOOL lomhd_files_on(void);
+long lomhd_files_served(void);
+
 /* Surface traffic trace, for designing the HD terrain composite. Off unless lomhd_trace sits beside
  * the game; see lomhd_trace.c. Safe to call from any thread. */
 void lomhd_trace_surface(const void* s, DWORD width, DWORD height, DWORD bpp, DWORD caps, LONG pitch,

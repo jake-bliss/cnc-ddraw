@@ -422,6 +422,8 @@ static DWORD WINAPI lomhd_worker(LPVOID unused)
                 long stat[4];
                 lomhd_terrain_stats(stat);
                 lomhd_logf("terrain: %ld map copies, %ld builds, %ld px drawn at the last", stat[0], stat[1], stat[2]);
+                lomhd_logf(lomhd_files_on() ? "terrain: art from lomhd_terrain, %ld files served" :
+                    "terrain: no lomhd_terrain folder in use (art from pic.mpq)", lomhd_files_served(), 0, 0);
 
                 if (stat[3])
                     lomhd_logf("terrain: map surface held a 1x picture (start screen) %ld times", stat[3], 0, 0);

@@ -169,6 +169,8 @@ BOOL lomhd_terrain_bltfast(IDirectDrawSurfaceImpl* This, DWORD dwX, DWORD dwY,
     if (!lomhd_terrain_active() || nested() || !src)
         return FALSE;
 
+    lomhd_files_install();
+
     IDirectDrawSurfaceImpl* map = game_surface(LOM_MAP_SURFACE);
     IDirectDrawSurfaceImpl* back = game_surface(LOM_BACK_SURFACE);
 

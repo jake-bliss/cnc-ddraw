@@ -1,3 +1,4 @@
+#include "lomhd.h"
 #include <windows.h>
 #include "ddraw.h"
 #include <stdio.h>
@@ -131,6 +132,8 @@ BOOL WINAPI DllMain(HANDLE hDll, DWORD dwReason, LPVOID lpReserved)
             if (set_aware)
                 set_aware();
         }
+
+        lomhd_files_install();
 
         /* Make sure screensaver will stay off and monitors will stay on */
         SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED);
