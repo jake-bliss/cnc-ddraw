@@ -1,4 +1,5 @@
 #include <windows.h>
+#include "lomhd.h"
 #include <stdio.h>
 #include "dllmain.h"
 #include "dd.h"
@@ -50,6 +51,14 @@ HRESULT dds_Blt(
     DWORD dwFlags,
     LPDDBLTFX lpDDBltFx)
 {
+    lomhd_trace_op('B', This, lpDDSrcSurface, lpDestRect, lpSrcRect ? lpSrcRect->left : -1,
+        lpSrcRect ? lpSrcRect->top : -1, dwFlags);
+
+    HRESULT lomhd_ret;
+
+    if (lomhd_terrain_blt(This, lpDestRect, lpDDSrcSurface, lpSrcRect, dwFlags, lpDDBltFx, &lomhd_ret))
+        return lomhd_ret;
+
     if (lpDDSrcSurface &&
         lpDDSrcSurface->bpp != 8 &&
         lpDDSrcSurface->bpp != 16 &&
@@ -476,6 +485,13 @@ HRESULT dds_BltFast(
     DWORD dwFlags)
 {
     dbg_dump_dds_blt_fast_flags(dwFlags);
+    lomhd_trace_op('F', This, lpDDSrcSurface, lpSrcRect, (long)dwX, (long)dwY, dwFlags);
+
+    HRESULT lomhd_ret;
+
+    if (lomhd_terrain_bltfast(This, dwX, dwY, lpDDSrcSurface, lpSrcRect, dwFlags, &lomhd_ret))
+        return lomhd_ret;
+
 
     IDirectDrawSurfaceImpl* src_surface = lpDDSrcSurface;
 
@@ -808,6 +824,8 @@ HRESULT dds_EnumAttachedSurfaces(
 HRESULT dds_Flip(IDirectDrawSurfaceImpl* This, IDirectDrawSurfaceImpl* lpDDSurfaceTargetOverride, DWORD dwFlags)
 {
     dbg_dump_dds_flip_flags(dwFlags);
+    lomhd_trace_op('P', This, lpDDSurfaceTargetOverride, NULL, 0, 0, dwFlags);
+    lomhd_terrain_flip();
 
     if (This->backbuffer && !This->skip_flip && !(g_config.carma95_hack && g_ddraw.height == 200))
     {
@@ -1017,6 +1035,7 @@ HRESULT dds_Lock(
         EnterCriticalSection(&This->cs);
 
     dbg_dump_dds_lock_flags(dwFlags);
+    lomhd_trace_op('L', This, NULL, lpDestRect, 0, 0, dwFlags);
 
     util_pull_messages();
 
@@ -1147,6 +1166,8 @@ HRESULT dds_SetPalette(IDirectDrawSurfaceImpl* This, IDirectDrawPaletteImpl* lpD
 
 HRESULT dds_Unlock(IDirectDrawSurfaceImpl* This, LPRECT lpRect)
 {
+    lomhd_trace_op('U', This, NULL, lpRect, 0, 0, 0);
+
     /* Hack for Warcraft II BNE and Diablo */
     HWND hwnd = g_ddraw.ref && g_ddraw.bnet_active ? FindWindowEx(HWND_DESKTOP, NULL, "SDlgDialog", NULL) : NULL;
 
@@ -1672,6 +1693,9 @@ HRESULT dd_CreateSurface(
         dst_surface->height,
         dst_surface->bpp,
         dst_surface->surface);
+
+    lomhd_trace_surface(dst_surface, dst_surface->width, dst_surface->height, dst_surface->bpp,
+        dst_surface->caps, dst_surface->pitch, dst_surface->custom_buf);
 
     *lpDDSurface = dst_surface;
 

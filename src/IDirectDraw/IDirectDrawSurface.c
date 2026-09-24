@@ -1,3 +1,4 @@
+#include "lomhd.h"
 #include <initguid.h>
 #include "IDirectDrawSurface.h"
 #include "IDirectDrawGammaControl.h"
@@ -413,6 +414,8 @@ HRESULT __stdcall IDirectDrawSurface__Lock(
         dwFlags,
         hEvent, 
         _ReturnAddress());
+
+    lomhd_terrain_lock(This, __builtin_return_address(0), __builtin_frame_address(0));
 
     HRESULT ret = dds_Lock(This, lpDestRect, (LPDDSURFACEDESC)lpDDSurfaceDesc, dwFlags, hEvent);
 

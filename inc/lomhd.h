@@ -18,4 +18,28 @@ void lomhd_draw(void);
  * once at startup, before the render thread exists. */
 BOOL lomhd_wants_opengl(void);
 
+/* HD terrain for the hybrid exe build; see lomhd_terrain.c. Inert unless that build is running.
+ * The Blt hooks return TRUE when they handled the call, with its result in *ret. */
+struct IDirectDrawSurfaceImpl;
+BOOL lomhd_terrain_active(void);
+BOOL lomhd_terrain_bltfast(struct IDirectDrawSurfaceImpl* This, DWORD dwX, DWORD dwY,
+    struct IDirectDrawSurfaceImpl* src, LPRECT lpSrcRect, DWORD dwFlags, HRESULT* ret);
+BOOL lomhd_terrain_blt(struct IDirectDrawSurfaceImpl* This, LPRECT lpDestRect,
+    struct IDirectDrawSurfaceImpl* src, LPRECT lpSrcRect, DWORD dwFlags, void* lpDDBltFx, HRESULT* ret);
+void lomhd_terrain_lock(struct IDirectDrawSurfaceImpl* This, void* return_address, void* frame);
+void lomhd_terrain_flip(void);
+void lomhd_terrain_frame(void);
+/* For the debug log: [0] map copies and [1] mask builds since the last call, [2] pixels drawn by the
+ * latest build, [3] start-screen locks since the last call. Then every distinct game caller of
+ * Lock on the map surface seen so far (the start-screen check keys on one of them). */
+void lomhd_terrain_stats(long out[4]);
+int lomhd_terrain_lock_callers(DWORD* out, int max);
+BOOL lomhd_terrain_snapshot(const BYTE** mask, const WORD** hd, int* w, int* h, LONG* gen);
+
+/* Surface traffic trace, for designing the HD terrain composite. Off unless lomhd_trace sits beside
+ * the game; see lomhd_trace.c. Safe to call from any thread. */
+void lomhd_trace_surface(const void* s, DWORD width, DWORD height, DWORD bpp, DWORD caps, LONG pitch,
+    BOOL caller_memory);
+void lomhd_trace_op(char op, const void* dst, const void* src, const RECT* r, long x, long y, DWORD flags);
+
 #endif

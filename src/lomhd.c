@@ -416,6 +416,22 @@ static DWORD WINAPI lomhd_worker(LPVOID unused)
 
             if (over)
                 lomhd_logf("watchdog: %ld scans over the sprite budget -- sprites skipped there", over, 0, 0);
+
+            if (lomhd_terrain_active())
+            {
+                long stat[4];
+                lomhd_terrain_stats(stat);
+                lomhd_logf("terrain: %ld map copies, %ld builds, %ld px drawn at the last", stat[0], stat[1], stat[2]);
+
+                if (stat[3])
+                    lomhd_logf("terrain: map surface held a 1x picture (start screen) %ld times", stat[3], 0, 0);
+
+                DWORD callers[8];
+                int n = lomhd_terrain_lock_callers(callers, 8);
+
+                for (int i = 0; i < n; i++)
+                    lomhd_logf("terrain: map Lock from %08lx", (long)callers[i], 0, 0);
+            }
             last_report = now;
         }
     }
@@ -632,6 +648,8 @@ static char LOMHD_FRAG[] =
     "}\n";
 
 static GLuint g_program, g_vao, g_vbo, g_ebo, g_mask_tex[LOMHD_MAX_PLACEMENTS];
+static GLuint g_terrain_tex[2];         /* HD terrain (2x frame, RGB565) and its mask (1x frame) */
+static LONG g_terrain_uploaded = -1;    /* the snapshot they hold */
 static PFNGLGETINTEGERVPROC lomhd_glGetIntegerv;
 static HGLRC g_gl_context;              /* the context g_program and friends were created in */
 
@@ -698,6 +716,8 @@ static BOOL lomhd_gl_usable(void)
     if (current != g_gl_context)
     {
         g_program = g_vao = g_vbo = g_ebo = 0;
+        g_terrain_tex[0] = g_terrain_tex[1] = 0;
+        g_terrain_uploaded = -1;
         lomhd_forget_textures();
         g_gl_failed = FALSE;
         g_gl_context = current;
@@ -796,6 +816,13 @@ static BOOL lomhd_gl_init(void)
     glBindVertexArray(0);
 
     glGenTextures(LOMHD_MAX_PLACEMENTS, g_mask_tex);
+    glGenTextures(2, g_terrain_tex);
+
+    for (int i = 0; i < 2; i++)
+    {
+        glBindTexture(GL_TEXTURE_2D, g_terrain_tex[i]);
+        texture_params(GL_NEAREST);
+    }
 
     for (int i = 0; i < LOMHD_MAX_PLACEMENTS; i++)
     {
@@ -844,7 +871,13 @@ void lomhd_draw(void)
 {
     /* Runs WITHOUT g_ddraw.cs: reads only the slots lomhd_scan built under it, on this same render
      * thread, never the game's surface. */
-    if ((!g_slot_count && !g_upload_count) || g_gl_failed_permanently)
+    const BYTE* terrain_mask;
+    const WORD* terrain_hd;
+    int terrain_w, terrain_h;
+    LONG terrain_gen;
+    BOOL terrain = lomhd_terrain_snapshot(&terrain_mask, &terrain_hd, &terrain_w, &terrain_h, &terrain_gen);
+
+    if ((!g_slot_count && !g_upload_count && !terrain) || g_gl_failed_permanently)
         return;
 
     if (!lomhd_resolve_basics() || !glActiveTexture)
@@ -913,6 +946,38 @@ void lomhd_draw(void)
     glUniform1i(g_mask_loc, 1);
     glBindVertexArray(g_vao);
     glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+
+    /* HD terrain first, so the pictures and sprites above draw over it. One quad over the whole
+     * frame: the mask (1x, NEAREST) says which 2x2 blocks the frame still shows as terrain. */
+    if (terrain)
+    {
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, g_terrain_tex[1]);
+
+        if (terrain_gen != g_terrain_uploaded)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, terrain_w, terrain_h, 0, GL_RED, GL_UNSIGNED_BYTE,
+                terrain_mask);
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_terrain_tex[0]);
+
+        if (terrain_gen != g_terrain_uploaded)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, terrain_w * 2, terrain_h * 2, 0, GL_RGB,
+                GL_UNSIGNED_SHORT_5_6_5, terrain_hd);
+
+        g_terrain_uploaded = terrain_gen;
+        glUniform1i(g_masked_loc, 0);
+
+        GLfloat quad[16] = {
+            -1, 1, 0, 0,
+            1, 1, 1, 0,
+            1, -1, 1, 1,
+            -1, -1, 0, 1,
+        };
+
+        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(quad), quad);
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
+    }
 
     for (int i = 0; i < g_slot_count; i++)
     {
@@ -1005,6 +1070,9 @@ void lomhd_on_frame(const char* renderer)
 
     g_renderer = renderer;
     InterlockedIncrement(&g_frames);
+
+    if (strcmp(renderer, "opengl") == 0)
+        lomhd_terrain_frame();
     lomhd_copy_frame_if_wanted();
 
     /* Only the OpenGL renderer can draw the overlay, so only it pays for the scan. A frame that
