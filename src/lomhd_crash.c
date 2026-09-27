@@ -45,16 +45,22 @@
  * EXCEPTION_CONTINUE_SEARCH -- so Windows Error Reporting or Wine's crash dialog and winedbg still
  * do exactly what they did before.
  *
- * THE CRASHING THREAD does almost nothing: interlocked operations, SetEvent, a bounded wait, and the
- * chain. It never allocates, formats, logs, opens a file or takes a lock of its own, and its frame
- * is small (measured with -fstack-usage; see the README), so a stack overflow is reported too. The
- * report is written by a helper thread created at startup, which reads the crashing thread's
- * context and stack while it waits. The helper uses no heap and no C runtime for the report itself
- * (lomhd_crash_core.c formats into static buffers), but it does call into Windows: CreateFile and
- * WriteFile, VirtualQuery, and dbghelp's MiniDumpWriteDump, which allocates and may need the loader
- * lock. If the crashing thread holds a lock the helper then needs, the helper blocks -- and after
- * ten seconds the crashing thread stops waiting and carries on to the chain, so the game still ends
- * as it would have. The text is written and flushed before the minidump is attempted.
+ * THE CRASHING THREAD does almost nothing: it copies its exception record and context into a
+ * request slot, signals the helper thread, waits until one deadline taken on entry (ten seconds),
+ * and runs the chain. It never allocates, formats, logs or opens a file; the only lock it takes is
+ * a spinlock held for a few instructions (the duplicate check). Its frame is small (measured with
+ * -fstack-usage; see the README), so a stack overflow is reported too. The helper, created at
+ * startup, writes the report from the request's copies. It uses no heap and no C runtime for the
+ * report itself (lomhd_crash_core.c formats into static buffers), but it does call into Windows:
+ * CreateFile and WriteFile, VirtualQuery, ReadProcessMemory, and dbghelp's MiniDumpWriteDump, which
+ * allocates and may need the loader lock. If the crashing thread holds a lock the helper then
+ * needs, the helper blocks; at its deadline the crashing thread abandons the request and carries on
+ * to the chain, so the game still ends as it would have. An abandoned request's slot stays the
+ * helper's until it finishes, so a later crash never overwrites what it is reading. The text is
+ * written and flushed before the minidump is attempted.
+ *
+ * OUR THREADS never keep the process alive: the helper and the reporter wait on the game's main
+ * thread and exit when it ends -- as it does when a game filter ends just that thread.
  *
  * MODULES are listed by walking the address space with VirtualQuery and reading each image's PE
  * headers (the name from its export directory). No Toolhelp, so nothing here ever takes the loader
@@ -116,18 +122,31 @@ typedef struct
 } LC_THREAD;
 
 static LC_THREAD g_threads[LC_MAX_THREADS];
-static volatile LONG g_report_lock;        /* thread id writing (or waiting on) a report, or 0 */
 static volatile LONG g_reports;
+static volatile LONG g_dedupe_lock;        /* held for a few instructions, never across a wait */
 static DWORD g_last_code, g_last_address, g_last_thread;   /* the last exception reported */
 static int g_hang_count;                   /* reporter thread only */
 
-/* The handoff to the helper thread. */
+/* The handoff to the helper thread: the mailbox (lomhd_crash_core.c) and, per slot, the crashing
+ * thread's exception copied out of its stack -- so nothing the helper reads can vanish when a
+ * thread that stopped waiting unwinds or exits. */
+typedef struct
+{
+    EXCEPTION_RECORD record;
+    CONTEXT context;
+    EXCEPTION_POINTERS pointers;           /* pointing at the two above */
+    DWORD tid;
+} LC_REQUEST;
+
+static LC_MAILBOX g_mail;
+static LC_REQUEST g_request_data[LC_SLOTS];
 static HANDLE g_helper, g_request, g_done;
 static DWORD g_helper_tid;
-static EXCEPTION_POINTERS* volatile g_req_ep;
-static volatile DWORD g_req_tid;
-static volatile LONG g_req_seq, g_done_seq;
-static volatile LONG g_resume_seq;         /* a report whose chain resumed execution */
+static volatile LONG g_resume_gen;         /* a report whose chain resumed execution */
+
+/* The game's main thread (the one that loaded this DLL). Our two threads exit when it does, so
+ * they can never be what keeps a crashed game's process alive. */
+static HANDLE g_main;
 
 /* Everything one report needs, static: a crash and a hang report can be in flight at once, on
  * different threads, so each has its own. */
@@ -138,7 +157,7 @@ typedef struct
     LC_SEEN seen[LC_MAX_SEEN];
     char text[40000];
     char name[64];
-    LONG seq;
+    LONG gen;
 } LC_WORK;
 
 static LC_WORK g_crash_work, g_hang_work;
@@ -161,16 +180,11 @@ static void lc_spin_unlock(volatile LONG* lock)
     InterlockedExchange(lock, 0);
 }
 
-static BOOL lc_readable_region(const MEMORY_BASIC_INFORMATION* m)
-{
-    return m->State == MEM_COMMIT && !(m->Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
-        (m->Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
-            PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
-}
-
-/* Copies what is readable from the start of [src, src + n); returns the byte count. VirtualQuery
- * rather than a fault handler: mingw has no __try, and a fault on the helper thread would end the
- * report. */
+/* Copies what is readable from the start of [src, src + n); returns the byte count. Through
+ * ReadProcessMemory on this process, which fails cleanly on an unreadable page -- including one
+ * that goes away between a check and the read, as a thread's stack does when it exits -- where a
+ * plain read would fault the helper. mingw has no __try. Page by page, so a read that runs off the
+ * end of a mapping still returns the part before it. */
 static DWORD lc_copy(void* dst, DWORD src, DWORD n)
 {
     DWORD done = 0;
@@ -178,22 +192,17 @@ static DWORD lc_copy(void* dst, DWORD src, DWORD n)
     while (done < n)
     {
         DWORD at = src + done;
-        MEMORY_BASIC_INFORMATION m;
+        DWORD chunk = 0x1000 - (at & 0xFFF);
+        SIZE_T got = 0;
 
-        if (at < src || !VirtualQuery((LPCVOID)at, &m, sizeof(m)) || !lc_readable_region(&m))
-            break;
-
-        DWORD end = (DWORD)m.BaseAddress + (DWORD)m.RegionSize;
-        DWORD chunk = end > at ? end - at : 0;
-
-        if (chunk == 0)
+        if (at < src)
             break;
 
         if (chunk > n - done)
             chunk = n - done;
 
-        for (DWORD i = 0; i < chunk; i++)
-            ((BYTE*)dst)[done + i] = ((const BYTE*)at)[i];
+        if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)at, (BYTE*)dst + done, chunk, &got) || got != chunk)
+            break;
 
         done += chunk;
     }
@@ -262,26 +271,37 @@ static BOOL lc_image_at(DWORD addr, LC_MODULE* mod)
     if (!VirtualQuery((LPCVOID)addr, &m, sizeof(m)) || m.Type != MEM_IMAGE || !m.AllocationBase)
         return FALSE;
 
+    /* The headers: the first page, as far as it can be read. Every offset in them is checked
+     * against what was read or against the image's size before it is followed. */
     DWORD base = (DWORD)m.AllocationBase;
-    IMAGE_DOS_HEADER dos;
-    IMAGE_NT_HEADERS32 nt;
+    static BYTE page_helper[0x1000], page_reporter[0x1000];
+    BYTE* page = GetCurrentThreadId() == g_helper_tid ? page_helper : page_reporter;
+    DWORD readable = lc_copy(page, base, 0x1000);
+    const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)page;
 
-    if (lc_copy(&dos, base, sizeof(dos)) != sizeof(dos) || dos.e_magic != IMAGE_DOS_SIGNATURE ||
-        lc_copy(&nt, base + (DWORD)dos.e_lfanew, sizeof(nt)) != sizeof(nt) || nt.Signature != IMAGE_NT_SIGNATURE)
+    if (readable < sizeof(*dos) || dos->e_magic != IMAGE_DOS_SIGNATURE ||
+        !lc_pe_nt_ok((DWORD)dos->e_lfanew, sizeof(IMAGE_NT_HEADERS32), readable))
+        return FALSE;
+
+    const IMAGE_NT_HEADERS32* nt = (const IMAGE_NT_HEADERS32*)(page + dos->e_lfanew);
+    DWORD image_size = nt->OptionalHeader.SizeOfImage;
+
+    if (nt->Signature != IMAGE_NT_SIGNATURE || image_size == 0 || image_size > 0xFFFFFFFFu - base)
         return FALSE;
 
     mod->base = base;
-    mod->size = nt.OptionalHeader.SizeOfImage;
+    mod->size = image_size;
     lc_strcpy(mod->name, LC_MODULE_NAME, base == g_exe_base ? g_exe_name : "(no export name)");
 
-    IMAGE_DATA_DIRECTORY* dir = &nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    const IMAGE_DATA_DIRECTORY* dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
     IMAGE_EXPORT_DIRECTORY exp;
 
-    if (base != g_exe_base && nt.OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT &&
-        dir->VirtualAddress && lc_copy(&exp, base + dir->VirtualAddress, sizeof(exp)) == sizeof(exp) && exp.Name)
+    if (base != g_exe_base && nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT &&
+        lc_pe_range_ok(dir->VirtualAddress, sizeof(exp), image_size) &&
+        lc_copy(&exp, base + dir->VirtualAddress, sizeof(exp)) == sizeof(exp))
     {
         char name[LC_MODULE_NAME];
-        DWORD got = lc_copy(name, base + exp.Name, sizeof(name) - 1);
+        DWORD got = lc_copy(name, base + exp.Name, lc_pe_name_cap(exp.Name, image_size, sizeof(name) - 1));
         name[got] = 0;
 
         if (got && name[0])
@@ -443,21 +463,6 @@ static BOOL CALLBACK lc_dump_callback(PVOID param, const PMINIDUMP_CALLBACK_INPU
     return TRUE;
 }
 
-/* The install path, in this DLL's data segment, scrambled for the length of the dump: the report
- * text carries it, the minidump should not. XOR in place rather than a copy, since a copy would sit
- * in the same data segment or on a dumped stack. The fork's globals and cnc-ddraw's own path
- * settings; see the README for what else in a minidump can still name the folder. */
-static void lc_scramble_paths(void)
-{
-    char* const paths[] = {
-        g_dir, g_exe_path, g_config.ini_path, g_config.game_path, g_config.dll_path, g_config.screenshot_dir,
-    };
-
-    for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++)
-        for (unsigned j = 0; j < MAX_PATH; j++)
-            paths[i][j] ^= 0x5A;
-}
-
 static __attribute__((noinline)) void lc_write_dump(LC_WORK* w, EXCEPTION_POINTERS* ep, DWORD tid, int attempt,
     HANDLE txt)
 {
@@ -502,11 +507,9 @@ static __attribute__((noinline)) void lc_write_dump(LC_WORK* w, EXCEPTION_POINTE
     cb.CallbackRoutine = (MINIDUMP_CALLBACK_ROUTINE)lc_dump_callback;
     cb.CallbackParam = NULL;
 
-    lc_scramble_paths();
     BOOL ok = g_minidump(GetCurrentProcess(), GetCurrentProcessId(), f,
         (MINIDUMP_TYPE)(MiniDumpNormal | MiniDumpWithDataSegs), ep ? &info : NULL, NULL, &cb);
     DWORD error = ok ? 0 : GetLastError();
-    lc_scramble_paths();
 
     DWORD size = GetFileSize(f, NULL);
     CloseHandle(f);
@@ -538,8 +541,9 @@ static void lc_note(const char* what, const LC_WORK* w, BOOL written)
     lomhd_log(line);
 }
 
-/* On the helper thread, for a crashing thread blocked in lc_handoff. */
-static __attribute__((noinline)) void lc_report_crash(EXCEPTION_POINTERS* ep, DWORD tid, LONG seq)
+/* On the helper thread, from a request's own copy of the exception. The crashing thread may have
+ * stopped waiting by now; its stack is read through lc_copy, which fails cleanly if it is gone. */
+static __attribute__((noinline)) void lc_report_crash(EXCEPTION_POINTERS* ep, DWORD tid, LONG gen)
 {
     LC_WORK* w = &g_crash_work;
     LC_REPORT* r = &w->r;
@@ -547,7 +551,7 @@ static __attribute__((noinline)) void lc_report_crash(EXCEPTION_POINTERS* ep, DW
 
     memset(r, 0, sizeof(*r));
     w->name[0] = 0;
-    w->seq = seq;
+    w->gen = gen;
     lc_fill_common(w, "crash");
     r->thread_id = tid;
     r->window_thread = tid == g_window_tid;
@@ -605,11 +609,12 @@ static __attribute__((noinline)) void lc_report_crash(EXCEPTION_POINTERS* ep, DW
 }
 
 /* The game's own filter resumed execution after a report: not a crash after all. */
-static void lc_note_resumed(LONG seq)
+static void lc_note_resumed(LONG gen)
 {
     LC_WORK* w = &g_crash_work;
 
-    if (w->seq != seq || !w->name[0])
+    /* Only the report of that request: a later one may have been written since. */
+    if (w->gen != gen || !w->name[0])
         return;
 
     char path[MAX_PATH];
@@ -637,22 +642,27 @@ static void lc_note_resumed(LONG seq)
 static DWORD WINAPI lc_helper(LPVOID unused)
 {
     (void)unused;
-    LONG handled = 0, resumed = 0;
+    LONG resumed = 0;
+    HANDLE wait[2] = { g_request, g_main };
 
     for (;;)
     {
-        WaitForSingleObject(g_request, INFINITE);
-        LONG seq = g_req_seq;
+        /* The main thread gone means the game is ending (or a filter ended just that thread):
+         * this thread must not be what keeps the process alive. */
+        if (WaitForMultipleObjects(2, wait, FALSE, INFINITE) != WAIT_OBJECT_0)
+            return 0;
 
-        if (seq != handled)
+        int slot;
+
+        while ((slot = lc_mail_take(&g_mail)) >= 0)
         {
-            handled = seq;
-            lc_report_crash(g_req_ep, g_req_tid, seq);
-            InterlockedExchange(&g_done_seq, seq);
+            LC_REQUEST* q = &g_request_data[slot];
+            lc_report_crash(&q->pointers, q->tid, g_mail.gen[slot]);
+            lc_mail_finish(&g_mail, slot);
             SetEvent(g_done);
         }
 
-        LONG r = g_resume_seq;
+        LONG r = g_resume_gen;
 
         if (r && r != resumed)
         {
@@ -660,8 +670,6 @@ static DWORD WINAPI lc_helper(LPVOID unused)
             lc_note_resumed(r);
         }
     }
-
-    return 0;
 }
 
 /* ------------------------------------------------------------------------------------------- */
@@ -697,55 +705,64 @@ static LONG lc_call(EXCEPTION_POINTERS* ep, int level)
     return f ? f(ep) : EXCEPTION_CONTINUE_SEARCH;
 }
 
-/* Asks the helper for a report and waits for it, at most LC_HANDOFF_MS. Returns the report's
- * sequence number, or 0 if none was written. */
-static LONG lc_handoff(EXCEPTION_POINTERS* ep, DWORD me)
+/* Asks the helper for a report and waits for it until `deadline`, the one deadline this thread
+ * has (taken on entry, so a thread queued behind another crash waits no longer in total). Returns
+ * the request's generation, or 0 if no report was asked for. */
+static LONG lc_handoff(EXCEPTION_POINTERS* ep, DWORD me, DWORD deadline)
 {
     const EXCEPTION_RECORD* e = ep ? ep->ExceptionRecord : NULL;
 
-    /* No helper -- the process is exiting and ExitProcess has ended it -- no report. */
-    if (!e || g_detached || !g_helper || WaitForSingleObject(g_helper, 0) != WAIT_TIMEOUT)
+    /* No helper -- the process is exiting, or the main thread has ended it -- no report. */
+    if (!e || !ep->ContextRecord || g_detached || !g_helper || WaitForSingleObject(g_helper, 0) != WAIT_TIMEOUT)
         return 0;
 
-    /* One report at a time; another thread's is waited for, so this one cannot end the process
-     * while the first is still being written. */
-    BOOL mine = FALSE;
+    lc_spin_lock(&g_dedupe_lock);
+    BOOL report = !lc_same_fault(e->ExceptionCode, (DWORD)e->ExceptionAddress, me, g_last_code, g_last_address,
+        g_last_thread) && g_reports < LC_MAX_REPORTS;
 
-    for (int i = 0; i < 120; i++)
-    {
-        if (InterlockedCompareExchange(&g_report_lock, (LONG)me, 0) == 0)
-        {
-            mine = TRUE;
-            break;
-        }
-
-        Sleep(100);
-    }
-
-    if (!mine)
-        return 0;
-
-    LONG seq = 0;
-
-    if (!lc_same_fault(e->ExceptionCode, (DWORD)e->ExceptionAddress, me, g_last_code, g_last_address,
-        g_last_thread) && InterlockedIncrement(&g_reports) <= LC_MAX_REPORTS)
+    if (report)
     {
         g_last_code = e->ExceptionCode;
         g_last_address = (DWORD)e->ExceptionAddress;
         g_last_thread = me;
-        g_req_ep = ep;
-        g_req_tid = me;
-        seq = InterlockedIncrement(&g_req_seq);
-        SetEvent(g_request);
-
-        DWORD start = GetTickCount();
-
-        while (g_done_seq != seq && GetTickCount() - start < LC_HANDOFF_MS)
-            WaitForSingleObject(g_done, 100);
+        InterlockedIncrement(&g_reports);
     }
 
-    InterlockedExchange(&g_report_lock, 0);
-    return seq;
+    lc_spin_unlock(&g_dedupe_lock);
+
+    /* Both slots busy (the helper stuck on one, another queued): no report for this one. */
+    int slot = report ? lc_mail_claim(&g_mail) : -1;
+
+    if (slot < 0)
+        return 0;
+
+    LC_REQUEST* q = &g_request_data[slot];
+    q->record = *e;
+    q->record.ExceptionRecord = NULL;
+    q->context = *ep->ContextRecord;
+    q->pointers.ExceptionRecord = &q->record;
+    q->pointers.ContextRecord = &q->context;
+    q->tid = me;
+    LONG gen = lc_mail_post(&g_mail, slot);
+    SetEvent(g_request);
+
+    for (;;)
+    {
+        if (lc_mail_collect(&g_mail, slot))
+            return gen;
+
+        DWORD left = lc_left(deadline, GetTickCount());
+
+        if (!left)
+            break;
+
+        WaitForSingleObject(g_done, left < 100 ? left : 100);
+    }
+
+    /* Out of time: cancelled if the helper never started it; if it did, the slot stays the
+     * helper's until it finishes, and the request's copies stay valid for it. */
+    lc_mail_abandon(&g_mail, slot);
+    return gen;
 }
 
 /* Every entry point lands here with its level. Kept small: it runs on the crashing thread, which
@@ -771,12 +788,12 @@ static __attribute__((noinline)) LONG lc_enter(EXCEPTION_POINTERS* ep, int level
         return lc_call(ep, level);
 
     lc_chain_enter(&th->visited, level);
-    LONG seq = g_installed ? lc_handoff(ep, me) : 0;
+    LONG gen = g_installed ? lc_handoff(ep, me, GetTickCount() + LC_HANDOFF_MS) : 0;
     LONG ret = lc_call(ep, level);
 
-    if (seq && ret == EXCEPTION_CONTINUE_EXECUTION)
+    if (gen && ret == EXCEPTION_CONTINUE_EXECUTION)
     {
-        InterlockedExchange(&g_resume_seq, seq);
+        InterlockedExchange(&g_resume_gen, gen);
         SetEvent(g_request);
     }
 
@@ -926,10 +943,6 @@ void lomhd_crash_beat(void)
 
 static BOOL lc_report_hang(DWORD tid, DWORD silent_ms)
 {
-    /* Never beside a crash report: they share the report lock (and the path scrambling). */
-    if (InterlockedCompareExchange(&g_report_lock, (LONG)GetCurrentThreadId(), 0) != 0)
-        return FALSE;
-
     LC_WORK* w = &g_hang_work;
     LC_REPORT* r = &w->r;
     memset(r, 0, sizeof(*r));
@@ -968,7 +981,6 @@ static BOOL lc_report_hang(DWORD tid, DWORD silent_ms)
     if (f == INVALID_HANDLE_VALUE)
     {
         w->name[0] = 0;
-        InterlockedExchange(&g_report_lock, 0);
         lc_note("hang", w, FALSE);
         return TRUE;
     }
@@ -982,7 +994,6 @@ static BOOL lc_report_hang(DWORD tid, DWORD silent_ms)
 
     lc_write_all(f, w->text, t.len);
     CloseHandle(f);
-    InterlockedExchange(&g_report_lock, 0);
     lc_note("hang", w, TRUE);
     return TRUE;
 }
@@ -1169,9 +1180,9 @@ static DWORD WINAPI lc_reporter(LPVOID unused)
     watch.quiet_since = GetTickCount();
     DWORD last_assert = 0;
 
-    for (;;)
+    /* Every quarter second -- or until the main thread ends, and then this thread ends too. */
+    while (WaitForSingleObject(g_main, 250) == WAIT_TIMEOUT)
     {
-        Sleep(250);
         DWORD now = GetTickCount();
 
         if (now - last_assert >= 1000)
@@ -1253,7 +1264,9 @@ void lomhd_crash_install(void)
     g_request = CreateEventA(NULL, FALSE, FALSE, NULL);
     g_done = CreateEventA(NULL, FALSE, FALSE, NULL);
 
-    if (!g_request || !g_done)
+    /* DllMain runs on the thread that loaded us: for lomse (a static import) the main thread. */
+    if (!g_request || !g_done || !DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+        &g_main, SYNCHRONIZE, FALSE, 0))
         return;
 
     /* Both threads are created under the loader lock and start once DllMain returns. */

@@ -797,3 +797,101 @@ BOOL lc_in_front(const void* window, const void* foreground, const void* ghost_o
 
     return foreground == window || (ghost_of_foreground && ghost_of_foreground == window);
 }
+
+/* ------------------------------------------------------------------------------------------- */
+/* The request mailbox                                                                         */
+/* ------------------------------------------------------------------------------------------- */
+
+static BOOL cas(volatile LONG* p, LONG from, LONG to)
+{
+    return InterlockedCompareExchange(p, to, from) == from;
+}
+
+int lc_mail_claim(LC_MAILBOX* m)
+{
+    for (int i = 0; i < LC_SLOTS; i++)
+        if (cas(&m->state[i], LC_FREE, LC_FILLING))
+            return i;
+
+    return -1;
+}
+
+LONG lc_mail_post(LC_MAILBOX* m, int slot)
+{
+    LONG gen = InterlockedIncrement(&m->next_gen);
+    InterlockedExchange(&m->gen[slot], gen);
+    InterlockedExchange(&m->state[slot], LC_POSTED);
+    return gen;
+}
+
+int lc_mail_take(LC_MAILBOX* m)
+{
+    for (;;)
+    {
+        int best = -1;
+
+        for (int i = 0; i < LC_SLOTS; i++)
+            if (m->state[i] == LC_POSTED && (best < 0 || m->gen[i] - m->gen[best] < 0))
+                best = i;
+
+        if (best < 0)
+            return -1;
+
+        /* Lost to a waiter cancelling it: look again. */
+        if (cas(&m->state[best], LC_POSTED, LC_TAKEN))
+            return best;
+    }
+}
+
+void lc_mail_finish(LC_MAILBOX* m, int slot)
+{
+    if (!cas(&m->state[slot], LC_TAKEN, LC_DONE))
+        cas(&m->state[slot], LC_ABANDONED, LC_FREE);
+}
+
+BOOL lc_mail_collect(LC_MAILBOX* m, int slot)
+{
+    return cas(&m->state[slot], LC_DONE, LC_FREE);
+}
+
+int lc_mail_abandon(LC_MAILBOX* m, int slot)
+{
+    if (cas(&m->state[slot], LC_POSTED, LC_FREE))
+        return LC_CANCELLED;
+
+    if (cas(&m->state[slot], LC_TAKEN, LC_ABANDONED))
+        return LC_LEFT_RUNNING;
+
+    /* Finished between the last look and now. */
+    cas(&m->state[slot], LC_DONE, LC_FREE);
+    return LC_WAS_DONE;
+}
+
+/* ------------------------------------------------------------------------------------------- */
+/* PE bounds, deadlines                                                                        */
+/* ------------------------------------------------------------------------------------------- */
+
+BOOL lc_pe_nt_ok(DWORD e_lfanew, DWORD nt_size, DWORD readable)
+{
+    /* After the 64-byte DOS header, 4-aligned, and the NT headers wholly inside what was read. */
+    return e_lfanew >= 64 && (e_lfanew & 3) == 0 && e_lfanew <= readable && nt_size <= readable - e_lfanew;
+}
+
+BOOL lc_pe_range_ok(DWORD rva, DWORD size, DWORD image_size)
+{
+    return rva != 0 && rva < image_size && size <= image_size - rva;
+}
+
+DWORD lc_pe_name_cap(DWORD rva, DWORD image_size, DWORD cap)
+{
+    if (rva == 0 || rva >= image_size)
+        return 0;
+
+    return image_size - rva < cap ? image_size - rva : cap;
+}
+
+DWORD lc_left(DWORD deadline, DWORD now)
+{
+    LONG left = (LONG)(deadline - now);
+    return left > 0 ? (DWORD)left : 0;
+}

@@ -5,13 +5,19 @@
  * Its filters stand in for a game's: game_filter is installed through the victim's import table
  * (the path cnc-ddraw patches), the "bypass" ones through GetProcAddress, around the patch. Each
  * filter that ends the process does so with its own exit code, so the exit code says which ran:
- *   3  a vectored handler caught the fault and exited (mode caught)
+ *   3  a vectored handler caught the fault and exited (modes caught, caught-heap)
  *   43 game_filter called its predecessor, which returned (mode chain)
  *   44 game_filter ran
  *   45 bypass_filter ran
  *   46 bypass_filter called its predecessor, which returned without ending the process
  *   47 execution resumed after the fault (mode continue)
- *   0  no fault, or the hang modes ran to the end */
+ *   49 deadline: the second crashing thread reached the game's filter within ~10 s of its fault
+ *   50 deadline: it took longer
+ *   51 abandon: the minidump's exception is not the one that happened
+ *   52 abandon: no minidump to check
+ *   0  no fault, or the hang modes ran to the end, or abandon's dump checked out
+ * Modes exitthread and overflow-loud end only the faulting (main) thread; the process must then
+ * end by itself, which the harness checks with its timeout. */
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
@@ -74,11 +80,13 @@ static LONG WINAPI resuming_filter(EXCEPTION_POINTERS* ep)
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
+static void put(const char* s);
+
 static LONG WINAPI catch_and_exit(EXCEPTION_POINTERS* ep)
 {
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
     {
-        printf("caught: %08lx, calling ExitProcess\n", ep->ExceptionRecord->ExceptionCode);
+        put("caught: calling ExitProcess\n");
         ExitProcess(3);
     }
 
@@ -108,6 +116,188 @@ static __attribute__((noinline)) int recurse(volatile int depth)
     volatile char pad[256];
     pad[0] = (char)depth;
     return recurse(depth + 1) + pad[0];
+}
+
+/* Output without the heap: some modes hold the heap lock on another thread. */
+static void put(const char* s)
+{
+    DWORD n = 0, w;
+
+    while (s[n])
+        n++;
+
+    WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), s, n, &w, NULL);
+}
+
+static void put_num(DWORD v)
+{
+    char b[12];
+    int i = 11;
+    b[i] = 0;
+
+    do
+        b[--i] = (char)('0' + v % 10);
+    while ((v /= 10) && i > 0);
+
+    put(b + i);
+}
+
+/* exitthread: a game filter that ends only the faulting thread. */
+static LONG WINAPI exit_thread_filter(EXCEPTION_POINTERS* ep)
+{
+    (void)ep;
+    put("exitthread: the filter ends the faulting thread only\n");
+    ExitThread(48);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+/* deadline: thread A takes the heap lock and faults, so the report helper stalls in dbghelp; B
+ * faults half a second later. B must reach the game's filter about ten seconds after its fault,
+ * not ten for the report lock plus ten for the handoff. */
+static volatile DWORD g_a_tid, g_b_tid, g_b_fault_tick;
+static HANDLE g_a_locked, g_a_clobbered, g_b_ready;
+static volatile DWORD g_a_top, g_a_fault_address;
+
+static LONG WINAPI deadline_filter(EXCEPTION_POINTERS* ep)
+{
+    (void)ep;
+
+    if (GetCurrentThreadId() == g_b_tid)
+    {
+        DWORD ms = GetTickCount() - g_b_fault_tick;
+        put("deadline: B reached the game filter ");
+        put_num(ms);
+        put(" ms after its fault\n");
+        TerminateProcess(GetCurrentProcess(), ms <= 11500 ? 49 : 50);
+    }
+
+    Sleep(INFINITE);            /* A: keeps the heap locked */
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* A locks the heap only once B is running: creating a thread allocates (the thread-attach calls
+ * of the C runtimes too), so creating B after A held the lock deadlocked the victim itself. */
+static DWORD WINAPI deadline_a(LPVOID unused)
+{
+    (void)unused;
+    WaitForSingleObject(g_b_ready, INFINITE);
+    HeapLock(GetProcessHeap());
+    SetEvent(g_a_locked);
+    return (DWORD)outer(1);
+}
+
+static DWORD WINAPI deadline_b(LPVOID unused)
+{
+    (void)unused;
+    SetEvent(g_b_ready);
+    WaitForSingleObject(g_a_locked, INFINITE);
+    Sleep(500);
+    g_b_fault_tick = GetTickCount();
+    return (DWORD)outer(1);
+}
+
+/* abandon: A takes the heap lock and faults; the helper stalls in dbghelp; A times out, and its
+ * filter unlocks the heap and resumes A at clobber() on a fresh stack pointer near the top of A's
+ * stack, which overwrites the stack where A's exception record and context were. The helper then
+ * finishes the minidump -- which must still show A's real exception. */
+static void __attribute__((noinline, noreturn)) clobber(void)
+{
+    volatile BYTE area[96 * 1024];
+
+    for (unsigned i = 0; i < sizeof(area); i++)
+        area[i] = 0xCC;
+
+    SetEvent(g_a_clobbered);
+
+    for (;;)
+        Sleep(INFINITE);
+}
+
+static LONG WINAPI abandon_filter(EXCEPTION_POINTERS* ep)
+{
+    g_a_fault_address = (DWORD)ep->ExceptionRecord->ExceptionAddress;
+    HeapUnlock(GetProcessHeap());
+    ep->ContextRecord->Esp = (g_a_top - 512) & ~15u;
+    ep->ContextRecord->Eip = (DWORD)clobber;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static DWORD WINAPI abandon_a(LPVOID unused)
+{
+    volatile DWORD top = 0;
+    (void)unused;
+    g_a_top = (DWORD)&top;
+    HeapLock(GetProcessHeap());
+    return (DWORD)outer(1);
+}
+
+/* The exception stream of the one lomhd_crash_*.dmp in the current folder: code, address, and
+ * the EIP of its context. */
+static int check_dump(DWORD want_address)
+{
+    WIN32_FIND_DATAA fd;
+    HANDLE find = FindFirstFileA("lomhd_crash_*.dmp", &fd);
+
+    if (find == INVALID_HANDLE_VALUE)
+        return 52;
+
+    FindClose(find);
+    HANDLE f = CreateFileA(fd.cFileName, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    static BYTE d[4 << 20];
+    DWORD size = 0;
+
+    if (f == INVALID_HANDLE_VALUE || !ReadFile(f, d, sizeof(d), &size, NULL))
+        return 52;
+
+    CloseHandle(f);
+    DWORD streams = *(DWORD*)(d + 8), dir = *(DWORD*)(d + 12);
+
+    for (DWORD i = 0; i < streams && dir + 12 * i + 12 <= size; i++)
+    {
+        DWORD type = *(DWORD*)(d + dir + 12 * i), rva = *(DWORD*)(d + dir + 12 * i + 8);
+
+        if (type != 6 || rva + 0xA8 > size)
+            continue;
+
+        /* MINIDUMP_EXCEPTION_STREAM: ThreadId, pad, then MINIDUMP_EXCEPTION (code at +8, address
+         * at +24 as 64 bits); the context's location at +0xA0. CONTEXT's Eip is at +0xB8. */
+        DWORD code = *(DWORD*)(d + rva + 8), address = *(DWORD*)(d + rva + 24);
+        DWORD ctx = *(DWORD*)(d + rva + 0xA4);
+        DWORD eip = ctx + 0xBC <= size ? *(DWORD*)(d + ctx + 0xB8) : 0;
+        put("abandon: dump says code ");
+        put_num(code);
+        put(", address ");
+        put_num(address);
+        put(", context eip ");
+        put_num(eip);
+        put("; the fault was at ");
+        put_num(want_address);
+        put("\n");
+
+        if (code == 0xC0000005 && address == want_address && eip == want_address)
+        {
+            put("abandon: dump holds the copied exception\n");
+            return 0;
+        }
+
+        return 51;
+    }
+
+    return 52;
+}
+
+/* caught-heap: another thread holds the heap lock when the game exits (ExitProcess kills it with
+ * the lock held). Nothing on the way out -- our DLL_PROCESS_DETACH logging included -- may wait
+ * for that lock. */
+static HANDLE g_heap_held;
+
+static DWORD WINAPI hold_heap(LPVOID unused)
+{
+    (void)unused;
+    HeapLock(GetProcessHeap());
+    SetEvent(g_heap_held);
+    Sleep(INFINITE);
+    return 0;
 }
 
 static SETFILTER real_set_filter(void)
@@ -228,6 +418,50 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    if (strcmp(mode, "deadline") == 0)
+    {
+        SetUnhandledExceptionFilter(deadline_filter);
+        g_a_locked = CreateEventA(NULL, TRUE, FALSE, NULL);
+        g_b_ready = CreateEventA(NULL, TRUE, FALSE, NULL);
+        HANDLE b = CreateThread(NULL, 0, deadline_b, NULL, 0, (DWORD*)&g_b_tid);
+        HANDLE a = CreateThread(NULL, 0, deadline_a, NULL, 0, (DWORD*)&g_a_tid);
+        (void)a;
+        WaitForSingleObject(b, INFINITE);
+        return 0;
+    }
+
+    if (strcmp(mode, "abandon") == 0)
+    {
+        SetUnhandledExceptionFilter(abandon_filter);
+        g_a_clobbered = CreateEventA(NULL, TRUE, FALSE, NULL);
+        CreateThread(NULL, 1 << 20, abandon_a, NULL, 0, (DWORD*)&g_a_tid);
+
+        if (WaitForSingleObject(g_a_clobbered, 40000) != WAIT_OBJECT_0)
+        {
+            put("abandon: A never resumed\n");
+            return 52;
+        }
+
+        Sleep(5000);            /* the helper, unstuck, finishes the minidump */
+        return check_dump(g_a_fault_address);
+    }
+
+    if (strcmp(mode, "exitthread") == 0)
+        SetUnhandledExceptionFilter(exit_thread_filter);
+    else if (strcmp(mode, "overflow-loud") == 0)
+        SetUnhandledExceptionFilter(game_filter);
+
+    if (strcmp(mode, "caught-heap") == 0)
+    {
+        AddVectoredExceptionHandler(0, catch_and_exit);
+        Sleep(1500);            /* the reporter is past its startup */
+        g_heap_held = CreateEventA(NULL, TRUE, FALSE, NULL);
+        CreateThread(NULL, 0, hold_heap, NULL, 0, NULL);
+        WaitForSingleObject(g_heap_held, INFINITE);
+        put("caught-heap: heap held by another thread; crashing\n");
+        return outer(argc);
+    }
+
     if (strcmp(mode, "caught") == 0)
     {
         /* Last in line, as a game's own SEH __except is (vectored handlers all run before any frame
@@ -270,7 +504,7 @@ int main(int argc, char** argv)
         real_set_filter()(g_bypass_prev);
         printf("bypass-restore: restored %p\n", (void*)g_bypass_prev);
     }
-    else if (strcmp(mode, "none") != 0)
+    else if (strcmp(mode, "none") != 0 && strcmp(mode, "exitthread") != 0 && strcmp(mode, "overflow-loud") != 0)
     {
         printf("unknown mode\n");
         return 2;
@@ -282,6 +516,12 @@ int main(int argc, char** argv)
 
     if (strncmp(mode, "overflow", 8) == 0)
         return recurse(0);
+
+    if (strcmp(mode, "exitthread") == 0)
+    {
+        outer(argc);
+        return 0;
+    }
 
     int r = outer(argc);
 

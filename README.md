@@ -35,10 +35,10 @@ usual crash dialog (Windows Error Reporting, or Wine's) appears:
 - `lomhd_crash_YYYYMMDD_HHMMSS.dmp`, a minidump (threads, stacks, modules, and the data segments of
   the game, Storm and this DLL). About 12 KB under Wine 10 for an ordinary crash, whose dbghelp
   writes the stacks but not the data segments; about 2 MB after a stack overflow (the whole spent
-  stack). Not yet measured on Windows, where the data segments are included. This DLL's own copies
-  of the install path (and cnc-ddraw's path settings) are scrambled for the length of the dump,
-  but a minidump still names the folder: its module list holds full paths, and the game's and
-  Storm's memory and the thread stacks may too. Treat a `.dmp` as private.
+  stack). Not yet measured on Windows, where the data segments are included. A minidump names the
+  install folder, and on Windows usually the user: its module list holds full paths, and the
+  game's, Storm's and this DLL's memory and the thread stacks hold more. Treat a `.dmp` as private
+  and share it only on purpose.
 
 A **hang** writes `lomhd_hang_YYYYMMDD_HHMMSS.txt` with the window thread's registers and stack. It
 counts as a hang only when all of these hold: the game window's thread has made no DirectDraw call
@@ -77,18 +77,31 @@ If the game's filter resumes execution (`EXCEPTION_CONTINUE_EXECUTION`) the repo
 "Outcome" line saying it was not a crash, `lomhd.log` says so, and it does not count against the
 four reports a session may write.
 
-The report is written by a helper thread created at startup. The crashing thread only hands it the
-exception and waits, at most ten seconds, then carries on to the game's filter whatever happened --
-so a report that stalls (dbghelp waiting on a lock the crashing thread holds, say) can delay the
-game's end by ten seconds but never stop it. The crashing thread's own share is a few interlocked
-operations, an event and a wait: `-fstack-usage` measures 4 bytes for the entry point and 60 for
-the function behind it (with the handoff and the chain call inlined), which is why a stack overflow
-gets a report and a minidump too. The text is flushed before the minidump is attempted, and both
-are closed before any other filter runs, so whatever happens next -- a dialog, `ExitProcess`, or a
-hang in some DLL's shutdown code -- the report is already on disk. The module list comes from
-walking memory (VirtualQuery and each image's PE headers), not Toolhelp, so no part of the reporter
-takes the loader lock. The DLL pins itself in memory when the reporter is on, so the filter can
-never point into an unloaded DLL.
+The report is written by a helper thread created at startup. The crashing thread copies its
+exception record and registers into one of two request slots, signals the helper, and waits until
+a single deadline ten seconds after it entered -- however long it spent queued behind another
+crashing thread -- then carries on to the game's filter whatever happened. So a report that stalls
+(dbghelp waiting on a lock the crashing thread holds, say) can delay the game's end by ten seconds
+but never stop it. A request the crashing thread gave up on stays the helper's until it finishes,
+and the helper works only from the copies, never from the crashing thread's stack. The crashing
+thread's own share is a copy, a few interlocked operations, an event and a wait: `-fstack-usage`
+measures 4 bytes for the entry point and 72 for the function behind it (with the handoff and the
+chain call inlined), which is why a stack overflow gets a report and a minidump too. The text is
+flushed before the minidump is attempted, and both are closed before any other filter runs when the
+helper finishes in time, so whatever happens next -- a dialog, `ExitProcess`, or a hang in some
+DLL's shutdown code -- the report is already on disk. The module list comes from walking memory
+(VirtualQuery, ReadProcessMemory and each image's PE headers, every offset bounds-checked), not
+Toolhelp, so no part of the reporter takes the loader lock.
+
+Two limits. A crash on a thread that holds the process heap lock (a crash inside `HeapFree` on a
+corrupted heap is the common case) gets no report: opening the report file allocates, so the helper
+waits on that lock until the deadline. `lomhd.log` still gets the first-chance line. And the
+helper and the reporter thread exit when the game's main thread does -- they never keep a crashed
+game's process alive, but a crash on another thread after the main thread has ended is not
+reported.
+
+The DLL pins itself in memory when the reporter is on, so the filter can never point into an
+unloaded DLL.
 An exception the game *catches* and then exits on produces no report; the first ten such
 exceptions inside the game's exe, Storm or ddraw are noted in `lomhd.log` as "first-chance ... may
 have been handled" -- by the reporter thread within a quarter second, and otherwise as this DLL

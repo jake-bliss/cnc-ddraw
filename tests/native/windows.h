@@ -12,10 +12,23 @@ typedef int BOOL;
 #define FALSE 0
 typedef struct { LONG left, top, right, bottom; } RECT;
 typedef struct { LONG x, y; } POINT;
-/* Single-threaded tests: the interlocked increment needs no atomicity here. */
+/* Single-threaded tests: the interlocked operations need no atomicity here. */
 static inline LONG InterlockedIncrement(volatile LONG* p)
 {
     return ++*p;
+}
+static inline LONG InterlockedExchange(volatile LONG* p, LONG v)
+{
+    LONG old = *p;
+    *p = v;
+    return old;
+}
+static inline LONG InterlockedCompareExchange(volatile LONG* p, LONG v, LONG cmp)
+{
+    LONG old = *p;
+    if (old == cmp)
+        *p = v;
+    return old;
 }
 static inline BOOL SetRect(RECT* r, LONG l, LONG t, LONG rr, LONG b)
 {

@@ -368,6 +368,78 @@ static void test_chain(void)
     CHECK(!lc_in_front(NULL, NULL, NULL, FALSE), "no window");
 }
 
+static void test_mailbox(void)
+{
+    LC_MAILBOX m = { { 0 }, { 0 }, 0 };
+
+    /* The ordinary round trip. */
+    int a = lc_mail_claim(&m);
+    LONG g1 = lc_mail_post(&m, a);
+    CHECK(a >= 0 && g1 == 1 && lc_mail_take(&m) == a, "post and take");
+    CHECK(!lc_mail_collect(&m, a), "not collectable while the helper works");
+    lc_mail_finish(&m, a);
+    CHECK(lc_mail_collect(&m, a) && m.state[a] == LC_FREE, "collected, and the slot is free again");
+
+    /* Timed out before the helper started: cancelled, and the helper never sees it. */
+    a = lc_mail_claim(&m);
+    lc_mail_post(&m, a);
+    CHECK(lc_mail_abandon(&m, a) == LC_CANCELLED && lc_mail_take(&m) == -1, "cancelled before it started");
+
+    /* Timed out while the helper works (it is stuck on this thread's lock, say). The slot stays
+     * the helper's until it finishes: a second crash must get the other slot, never this one. */
+    a = lc_mail_claim(&m);
+    LONG ga = lc_mail_post(&m, a);
+    CHECK(lc_mail_take(&m) == a, "helper takes A");
+    CHECK(lc_mail_abandon(&m, a) == LC_LEFT_RUNNING && m.state[a] == LC_ABANDONED, "A abandoned mid-report");
+    int b = lc_mail_claim(&m);
+    LONG gb = lc_mail_post(&m, b);
+    CHECK(b >= 0 && b != a && gb > ga, "B gets the other slot and a later generation");
+    CHECK(lc_mail_claim(&m) == -1, "both busy: a third crash gets no slot (and skips its report)");
+
+    /* The helper finishes A late: A's slot is freed, and B is not marked done by it. */
+    lc_mail_finish(&m, a);
+    CHECK(m.state[a] == LC_FREE && !lc_mail_collect(&m, b), "A's late finish frees A only");
+    CHECK(lc_mail_take(&m) == b, "then the helper takes B");
+    lc_mail_finish(&m, b);
+    CHECK(lc_mail_collect(&m, b), "and B completes");
+
+    /* Finished just before the deadline check: counts as done, slot freed. */
+    a = lc_mail_claim(&m);
+    lc_mail_post(&m, a);
+    lc_mail_take(&m);
+    lc_mail_finish(&m, a);
+    CHECK(lc_mail_abandon(&m, a) == LC_WAS_DONE && m.state[a] == LC_FREE, "done at the deadline");
+
+    /* Two posted: the older generation is taken first. */
+    a = lc_mail_claim(&m);
+    b = lc_mail_claim(&m);
+    lc_mail_post(&m, b);
+    lc_mail_post(&m, a);
+    CHECK(lc_mail_take(&m) == b, "oldest first");
+
+    CHECK(lc_left(1000, 400) == 600 && lc_left(1000, 1000) == 0 && lc_left(1000, 5000) == 0, "left");
+    CHECK(lc_left(5, 0xFFFFFFF0u) == 21, "left across the tick counter wrapping");
+}
+
+static void test_pe_bounds(void)
+{
+    CHECK(lc_pe_nt_ok(0x80, 248, 4096), "ordinary e_lfanew");
+    CHECK(!lc_pe_nt_ok(0x10, 248, 4096), "inside the DOS header");
+    CHECK(!lc_pe_nt_ok(0x82, 248, 4096), "misaligned");
+    CHECK(!lc_pe_nt_ok(4000, 248, 4096), "NT headers run past what was read");
+    CHECK(!lc_pe_nt_ok(0x7FFFFFFC, 248, 4096), "huge e_lfanew");
+    CHECK(lc_pe_nt_ok(4096 - 248, 248, 4096), "NT headers ending exactly at the edge");
+
+    CHECK(lc_pe_range_ok(0x1000, 40, 0x2000), "export directory inside the image");
+    CHECK(!lc_pe_range_ok(0, 40, 0x2000), "no directory");
+    CHECK(!lc_pe_range_ok(0x1FF0, 40, 0x2000), "directory running off the end");
+    CHECK(!lc_pe_range_ok(0xFFFFFFF0u, 40, 0x2000), "RVA that would wrap");
+
+    CHECK(lc_pe_name_cap(0x1000, 0x2000, 47) == 47, "name, full cap");
+    CHECK(lc_pe_name_cap(0x1FF8, 0x2000, 47) == 8, "name near the end: only what is inside");
+    CHECK(lc_pe_name_cap(0x2000, 0x2000, 47) == 0 && lc_pe_name_cap(0, 0x2000, 47) == 0, "name outside");
+}
+
 int main(void)
 {
     test_text();
@@ -377,6 +449,8 @@ int main(void)
     test_report();
     test_sha256();
     test_chain();
+    test_mailbox();
+    test_pe_bounds();
 
     printf(g_fail ? "%d FAILED\n" : "all passed\n", g_fail);
     return g_fail != 0;

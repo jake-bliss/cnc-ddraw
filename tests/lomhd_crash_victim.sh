@@ -20,18 +20,27 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/lomhd_victim.XXXXXX")
 i686-w64-mingw32-gcc -O1 -Wall -Wno-infinite-recursion -o "$WORK/victim.exe" "$ROOT/tests/lomhd_crash_victim.c" || exit 1
 
 # mode | exit | crash .txt | .dmp | hang .txt | lomhd.log must contain | stdout must contain | .txt must contain
+#   exit: a number, or * for any exit at all -- the process ending by itself is the assertion.
+#   Exit 124 (killed at the timeout) fails every mode.
+#   files: a count, or ? for "not checked". lomhd.log: text it must contain, - for "must not
+#   exist", empty for "not checked".
 EXPECT='
 av             |44|1|1|0|report written to          |game filter              |ACCESS_VIOLATION
 chain          |43|1|1|0|report written to          |calling its predecessor  |
 bypass         |45|1|1|0|replaced ours without      |bypass filter            |
 bypass-chain   |44|1|1|0|replaced ours without      |bypass filter: calling   |
 bypass-restore |44|1|1|0|uninstalled itself         |restored                 |
-none           |*|1|1|0|report written to          |crashing now             |
+none           |5 |1|1|0|report written to          |crashing now             |
 handled        |0 |0|0|0|crash reports: on          |IsBadReadPtr 1           |
-noflag         |44|0|0|0|                           |game filter              |
+noflag         |44|0|0|0|-                          |game filter              |
 caught         |3 |0|0|0|first-chance c0000005      |caught                   |
+caught-heap    |3 |0|0|0|first-chance c0000005      |heap held by another     |
 overflow       |44|1|1|0|report written to          |crashing now             |STACK_OVERFLOW
-overflow-noflag|44|0|0|0|                           |crashing now             |
+overflow-noflag|44|0|0|0|-                          |crashing now             |
+overflow-loud  |* |1|1|0|report written to          |crashing now             |STACK_OVERFLOW
+exitthread     |* |1|1|0|report written to          |ends the faulting thread |
+deadline       |49|?|?|0|                           |B reached the game filter|
+abandon        |0 |1|1|0|resumed after              |dump holds the copied    |Outcome:
 continue       |47|1|1|0|resumed after              |resumed after the fault  |Outcome:
 freelib        |44|1|1|0|report written to          |still loaded after FreeLibrary: yes|
 hang           |0 |0|0|1|hang: report written       |not pumping              |
@@ -72,14 +81,13 @@ for mode in "${MODES[@]}"; do
   have_hang=$(ls "$dir"/lomhd_hang_*.txt 2>/dev/null | wc -l | tr -d ' ')
   problems=""
 
-  if [ "$want_code" = "*" ]; then
-    case $code in 0|3|43|44|45|46|47) problems+=" exit $code (want a crash exit, not one of the victim's)";; esac
-  elif [ "$code" != "$want_code" ]; then problems+=" exit $code (want $want_code)"; fi
-  [ "$have_txt" = "$want_txt" ] || problems+=" $have_txt crash .txt (want $want_txt)"
-  [ "$have_dmp" = "$want_dmp" ] || problems+=" $have_dmp .dmp (want $want_dmp)"
-  [ "$have_hang" = "$want_hang" ] || problems+=" $have_hang hang .txt (want $want_hang)"
-  if [ -n "$want_log" ]; then grep -q -- "$want_log" "$dir/lomhd.log" 2>/dev/null || problems+=" lomhd.log lacks '$want_log'"
-  elif [ -e "$dir/lomhd.log" ]; then problems+=" lomhd.log exists (want none)"; fi
+  if [ "$code" = 124 ]; then problems+=" timed out after ${TIMEOUT:-90} s (the process did not end)"
+  elif [ "$want_code" != "*" ] && [ "$code" != "$want_code" ]; then problems+=" exit $code (want $want_code)"; fi
+  [ "$want_txt" = "?" ] || [ "$have_txt" = "$want_txt" ] || problems+=" $have_txt crash .txt (want $want_txt)"
+  [ "$want_dmp" = "?" ] || [ "$have_dmp" = "$want_dmp" ] || problems+=" $have_dmp .dmp (want $want_dmp)"
+  [ "$want_hang" = "?" ] || [ "$have_hang" = "$want_hang" ] || problems+=" $have_hang hang .txt (want $want_hang)"
+  if [ "$want_log" = "-" ]; then [ ! -e "$dir/lomhd.log" ] || problems+=" lomhd.log exists (want none)"
+  elif [ -n "$want_log" ]; then grep -q -- "$want_log" "$dir/lomhd.log" 2>/dev/null || problems+=" lomhd.log lacks '$want_log'"; fi
   [ -z "$want_out" ] || grep -q -- "$want_out" "$dir/stdout.txt" || problems+=" stdout lacks '$want_out'"
   [ -z "$want_in_txt" ] || cat "$dir"/lomhd_crash_*.txt 2>/dev/null | grep -q -- "$want_in_txt" || problems+=" report lacks '$want_in_txt'"
 

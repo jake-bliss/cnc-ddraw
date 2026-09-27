@@ -193,4 +193,42 @@ BOOL lc_same_fault(DWORD code, DWORD address, DWORD thread,
  * HungWindowFromGhostWindow says the foreground window stands for; NULL if it is no ghost). */
 BOOL lc_in_front(const void* window, const void* foreground, const void* ghost_of_foreground, BOOL iconic);
 
+/* The handoff between crashing threads and the report helper: LC_SLOTS request slots, each with
+ * its own copy of the exception (so the helper never reads a crashing thread's stack after that
+ * thread has given up waiting) and its own generation number.
+ *   waiter: claim (FREE -> FILLING), copy the exception in, post (-> POSTED, new generation),
+ *           then either collect (DONE -> FREE) or, at its deadline, abandon:
+ *           POSTED -> FREE (the helper never started: cancelled), TAKEN -> ABANDONED (the helper
+ *           is working on it; it frees the slot when it finishes), DONE -> FREE.
+ *   helper: take the oldest POSTED (-> TAKEN), work, finish (TAKEN -> DONE, ABANDONED -> FREE).
+ * A slot the helper holds is never claimed again until it is finished, so a later request cannot
+ * overwrite data the helper is still reading. All transitions are compare-and-swap. */
+#define LC_SLOTS 2
+
+enum { LC_FREE, LC_FILLING, LC_POSTED, LC_TAKEN, LC_ABANDONED, LC_DONE };
+enum { LC_CANCELLED, LC_LEFT_RUNNING, LC_WAS_DONE };
+
+typedef struct
+{
+    volatile LONG state[LC_SLOTS];
+    volatile LONG gen[LC_SLOTS];
+    volatile LONG next_gen;
+} LC_MAILBOX;
+
+int lc_mail_claim(LC_MAILBOX* m);                    /* a slot, or -1 when both are busy */
+LONG lc_mail_post(LC_MAILBOX* m, int slot);          /* its generation */
+int lc_mail_take(LC_MAILBOX* m);                     /* the oldest posted slot, or -1 */
+void lc_mail_finish(LC_MAILBOX* m, int slot);
+BOOL lc_mail_collect(LC_MAILBOX* m, int slot);       /* TRUE (and freed) once done */
+int lc_mail_abandon(LC_MAILBOX* m, int slot);        /* LC_CANCELLED, LC_LEFT_RUNNING, LC_WAS_DONE */
+
+/* PE header bounds, for reading a module's name out of memory. The headers are read from the first
+ * `readable` bytes of the image; RVAs must lie inside the image. */
+BOOL lc_pe_nt_ok(DWORD e_lfanew, DWORD nt_size, DWORD readable);
+BOOL lc_pe_range_ok(DWORD rva, DWORD size, DWORD image_size);
+DWORD lc_pe_name_cap(DWORD rva, DWORD image_size, DWORD cap);   /* bytes that may be read at rva */
+
+/* Milliseconds left before `deadline` (GetTickCount time), 0 once passed; wrap-safe. */
+DWORD lc_left(DWORD deadline, DWORD now);
+
 #endif
