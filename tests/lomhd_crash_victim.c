@@ -11,6 +11,9 @@
  *   bypass    installs its filter through GetProcAddress, around the patched import, waits for the
  *             reporter to re-assert, then crashes. Expect a report, then "victim filter called".
  *   none      no filter of its own; crashes. Expect a report, then Wine's/Windows' usual crash.
+ *   caught    faults inside the victim, catches it in its own vectored handler and calls
+ *             ExitProcess -- a game that handles its own crash. Expect NO report, but a
+ *             "first-chance" line in lomhd.log, written as the DLL detaches.
  *   handled   raises access violations that are caught (IsBadReadPtr/IsBadWritePtr), then exits
  *             0. Expect NO report: a first-chance exception must never produce one.
  *   hang      makes a window, hands it to DirectDraw, pumps for two seconds, then stops pumping
@@ -50,6 +53,18 @@ static __attribute__((noinline)) int middle(int v)
 static __attribute__((noinline)) int outer(int v)
 {
     return middle(v + 1) + 7;
+}
+
+/* Stands in for a game's own handler that catches a fault and exits: no unhandled filter runs. */
+static LONG WINAPI catch_and_exit(EXCEPTION_POINTERS* ep)
+{
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
+    {
+        printf("caught: %08lx, calling ExitProcess\n", ep->ExceptionRecord->ExceptionCode);
+        ExitProcess(3);
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
@@ -169,6 +184,16 @@ int main(int argc, char** argv)
         printf("handled: IsBadReadPtr %d, IsBadWritePtr %d\n", r, w);
         Sleep(1500);
         return 0;
+    }
+
+    if (strcmp(mode, "caught") == 0)
+    {
+        /* Last in line, as a game's own SEH __except is (vectored handlers all run before any
+         * frame handler). Crash at once: the reporter thread has had no chance to log the
+         * breadcrumb itself, so what reaches lomhd.log came from DLL_PROCESS_DETACH. */
+        AddVectoredExceptionHandler(0, catch_and_exit);
+        printf("crashing now\n");
+        return outer(argc);
     }
 
     if (strcmp(mode, "av") == 0)

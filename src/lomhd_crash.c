@@ -250,16 +250,15 @@ static void lc_snapshot_modules(void)
     InterlockedExchange(&g_snap_active, slot);
 }
 
-/* An address in an image the snapshot has not seen yet: its allocation base is the module, and
- * the PE export directory usually carries its name. Lock-free, heap-free. */
-static void lc_add_image(LC_WORK* w, DWORD addr)
+/* The module an address is in, without the snapshot: its allocation base is the module, and the
+ * PE export directory usually carries its name (the exe's comes from its path). Lock-free and
+ * heap-free, so it serves the crash path and DLL_PROCESS_DETACH. */
+static BOOL lc_image_at(DWORD addr, LC_MODULE* mod)
 {
-    LC_REPORT* r = &w->r;
     MEMORY_BASIC_INFORMATION m;
 
-    if (r->mod_count >= LC_MAX_MODULES || lc_find_module(w->mods, r->mod_count, addr) ||
-        !VirtualQuery((LPCVOID)addr, &m, sizeof(m)) || m.Type != MEM_IMAGE || !m.AllocationBase)
-        return;
+    if (!VirtualQuery((LPCVOID)addr, &m, sizeof(m)) || m.Type != MEM_IMAGE || !m.AllocationBase)
+        return FALSE;
 
     DWORD base = (DWORD)m.AllocationBase;
     IMAGE_DOS_HEADER dos;
@@ -267,12 +266,11 @@ static void lc_add_image(LC_WORK* w, DWORD addr)
 
     if (lc_copy(&dos, base, sizeof(dos)) != sizeof(dos) || dos.e_magic != IMAGE_DOS_SIGNATURE ||
         lc_copy(&nt, base + (DWORD)dos.e_lfanew, sizeof(nt)) != sizeof(nt) || nt.Signature != IMAGE_NT_SIGNATURE)
-        return;
+        return FALSE;
 
-    LC_MODULE* mod = &w->mods[r->mod_count];
     mod->base = base;
     mod->size = nt.OptionalHeader.SizeOfImage;
-    lc_strcpy(mod->name, LC_MODULE_NAME, "(loaded since the snapshot)");
+    lc_strcpy(mod->name, LC_MODULE_NAME, base == g_exe_base ? lc_basename(g_exe_path) : "(loaded since the snapshot)");
 
     IMAGE_DATA_DIRECTORY* dir = &nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
     IMAGE_EXPORT_DIRECTORY exp;
@@ -284,9 +282,20 @@ static void lc_add_image(LC_WORK* w, DWORD addr)
         DWORD got = lc_copy(name, base + exp.Name, sizeof(name) - 1);
         name[got] = 0;
 
-        if (got && name[0])
+        if (got && name[0] && base != g_exe_base)
             lc_strcpy(mod->name, LC_MODULE_NAME, name);
     }
+
+    return TRUE;
+}
+
+static void lc_add_image(LC_WORK* w, DWORD addr)
+{
+    LC_REPORT* r = &w->r;
+
+    if (r->mod_count >= LC_MAX_MODULES || lc_find_module(w->mods, r->mod_count, addr) ||
+        !lc_image_at(addr, &w->mods[r->mod_count]))
+        return;
 
     r->mod_count++;
     lc_sort_modules(w->mods, r->mod_count);
@@ -770,6 +779,9 @@ static LONG WINAPI lc_vectored(EXCEPTION_POINTERS* ep)
 /* In lomhd.log, the first few first-chance exceptions inside the game, Storm or this DLL: if the
  * game then closes or hangs without a crash report (something caught the exception and exited),
  * this is where it started. Capped, and never a report. */
+static LONG g_seen_logged_upto;            /* reporter thread, then DLL_PROCESS_DETACH */
+static int g_seen_logged;
+
 static void lc_log_seen(LONG* logged_upto, int* logged)
 {
     LONG next = g_seen_next;
@@ -782,9 +794,15 @@ static void lc_log_seen(LONG* logged_upto, int* logged)
         LC_SEEN s = g_seen[(DWORD)*logged_upto % LC_MAX_SEEN];
         LONG slot = g_snap_active;
         const LC_MODULE* m = slot >= 0 ? lc_find_module(g_snap[slot], g_snap_count[slot], s.address) : NULL;
-        const char* kind = lc_module_kind(m ? m->name : NULL);
+        LC_MODULE found;
 
-        if (*logged >= LC_SEEN_LOG_MAX || !m || strcmp(kind, "other") == 0)
+        if (!m && lc_image_at(s.address, &found))
+            m = &found;
+
+        /* The game's exe whatever it is called, Storm, or this DLL: not the system DLLs, whose
+         * IsBadReadPtr and friends fault and recover as a matter of course. */
+        if (*logged >= LC_SEEN_LOG_MAX || !m ||
+            (m->base != g_exe_base && strcmp(lc_module_kind(m->name), "other") == 0))
             continue;
 
         char line[200];
@@ -1034,8 +1052,6 @@ static DWORD WINAPI lc_reporter(LPVOID unused)
     memset(&watch, 0, sizeof(watch));
     watch.quiet_since = GetTickCount();
     DWORD last_snap = GetTickCount(), last_assert = 0;
-    LONG seen_upto = 0;
-    int seen_logged = 0;
 
     while (!g_stop)
     {
@@ -1054,7 +1070,7 @@ static DWORD WINAPI lc_reporter(LPVOID unused)
             last_assert = now;
         }
 
-        lc_log_seen(&seen_upto, &seen_logged);
+        lc_log_seen(&g_seen_logged_upto, &g_seen_logged);
 
         if (g_hang_reports)
             lc_watch(&watch, now);
@@ -1139,7 +1155,13 @@ void lomhd_crash_exit(BOOL process_exit)
     InterlockedExchange(&g_detached, 1);
 
     if (process_exit)
+    {
+        /* ExitProcess has already ended the reporter thread, so breadcrumbs from its last quarter
+         * second may be unlogged -- and a game that caught an access violation and chose to exit
+         * lands exactly here. Logged now, before any DLL detached after us (Storm, say) can hang. */
+        lc_log_seen(&g_seen_logged_upto, &g_seen_logged);
         return;             /* the code stays mapped: a crash during shutdown is still reported */
+    }
 
     /* FreeLibrary: this code is about to go. Hand the process its filter back and stop. */
     InterlockedExchange(&g_stop, 1);

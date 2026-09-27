@@ -64,9 +64,11 @@ own, the report is written first and theirs runs after it, with the result it re
 
 The report is written, flushed and closed before any other filter runs, so whatever happens next --
 a dialog, `ExitProcess`, or a hang in some DLL's shutdown code -- the report is already on disk.
-An exception the game *catches* and then exits on produces no report; the first few such
-exceptions inside lomse, Storm or ddraw are noted in `lomhd.log` as "first-chance ... may have been
-handled", which is where to look when the game closes or hangs with no report.
+An exception the game *catches* and then exits on produces no report; the first ten such
+exceptions inside the game's exe, Storm or ddraw are noted in `lomhd.log` as "first-chance ... may
+have been handled" -- by the reporter thread within a quarter second, and otherwise as this DLL
+detaches at exit, which is before any DLL detached after it (Storm, say) can hang. That line is
+where to look when the game closes or hangs with no report.
 
 `tests/lomhd_crash_test.c` covers the report text, module+offset annotation, the log ring buffer,
 the file names and SHA-256 natively; `tests/lomhd_crash_victim.c` is a program that loads the built
