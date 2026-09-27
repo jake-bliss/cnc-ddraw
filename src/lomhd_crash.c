@@ -1,13 +1,16 @@
 #include <windows.h>
 #include <dbghelp.h>
-#include <tlhelp32.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "dd.h"
 #include "hook.h"
 #include "git.h"
+#ifndef LOMHD_VERSION /* git.h from the Makefile has it; the MSVC project's does not */
+#define LOMHD_VERSION "dev"
+#endif
 #include "version.h"
+#include "config.h"
 #include "dllmain.h"
 #include "lomhd.h"
 #include "lomhd_crash.h"
@@ -17,96 +20,114 @@
  * responding while in front. The text is the part meant to be read from a bug report; see
  * src/lomhd_crash_core.c for its layout.
  *
- * WHICH EXCEPTIONS. Only unhandled ones: this is a top-level (SetUnhandledExceptionFilter) filter,
- * which Windows and Wine call after every frame-based handler has declined -- never for a
+ * WHICH EXCEPTIONS. Only unhandled ones: this is the top-level (SetUnhandledExceptionFilter)
+ * filter, which Windows and Wine call after every frame-based handler has declined -- never for a
  * first-chance exception the game or a system DLL catches (IsBadReadPtr raises and catches access
  * violations all day). A vectored handler also records the last few serious first-chance
  * exceptions, but only as context inside a report and as a capped note in lomhd.log.
  *
- * THE FILTER CHAIN. There is one top-level filter per process, and a game or Storm may set its own.
- * Two mechanisms keep ours first without losing theirs:
- *   1. cnc-ddraw already patches SetUnhandledExceptionFilter in the import tables of every module in
- *      the game folder (hook.c; upstream did it for debug builds, this fork for all gcc builds).
- *      Such a call lands in lomhd_crash_set_filter, which keeps the process-wide filter ours and
- *      records theirs as the "game top" -- returning what the real call would have returned, so a
- *      filter that chains to its predecessor still reaches it. Native semantics, one level down.
- *   2. A call that bypasses the patched tables (GetProcAddress, a module outside the game folder)
- *      really replaces ours. The reporter thread re-asserts ours once a second: it swaps ours back
- *      in and pushes the newcomer on the chain above the previous game top. The newcomer's own
- *      "previous filter" is ours, so when it chains back into us we continue one level down
- *      instead of recursing (see lc_filter). Between the replacement and the re-assert (up to a
- *      second) a crash goes to the newcomer alone: the one gap.
- * After the report is written and closed we call the chain and return its answer; with nothing to
- * chain to, EXCEPTION_CONTINUE_SEARCH -- so Windows Error Reporting or Wine's crash dialog and
- * winedbg still do exactly what they did before.
+ * THE FILTER CHAIN. There is one top-level filter per process, and a game or Storm may set its
+ * own. Ours is installed as one of eight entry points, one per chain level (lc_stub_0..7); the
+ * bookkeeping is pure and tested natively (lc_chain_* in lomhd_crash_core.c).
+ *   1. cnc-ddraw patches SetUnhandledExceptionFilter in the import tables of every module in the
+ *      game folder (hook.c; upstream did it for debug builds, this fork for all gcc builds). Such a
+ *      call lands in lomhd_crash_set_filter: the process-wide filter stays ours, theirs becomes the
+ *      newest entry, and they get back what the real call would have returned, so a filter that
+ *      chains to its predecessor still reaches it.
+ *   2. A call that bypasses the patched imports (GetProcAddress, a module outside the game folder)
+ *      really replaces ours. Once a second the reporter thread puts ours back and records what it
+ *      found. The newcomer saved "ours at level j" as its predecessor, so when it chains back we
+ *      continue one level down; and when it uninstalls by restoring that, the reporter sees ours at
+ *      level j and drops it -- a filter that uninstalled itself is never called. A filter that is
+ *      already in the chain is never pushed twice. Between a replacement and the next re-assert (up
+ *      to a second) a crash goes to the newcomer alone: the one gap.
+ * After the report we call the chain and return its answer; with nothing to chain to,
+ * EXCEPTION_CONTINUE_SEARCH -- so Windows Error Reporting or Wine's crash dialog and winedbg still
+ * do exactly what they did before.
  *
- * THE CRASH PATH runs on the crashing thread: static buffers, no heap, no locks we do not own, no
- * C runtime formatting, function pointers resolved at startup, paths built at startup. The module
- * list comes from a snapshot the reporter thread refreshes every two seconds (Toolhelp takes the
- * loader lock, which a crashing thread may hold); an address in a module loaded since is found
- * with VirtualQuery and named from its export directory. The text is written and flushed before
- * the minidump is attempted, and both are closed before the chain runs: whatever the game's own
- * filter or its shutdown does next -- including hang in a DllMain -- the report is already on disk. */
+ * THE CRASHING THREAD does almost nothing: interlocked operations, SetEvent, a bounded wait, and the
+ * chain. It never allocates, formats, logs, opens a file or takes a lock of its own, and its frame
+ * is small (measured with -fstack-usage; see the README), so a stack overflow is reported too. The
+ * report is written by a helper thread created at startup, which reads the crashing thread's
+ * context and stack while it waits. The helper uses no heap and no C runtime for the report itself
+ * (lomhd_crash_core.c formats into static buffers), but it does call into Windows: CreateFile and
+ * WriteFile, VirtualQuery, and dbghelp's MiniDumpWriteDump, which allocates and may need the loader
+ * lock. If the crashing thread holds a lock the helper then needs, the helper blocks -- and after
+ * ten seconds the crashing thread stops waiting and carries on to the chain, so the game still ends
+ * as it would have. The text is written and flushed before the minidump is attempted.
+ *
+ * MODULES are listed by walking the address space with VirtualQuery and reading each image's PE
+ * headers (the name from its export directory). No Toolhelp, so nothing here ever takes the loader
+ * lock -- a lock the crashing thread, or a thread the minidump has suspended, may hold. */
 
 #define LC_MAX_MODULES 160
-#define LC_MAX_CHAIN 8
 #define LC_MAX_THREADS 8
 #define LC_MAX_REPORTS 4                   /* per session */
+#define LC_MAX_HANGS 3                     /* per session */
 #define LC_HANG_MS 20000
+#define LC_HANDOFF_MS 10000                /* the crashing thread's wait for the helper */
 #define LC_LOG_LINES 30
 #define LC_SEEN_LOG_MAX 10
+#define LC_CHAIN_LOG_MAX 6
 
 typedef BOOL(WINAPI* MINIDUMPWRITEDUMPPROC)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE,
     PMINIDUMP_EXCEPTION_INFORMATION, PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION);
 typedef BOOL(WINAPI* ISHUNGAPPWINDOWPROC)(HWND);
+typedef HWND(WINAPI* HUNGWINDOWFROMGHOSTPROC)(HWND);
 
 static volatile LONG g_installed;
-static volatile LONG g_detached;           /* DLL_PROCESS_DETACH seen: dbghelp may be gone */
-static volatile LONG g_stop;
+static volatile LONG g_detached;           /* DLL_PROCESS_DETACH seen: the helper is gone */
 static BOOL g_hang_reports;
 static DWORD g_start_tick;
 
 static char g_dir[MAX_PATH];               /* game folder, with a trailing backslash */
 static char g_exe_path[MAX_PATH];
+static char g_exe_name[LC_MODULE_NAME];
 static DWORD g_exe_size, g_exe_timestamp, g_exe_checksum;
 static DWORD g_exe_base;
 static char g_exe_sha[65];
 static volatile LONG g_exe_sha_ready;
 static char g_host[128] = "unknown";
-static const char g_version[] = "cnc-ddraw " VERSION_STRING ", " GIT_BRANCH " @ " GIT_COMMIT;
+static const char g_version[] = "cnc-ddraw " VERSION_STRING ", lomhd " LOMHD_VERSION ", git " GIT_COMMIT;
 static const char* volatile g_terrain = "not checked yet";
 
 static LC_RING g_log;
 static LC_SEEN g_seen[LC_MAX_SEEN];
 static volatile LONG g_seen_next;
-
-static LC_MODULE g_snap[2][LC_MAX_MODULES];
-static int g_snap_count[2];
-static DWORD g_snap_tick[2];
-static volatile LONG g_snap_active = -1;
+static LONG g_seen_logged_upto;            /* reporter thread, then DLL_PROCESS_DETACH */
+static int g_seen_logged;
 
 static MINIDUMPWRITEDUMPPROC g_minidump;
 static ISHUNGAPPWINDOWPROC g_is_hung;
+static HUNGWINDOWFROMGHOSTPROC g_ghost_owner;
 static DWORD g_ddraw_base, g_storm_base;   /* modules whose data segments go in the minidump */
 
-static LPTOP_LEVEL_EXCEPTION_FILTER volatile g_chain[LC_MAX_CHAIN];
-static volatile LONG g_chain_count;
+/* The chain. Changed under g_chain_lock (patched-import calls and the reporter's re-assert); read
+ * without it by the crash path. */
+static LC_CHAIN g_chain;
 static volatile LONG g_chain_lock;
-static volatile LONG g_replaced;           /* times something bypassed the hook and replaced ours */
+static void* g_stubs[LC_MAX_CHAIN];
+static int g_chain_logged;
 
 typedef struct
 {
     volatile LONG tid;
-    BOOL active, reporting;
-    int depth;
+    DWORD visited;                         /* chain levels this thread has entered */
 } LC_THREAD;
 
 static LC_THREAD g_threads[LC_MAX_THREADS];
-static volatile LONG g_report_lock;        /* thread id writing a report, or 0 */
+static volatile LONG g_report_lock;        /* thread id writing (or waiting on) a report, or 0 */
 static volatile LONG g_reports;
 static DWORD g_last_code, g_last_address, g_last_thread;   /* the last exception reported */
 static int g_hang_count;                   /* reporter thread only */
-#define LC_MAX_HANGS 3                     /* per session */
+
+/* The handoff to the helper thread. */
+static HANDLE g_helper, g_request, g_done;
+static DWORD g_helper_tid;
+static EXCEPTION_POINTERS* volatile g_req_ep;
+static volatile DWORD g_req_tid;
+static volatile LONG g_req_seq, g_done_seq;
+static volatile LONG g_resume_seq;         /* a report whose chain resumed execution */
 
 /* Everything one report needs, static: a crash and a hang report can be in flight at once, on
  * different threads, so each has its own. */
@@ -116,8 +137,8 @@ typedef struct
     LC_MODULE mods[LC_MAX_MODULES];
     LC_SEEN seen[LC_MAX_SEEN];
     char text[40000];
-    char path[MAX_PATH];
     char name[64];
+    LONG seq;
 } LC_WORK;
 
 static LC_WORK g_crash_work, g_hang_work;
@@ -125,10 +146,8 @@ static LC_WORK g_crash_work, g_hang_work;
 static volatile LONG g_beats;
 static volatile DWORD g_window_tid;
 
-static LONG WINAPI lc_filter(EXCEPTION_POINTERS* ep);
-
 /* ------------------------------------------------------------------------------------------- */
-/* Small helpers (no heap, no C runtime)                                                       */
+/* Small helpers                                                                               */
 /* ------------------------------------------------------------------------------------------- */
 
 static void lc_spin_lock(volatile LONG* lock)
@@ -150,8 +169,8 @@ static BOOL lc_readable_region(const MEMORY_BASIC_INFORMATION* m)
 }
 
 /* Copies what is readable from the start of [src, src + n); returns the byte count. VirtualQuery
- * rather than a fault handler: mingw has no __try, and a second fault inside a crash handler is
- * the one thing it must not do. */
+ * rather than a fault handler: mingw has no __try, and a fault on the helper thread would end the
+ * report. */
 static DWORD lc_copy(void* dst, DWORD src, DWORD n)
 {
     DWORD done = 0;
@@ -212,47 +231,30 @@ static BOOL lc_flag(const char* name)
     return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
 }
 
-/* ------------------------------------------------------------------------------------------- */
-/* Modules                                                                                     */
-/* ------------------------------------------------------------------------------------------- */
-
-/* The reporter thread's snapshot, never taken on a crashing thread: Toolhelp takes the loader lock
- * and allocates. Written to the buffer not being read, then published. */
-static void lc_snapshot_modules(void)
+/* g_dir + name into out; FALSE if it does not fit. */
+static BOOL lc_join(char* out, unsigned cap, const char* name)
 {
-    LONG active = g_snap_active;
-    int slot = active == 0 ? 1 : 0;
-    int n = 0;
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
-
-    if (snap == INVALID_HANDLE_VALUE)
-        return;
-
-    MODULEENTRY32 me;
-    me.dwSize = sizeof(me);
-
-    for (BOOL ok = Module32First(snap, &me); ok && n < LC_MAX_MODULES; ok = Module32Next(snap, &me))
-    {
-        g_snap[slot][n].base = (DWORD)me.modBaseAddr;
-        g_snap[slot][n].size = me.modBaseSize;
-        lc_strcpy(g_snap[slot][n].name, LC_MODULE_NAME, me.szModule);
-
-        if (_stricmp(me.szModule, "storm.dll") == 0)
-            g_storm_base = (DWORD)me.modBaseAddr;
-
-        n++;
-    }
-
-    CloseHandle(snap);
-    lc_sort_modules(g_snap[slot], n);
-    g_snap_count[slot] = n;
-    g_snap_tick[slot] = GetTickCount();
-    InterlockedExchange(&g_snap_active, slot);
+    LC_TEXT p;
+    lc_text_init(&p, out, cap);
+    lc_puts(&p, g_dir);
+    lc_puts(&p, name);
+    return p.dropped == 0;
 }
 
-/* The module an address is in, without the snapshot: its allocation base is the module, and the
- * PE export directory usually carries its name (the exe's comes from its path). Lock-free and
- * heap-free, so it serves the crash path and DLL_PROCESS_DETACH. */
+static void lc_wipe(void* p, unsigned n)
+{
+    volatile BYTE* b = p;
+
+    for (unsigned i = 0; i < n; i++)
+        b[i] = 0;
+}
+
+/* ------------------------------------------------------------------------------------------- */
+/* Modules, from memory                                                                        */
+/* ------------------------------------------------------------------------------------------- */
+
+/* The module an address is in: its allocation base is the module, and the PE export directory
+ * carries its name (the exe has none; its name comes from startup). Lock-free and heap-free. */
 static BOOL lc_image_at(DWORD addr, LC_MODULE* mod)
 {
     MEMORY_BASIC_INFORMATION m;
@@ -270,70 +272,62 @@ static BOOL lc_image_at(DWORD addr, LC_MODULE* mod)
 
     mod->base = base;
     mod->size = nt.OptionalHeader.SizeOfImage;
-    lc_strcpy(mod->name, LC_MODULE_NAME, base == g_exe_base ? lc_basename(g_exe_path) : "(loaded since the snapshot)");
+    lc_strcpy(mod->name, LC_MODULE_NAME, base == g_exe_base ? g_exe_name : "(no export name)");
 
     IMAGE_DATA_DIRECTORY* dir = &nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
     IMAGE_EXPORT_DIRECTORY exp;
 
-    if (nt.OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT && dir->VirtualAddress &&
-        lc_copy(&exp, base + dir->VirtualAddress, sizeof(exp)) == sizeof(exp) && exp.Name)
+    if (base != g_exe_base && nt.OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT &&
+        dir->VirtualAddress && lc_copy(&exp, base + dir->VirtualAddress, sizeof(exp)) == sizeof(exp) && exp.Name)
     {
         char name[LC_MODULE_NAME];
         DWORD got = lc_copy(name, base + exp.Name, sizeof(name) - 1);
         name[got] = 0;
 
-        if (got && name[0] && base != g_exe_base)
+        if (got && name[0])
             lc_strcpy(mod->name, LC_MODULE_NAME, name);
     }
 
     return TRUE;
 }
 
-static void lc_add_image(LC_WORK* w, DWORD addr)
+/* Every image mapped in the process, in address order: one VirtualQuery per region. */
+static __attribute__((noinline)) void lc_walk_modules(LC_WORK* w)
 {
     LC_REPORT* r = &w->r;
-
-    if (r->mod_count >= LC_MAX_MODULES || lc_find_module(w->mods, r->mod_count, addr) ||
-        !lc_image_at(addr, &w->mods[r->mod_count]))
-        return;
-
-    r->mod_count++;
-    lc_sort_modules(w->mods, r->mod_count);
-}
-
-static void lc_fill_modules(LC_WORK* w)
-{
-    LC_REPORT* r = &w->r;
-    LONG slot = g_snap_active;
+    DWORD addr = 0x10000;
 
     r->mods = w->mods;
     r->mod_count = 0;
 
-    if (slot >= 0)
+    while (r->mod_count < LC_MAX_MODULES)
     {
-        int n = g_snap_count[slot];
+        MEMORY_BASIC_INFORMATION m;
 
-        for (int i = 0; i < n && i < LC_MAX_MODULES; i++)
-            w->mods[i] = g_snap[slot][i];
+        if (!VirtualQuery((LPCVOID)addr, &m, sizeof(m)))
+            break;
 
-        r->mod_count = n;
-        r->mods_age_ms = GetTickCount() - g_snap_tick[slot];
+        DWORD next = (DWORD)m.BaseAddress + (DWORD)m.RegionSize;
+
+        if (m.Type == MEM_IMAGE && m.AllocationBase == m.BaseAddress && lc_image_at(addr, &w->mods[r->mod_count]))
+        {
+            const LC_MODULE* mod = &w->mods[r->mod_count++];
+
+            if (mod->base + mod->size > next)
+                next = mod->base + mod->size;
+        }
+
+        if (next <= addr)
+            break;
+
+        addr = next;
     }
 
-    if (r->has_exception)
-        lc_add_image(w, r->address);
-
-    if (r->has_regs)
-    {
-        lc_add_image(w, r->regs.eip);
-
-        for (int i = 0; i < r->stack_count; i++)
-            lc_add_image(w, r->stack[i]);
-    }
+    lc_sort_modules(w->mods, r->mod_count);
 }
 
 /* ------------------------------------------------------------------------------------------- */
-/* Writing a report                                                                            */
+/* Writing a report (helper and reporter threads)                                              */
 /* ------------------------------------------------------------------------------------------- */
 
 static void lc_fill_common(LC_WORK* w, const char* kind)
@@ -399,24 +393,24 @@ static void lc_fill_regs(LC_WORK* w, const CONTEXT* c)
     r->code_count = (int)lc_copy(r->code_bytes, c->Eip, sizeof(r->code_bytes));
 }
 
-/* Opens lomhd_<kind>_<time>.txt, never overwriting an older report. */
+/* Opens lomhd_<kind>_<time>.txt, never overwriting an older report. The full path exists only for
+ * the CreateFile call: it is wiped from the stack at once, because the stacks go in the minidump. */
 static HANDLE lc_open(LC_WORK* w, int* attempt_out)
 {
     for (int attempt = 1; attempt <= 9; attempt++)
     {
+        char path[MAX_PATH];
         lc_report_name(w->name, sizeof(w->name), w->r.kind, w->r.when, attempt, ".txt");
-        LC_TEXT p;
-        lc_text_init(&p, w->path, sizeof(w->path));
-        lc_puts(&p, g_dir);
-        lc_puts(&p, w->name);
 
-        if (p.dropped)
+        if (!lc_join(path, sizeof(path), w->name))
             return INVALID_HANDLE_VALUE;
 
-        HANDLE f = CreateFileA(w->path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW,
+        HANDLE f = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW,
             FILE_ATTRIBUTE_NORMAL, NULL);
+        DWORD error = GetLastError();
+        lc_wipe(path, sizeof(path));
 
-        if (f != INVALID_HANDLE_VALUE || GetLastError() != ERROR_FILE_EXISTS)
+        if (f != INVALID_HANDLE_VALUE || error != ERROR_FILE_EXISTS)
         {
             *attempt_out = attempt;
             return f;
@@ -449,18 +443,32 @@ static BOOL CALLBACK lc_dump_callback(PVOID param, const PMINIDUMP_CALLBACK_INPU
     return TRUE;
 }
 
-static void lc_write_dump(LC_WORK* w, EXCEPTION_POINTERS* ep, int attempt, HANDLE txt)
+/* The install path, in this DLL's data segment, scrambled for the length of the dump: the report
+ * text carries it, the minidump should not. XOR in place rather than a copy, since a copy would sit
+ * in the same data segment or on a dumped stack. The fork's globals and cnc-ddraw's own path
+ * settings; see the README for what else in a minidump can still name the folder. */
+static void lc_scramble_paths(void)
+{
+    char* const paths[] = {
+        g_dir, g_exe_path, g_config.ini_path, g_config.game_path, g_config.dll_path, g_config.screenshot_dir,
+    };
+
+    for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++)
+        for (unsigned j = 0; j < MAX_PATH; j++)
+            paths[i][j] ^= 0x5A;
+}
+
+static __attribute__((noinline)) void lc_write_dump(LC_WORK* w, EXCEPTION_POINTERS* ep, DWORD tid, int attempt,
+    HANDLE txt)
 {
     LC_TEXT t;
-    char line[MAX_PATH + 96];
+    char line[160];
     lc_text_init(&t, line, sizeof(line));
     lc_puts(&t, "Minidump:   ");
 
-    if (!g_minidump || g_detached || (ep && ep->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW))
+    if (!g_minidump)
     {
-        lc_puts(&t, !g_minidump ? "not written (dbghelp.dll unavailable)" : g_detached ?
-            "not written (the process was already shutting down)" :
-            "not written (stack overflow: too little stack left to write one safely)");
+        lc_puts(&t, "not written (dbghelp.dll unavailable)");
         lc_nl(&t);
         lc_write_all(txt, line, t.len);
         return;
@@ -468,13 +476,10 @@ static void lc_write_dump(LC_WORK* w, EXCEPTION_POINTERS* ep, int attempt, HANDL
 
     char name[64], path[MAX_PATH];
     lc_report_name(name, sizeof(name), w->r.kind, w->r.when, attempt, ".dmp");
-    LC_TEXT p;
-    lc_text_init(&p, path, sizeof(path));
-    lc_puts(&p, g_dir);
-    lc_puts(&p, name);
-
-    HANDLE f = p.dropped ? INVALID_HANDLE_VALUE :
-        CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE f = lc_join(path, sizeof(path), name) ?
+        CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL) :
+        INVALID_HANDLE_VALUE;
+    lc_wipe(path, sizeof(path));
 
     if (f == INVALID_HANDLE_VALUE)
     {
@@ -486,8 +491,10 @@ static void lc_write_dump(LC_WORK* w, EXCEPTION_POINTERS* ep, int attempt, HANDL
         return;
     }
 
+    /* The crashing thread's id: the dump's exception stream and "current thread" are that thread,
+     * not this helper. ClientPointers FALSE: the pointers are in this process. */
     MINIDUMP_EXCEPTION_INFORMATION info;
-    info.ThreadId = GetCurrentThreadId();
+    info.ThreadId = tid;
     info.ExceptionPointers = ep;
     info.ClientPointers = FALSE;
 
@@ -495,9 +502,12 @@ static void lc_write_dump(LC_WORK* w, EXCEPTION_POINTERS* ep, int attempt, HANDL
     cb.CallbackRoutine = (MINIDUMP_CALLBACK_ROUTINE)lc_dump_callback;
     cb.CallbackParam = NULL;
 
+    lc_scramble_paths();
     BOOL ok = g_minidump(GetCurrentProcess(), GetCurrentProcessId(), f,
         (MINIDUMP_TYPE)(MiniDumpNormal | MiniDumpWithDataSegs), ep ? &info : NULL, NULL, &cb);
     DWORD error = ok ? 0 : GetLastError();
+    lc_scramble_paths();
+
     DWORD size = GetFileSize(f, NULL);
     CloseHandle(f);
 
@@ -528,19 +538,19 @@ static void lc_note(const char* what, const LC_WORK* w, BOOL written)
     lomhd_log(line);
 }
 
-static void lc_report_crash(EXCEPTION_POINTERS* ep)
+/* On the helper thread, for a crashing thread blocked in lc_handoff. */
+static __attribute__((noinline)) void lc_report_crash(EXCEPTION_POINTERS* ep, DWORD tid, LONG seq)
 {
     LC_WORK* w = &g_crash_work;
     LC_REPORT* r = &w->r;
     EXCEPTION_RECORD* e = ep ? ep->ExceptionRecord : NULL;
 
-    for (unsigned i = 0; i < sizeof(*r); i++)
-        ((BYTE*)r)[i] = 0;
-
+    memset(r, 0, sizeof(*r));
     w->name[0] = 0;
+    w->seq = seq;
     lc_fill_common(w, "crash");
-    r->thread_id = GetCurrentThreadId();
-    r->window_thread = r->thread_id == g_window_tid;
+    r->thread_id = tid;
+    r->window_thread = tid == g_window_tid;
 
     if (e)
     {
@@ -556,15 +566,18 @@ static void lc_report_crash(EXCEPTION_POINTERS* ep)
     if (ep && ep->ContextRecord)
         lc_fill_regs(w, ep->ContextRecord);
 
-    lc_fill_modules(w);
+    lc_walk_modules(w);
+    g_storm_base = 0;
+
+    for (int i = 0; i < r->mod_count; i++)
+        if (strcmp(lc_module_kind(w->mods[i].name), "storm") == 0)
+            g_storm_base = w->mods[i].base;
 
     LC_TEXT note;
     char filters[96];
     lc_text_init(&note, filters, sizeof(filters));
-    lc_dec(&note, (DWORD)g_chain_count);
-    lc_puts(&note, " level(s) chained after this report; replaced and re-asserted ");
-    lc_dec(&note, (DWORD)g_replaced);
-    lc_puts(&note, " time(s)");
+    lc_dec(&note, (DWORD)g_chain.count);
+    lc_puts(&note, " level(s) chained after this report");
     r->filter_note = filters;
 
     int attempt = 1;
@@ -585,14 +598,74 @@ static void lc_report_crash(EXCEPTION_POINTERS* ep)
     FlushFileBuffers(f);
 
     /* After the text is safely down: a minidump is the step most likely to fail or stall. */
-    lc_write_dump(w, ep, attempt, f);
+    lc_write_dump(w, ep, tid, attempt, f);
     FlushFileBuffers(f);
     CloseHandle(f);
     lc_note("crash", w, TRUE);
 }
 
+/* The game's own filter resumed execution after a report: not a crash after all. */
+static void lc_note_resumed(LONG seq)
+{
+    LC_WORK* w = &g_crash_work;
+
+    if (w->seq != seq || !w->name[0])
+        return;
+
+    char path[MAX_PATH];
+
+    if (lc_join(path, sizeof(path), w->name))
+    {
+        HANDLE f = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+
+        if (f != INVALID_HANDLE_VALUE)
+        {
+            static const char outcome[] = "Outcome:    the game's own exception filter resumed execution "
+                "(EXCEPTION_CONTINUE_EXECUTION) -- this was not a crash.\r\n";
+            lc_write_all(f, outcome, sizeof(outcome) - 1);
+            CloseHandle(f);
+        }
+    }
+
+    char line[160];
+    _snprintf(line, sizeof(line), "crash: the game's filter resumed after %s; not a crash", w->name);
+    line[sizeof(line) - 1] = 0;
+    lomhd_log(line);
+    InterlockedDecrement(&g_reports);
+}
+
+static DWORD WINAPI lc_helper(LPVOID unused)
+{
+    (void)unused;
+    LONG handled = 0, resumed = 0;
+
+    for (;;)
+    {
+        WaitForSingleObject(g_request, INFINITE);
+        LONG seq = g_req_seq;
+
+        if (seq != handled)
+        {
+            handled = seq;
+            lc_report_crash(g_req_ep, g_req_tid, seq);
+            InterlockedExchange(&g_done_seq, seq);
+            SetEvent(g_done);
+        }
+
+        LONG r = g_resume_seq;
+
+        if (r && r != resumed)
+        {
+            resumed = r;
+            lc_note_resumed(r);
+        }
+    }
+
+    return 0;
+}
+
 /* ------------------------------------------------------------------------------------------- */
-/* The filter                                                                                  */
+/* The filter: the crashing thread's side                                                      */
 /* ------------------------------------------------------------------------------------------- */
 
 static LC_THREAD* lc_thread_find(DWORD me)
@@ -610,9 +683,7 @@ static LC_THREAD* lc_thread_claim(DWORD me)
     {
         if (InterlockedCompareExchange(&g_threads[i].tid, (LONG)me, 0) == 0)
         {
-            g_threads[i].active = TRUE;
-            g_threads[i].reporting = FALSE;
-            g_threads[i].depth = 0;
+            g_threads[i].visited = 0;
             return &g_threads[i];
         }
     }
@@ -620,50 +691,27 @@ static LC_THREAD* lc_thread_claim(DWORD me)
     return NULL;
 }
 
-/* Depth 0 is the newest game filter; each time a filter chains back into ours we go one down. */
-static LONG lc_call_chain(EXCEPTION_POINTERS* ep, int depth)
+static LONG lc_call(EXCEPTION_POINTERS* ep, int level)
 {
-    LONG idx = g_chain_count - 1 - depth;
-
-    if (idx < 0)
-        return EXCEPTION_CONTINUE_SEARCH;
-
-    LPTOP_LEVEL_EXCEPTION_FILTER f = g_chain[idx];
-
-    if (!f || f == lc_filter)
-        return EXCEPTION_CONTINUE_SEARCH;
-
-    return f(ep);
+    LPTOP_LEVEL_EXCEPTION_FILTER f = (LPTOP_LEVEL_EXCEPTION_FILTER)lc_chain_next(&g_chain, g_stubs, level);
+    return f ? f(ep) : EXCEPTION_CONTINUE_SEARCH;
 }
 
-static LONG WINAPI lc_filter(EXCEPTION_POINTERS* ep)
+/* Asks the helper for a report and waits for it, at most LC_HANDOFF_MS. Returns the report's
+ * sequence number, or 0 if none was written. */
+static LONG lc_handoff(EXCEPTION_POINTERS* ep, DWORD me)
 {
-    DWORD me = GetCurrentThreadId();
-    LC_THREAD* th = lc_thread_find(me);
+    const EXCEPTION_RECORD* e = ep ? ep->ExceptionRecord : NULL;
 
-    if (th)
-    {
-        /* Re-entry on this thread. A fault inside our own report: give up on it quietly. A filter
-         * we called chaining to its predecessor, which it believes is us: go one level down. */
-        if (th->reporting)
-            return EXCEPTION_CONTINUE_SEARCH;
+    /* No helper -- the process is exiting and ExitProcess has ended it -- no report. */
+    if (!e || g_detached || !g_helper || WaitForSingleObject(g_helper, 0) != WAIT_TIMEOUT)
+        return 0;
 
-        return lc_call_chain(ep, ++th->depth);
-    }
-
-    if (!g_installed)
-        return lc_call_chain(ep, 0);
-
-    th = lc_thread_claim(me);
-
-    if (!th)
-        return lc_call_chain(ep, 0);
-
-    /* One report at a time. Another thread's report in progress is waited for (up to 30 s), so a
-     * second crashing thread cannot end the process while the first is still writing. */
+    /* One report at a time; another thread's is waited for, so this one cannot end the process
+     * while the first is still being written. */
     BOOL mine = FALSE;
 
-    for (int i = 0; i < 300; i++)
+    for (int i = 0; i < 120; i++)
     {
         if (InterlockedCompareExchange(&g_report_lock, (LONG)me, 0) == 0)
         {
@@ -674,82 +722,138 @@ static LONG WINAPI lc_filter(EXCEPTION_POINTERS* ep)
         Sleep(100);
     }
 
-    /* One fault reaches the filter twice under Wine when winedbg attaches: it re-delivers the
-     * exception (same thread, same address; observed 2026-09-27 on Wine 10). One report each. */
-    const EXCEPTION_RECORD* e = ep ? ep->ExceptionRecord : NULL;
-    BOOL repeat = e && e->ExceptionCode == g_last_code && (DWORD)e->ExceptionAddress == g_last_address &&
-        me == g_last_thread;
+    if (!mine)
+        return 0;
 
-    if (mine)
+    LONG seq = 0;
+
+    if (!lc_same_fault(e->ExceptionCode, (DWORD)e->ExceptionAddress, me, g_last_code, g_last_address,
+        g_last_thread) && InterlockedIncrement(&g_reports) <= LC_MAX_REPORTS)
     {
-        if (!repeat && InterlockedIncrement(&g_reports) <= LC_MAX_REPORTS)
-        {
-            if (e)
-            {
-                g_last_code = e->ExceptionCode;
-                g_last_address = (DWORD)e->ExceptionAddress;
-                g_last_thread = me;
-            }
+        g_last_code = e->ExceptionCode;
+        g_last_address = (DWORD)e->ExceptionAddress;
+        g_last_thread = me;
+        g_req_ep = ep;
+        g_req_tid = me;
+        seq = InterlockedIncrement(&g_req_seq);
+        SetEvent(g_request);
 
-            th->reporting = TRUE;
-            lc_report_crash(ep);
-            th->reporting = FALSE;
-        }
+        DWORD start = GetTickCount();
 
-        InterlockedExchange(&g_report_lock, 0);
+        while (g_done_seq != seq && GetTickCount() - start < LC_HANDOFF_MS)
+            WaitForSingleObject(g_done, 100);
     }
 
-    LONG ret = lc_call_chain(ep, 0);
+    InterlockedExchange(&g_report_lock, 0);
+    return seq;
+}
 
-    th->active = FALSE;
+/* Every entry point lands here with its level. Kept small: it runs on the crashing thread, which
+ * after a stack overflow has little stack left. */
+static __attribute__((noinline)) LONG lc_enter(EXCEPTION_POINTERS* ep, int level)
+{
+    DWORD me = GetCurrentThreadId();
+
+    /* The helper faulting inside its own report: nothing to hand off to. */
+    if (me == g_helper_tid)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    LC_THREAD* th = lc_thread_find(me);
+
+    /* Re-entry on this thread: a filter we called chained into one of our levels. Continue below
+     * it, once per level. */
+    if (th)
+        return lc_chain_enter(&th->visited, level) ? lc_call(ep, level) : EXCEPTION_CONTINUE_SEARCH;
+
+    th = lc_thread_claim(me);
+
+    if (!th)
+        return lc_call(ep, level);
+
+    lc_chain_enter(&th->visited, level);
+    LONG seq = g_installed ? lc_handoff(ep, me) : 0;
+    LONG ret = lc_call(ep, level);
+
+    if (seq && ret == EXCEPTION_CONTINUE_EXECUTION)
+    {
+        InterlockedExchange(&g_resume_seq, seq);
+        SetEvent(g_request);
+    }
+
+    th->visited = 0;
     InterlockedExchange(&th->tid, 0);
     return ret;
 }
+
+#define LC_STUB(n) \
+    static LONG WINAPI lc_stub_##n(EXCEPTION_POINTERS* ep) { return lc_enter(ep, n); }
+LC_STUB(0)
+LC_STUB(1)
+LC_STUB(2)
+LC_STUB(3)
+LC_STUB(4)
+LC_STUB(5)
+LC_STUB(6)
+LC_STUB(7)
+
+static LPTOP_LEVEL_EXCEPTION_FILTER const g_stub_fn[LC_MAX_CHAIN] = {
+    lc_stub_0, lc_stub_1, lc_stub_2, lc_stub_3, lc_stub_4, lc_stub_5, lc_stub_6, lc_stub_7,
+};
+
+/* ------------------------------------------------------------------------------------------- */
+/* Keeping the chain                                                                           */
+/* ------------------------------------------------------------------------------------------- */
 
 LPTOP_LEVEL_EXCEPTION_FILTER lomhd_crash_set_filter(LPTOP_LEVEL_EXCEPTION_FILTER filter)
 {
     if (!g_installed)
         return real_SetUnhandledExceptionFilter(filter);
 
+    int install;
     lc_spin_lock(&g_chain_lock);
-    LONG top = g_chain_count - 1;
-    LPTOP_LEVEL_EXCEPTION_FILTER old = g_chain[top];
+    void* old = lc_chain_set(&g_chain, g_stubs, (void*)filter, &install);
 
-    /* A filter handing ours back (it got ours from a real call that bypassed the hook) means
-     * "remove me": the level below is the one to restore, which is what top-level NULL would miss. */
-    if (filter == lc_filter && top > 0)
-        g_chain_count--;
-    else if (filter != lc_filter)
-        g_chain[top] = filter;
+    if (install >= 0)
+        real_SetUnhandledExceptionFilter(g_stub_fn[install]);
 
     lc_spin_unlock(&g_chain_lock);
-    return old == lc_filter ? NULL : old;
+    return (LPTOP_LEVEL_EXCEPTION_FILTER)old;
 }
 
 static void lc_reassert(void)
 {
-    LPTOP_LEVEL_EXCEPTION_FILTER current = real_SetUnhandledExceptionFilter(lc_filter);
-
-    if (current == lc_filter)
-        return;
-
     lc_spin_lock(&g_chain_lock);
+    int before = g_chain.count;
+    LPTOP_LEVEL_EXCEPTION_FILTER ours = g_stub_fn[before - 1];
+    LPTOP_LEVEL_EXCEPTION_FILTER current = real_SetUnhandledExceptionFilter(ours);
+    int dropped;
+    int level = lc_chain_observe(&g_chain, g_stubs, (void*)current, &dropped);
 
-    if (g_chain_count < LC_MAX_CHAIN)
-        g_chain[g_chain_count++] = current;
-    else
-        g_chain[LC_MAX_CHAIN - 1] = current;
+    if (g_stub_fn[level] != ours)
+        real_SetUnhandledExceptionFilter(g_stub_fn[level]);
 
+    int after = g_chain.count;
     lc_spin_unlock(&g_chain_lock);
 
-    if (InterlockedIncrement(&g_replaced) <= 3)
-    {
-        char line[160];
+    if (after == before && !dropped)
+        return;
+
+    if (g_chain_logged++ >= LC_CHAIN_LOG_MAX)
+        return;
+
+    char line[200];
+
+    if (dropped)
+        _snprintf(line, sizeof(line), "crash reports: another filter (%08lx) replaced ours; the chain is full, "
+            "so ours is back on top without it", (unsigned long)(DWORD)current);
+    else if (after > before)
         _snprintf(line, sizeof(line), "crash reports: another filter (%08lx) replaced ours without the hook; "
             "ours runs first again, then that one", (unsigned long)(DWORD)current);
-        line[sizeof(line) - 1] = 0;
-        lomhd_log(line);
-    }
+    else
+        _snprintf(line, sizeof(line), "crash reports: a filter uninstalled itself; %d level(s) chained now", after);
+
+    line[sizeof(line) - 1] = 0;
+    lomhd_log(line);
 }
 
 /* ------------------------------------------------------------------------------------------- */
@@ -779,9 +883,6 @@ static LONG WINAPI lc_vectored(EXCEPTION_POINTERS* ep)
 /* In lomhd.log, the first few first-chance exceptions inside the game, Storm or this DLL: if the
  * game then closes or hangs without a crash report (something caught the exception and exited),
  * this is where it started. Capped, and never a report. */
-static LONG g_seen_logged_upto;            /* reporter thread, then DLL_PROCESS_DETACH */
-static int g_seen_logged;
-
 static void lc_log_seen(LONG* logged_upto, int* logged)
 {
     LONG next = g_seen_next;
@@ -792,23 +893,18 @@ static void lc_log_seen(LONG* logged_upto, int* logged)
     for (; *logged_upto < next; (*logged_upto)++)
     {
         LC_SEEN s = g_seen[(DWORD)*logged_upto % LC_MAX_SEEN];
-        LONG slot = g_snap_active;
-        const LC_MODULE* m = slot >= 0 ? lc_find_module(g_snap[slot], g_snap_count[slot], s.address) : NULL;
-        LC_MODULE found;
-
-        if (!m && lc_image_at(s.address, &found))
-            m = &found;
+        LC_MODULE m;
 
         /* The game's exe whatever it is called, Storm, or this DLL: not the system DLLs, whose
          * IsBadReadPtr and friends fault and recover as a matter of course. */
-        if (*logged >= LC_SEEN_LOG_MAX || !m ||
-            (m->base != g_exe_base && strcmp(lc_module_kind(m->name), "other") == 0))
+        if (*logged >= LC_SEEN_LOG_MAX || !lc_image_at(s.address, &m) ||
+            (m.base != g_exe_base && strcmp(lc_module_kind(m.name), "other") == 0))
             continue;
 
         char line[200];
         _snprintf(line, sizeof(line), "first-chance %08lx at %s+0x%08lx (target %08lx, thread %lu) -- "
             "may have been handled; if the game closes or hangs next, it started here",
-            (unsigned long)s.code, m->name, (unsigned long)(s.address - m->base), (unsigned long)s.target,
+            (unsigned long)s.code, m.name, (unsigned long)(s.address - m.base), (unsigned long)s.target,
             (unsigned long)s.thread);
         line[sizeof(line) - 1] = 0;
         lomhd_log(line);
@@ -819,7 +915,7 @@ static void lc_log_seen(LONG* logged_upto, int* logged)
 }
 
 /* ------------------------------------------------------------------------------------------- */
-/* Hang watchdog                                                                               */
+/* Hang watchdog (reporter thread)                                                             */
 /* ------------------------------------------------------------------------------------------- */
 
 void lomhd_crash_beat(void)
@@ -828,8 +924,12 @@ void lomhd_crash_beat(void)
         InterlockedIncrement(&g_beats);
 }
 
-static void lc_report_hang(HWND hwnd, DWORD tid, DWORD silent_ms)
+static BOOL lc_report_hang(DWORD tid, DWORD silent_ms)
 {
+    /* Never beside a crash report: they share the report lock (and the path scrambling). */
+    if (InterlockedCompareExchange(&g_report_lock, (LONG)GetCurrentThreadId(), 0) != 0)
+        return FALSE;
+
     LC_WORK* w = &g_hang_work;
     LC_REPORT* r = &w->r;
     memset(r, 0, sizeof(*r));
@@ -860,8 +960,7 @@ static void lc_report_hang(HWND hwnd, DWORD tid, DWORD silent_ms)
         CloseHandle(h);
     }
 
-    (void)hwnd;
-    lc_fill_modules(w);
+    lc_walk_modules(w);
 
     int attempt = 1;
     HANDLE f = lc_open(w, &attempt);
@@ -869,8 +968,9 @@ static void lc_report_hang(HWND hwnd, DWORD tid, DWORD silent_ms)
     if (f == INVALID_HANDLE_VALUE)
     {
         w->name[0] = 0;
+        InterlockedExchange(&g_report_lock, 0);
         lc_note("hang", w, FALSE);
-        return;
+        return TRUE;
     }
 
     LC_TEXT t;
@@ -882,7 +982,9 @@ static void lc_report_hang(HWND hwnd, DWORD tid, DWORD silent_ms)
 
     lc_write_all(f, w->text, t.len);
     CloseHandle(f);
+    InterlockedExchange(&g_report_lock, 0);
     lc_note("hang", w, TRUE);
+    return TRUE;
 }
 
 typedef struct
@@ -923,8 +1025,14 @@ static void lc_watch(LC_WATCH* s, DWORD now)
         return;
     }
 
-    /* Only time in front counts: a minimized or background game is allowed to sit still. */
-    if (GetForegroundWindow() != hwnd || IsIconic(hwnd))
+    /* Only time in front counts: a minimized or background game is allowed to sit still. Five
+     * seconds into a hang Windows replaces the window with a ghost, which then is the foreground
+     * window; HungWindowFromGhostWindow says whose ghost it is. (Wine does not ghost, and has no
+     * such function; there the window itself stays in front.) */
+    HWND fg = GetForegroundWindow();
+    HWND ghost_of = fg && fg != hwnd && g_ghost_owner ? g_ghost_owner(fg) : NULL;
+
+    if (!lc_in_front(hwnd, fg, ghost_of, IsIconic(hwnd)))
     {
         s->quiet_since = now;
         return;
@@ -952,10 +1060,17 @@ static void lc_watch(LC_WATCH* s, DWORD now)
         return;
     }
 
-    s->reported = TRUE;
+    if (g_hang_count >= LC_MAX_HANGS)
+    {
+        s->reported = TRUE;
+        return;
+    }
 
-    if (++g_hang_count <= LC_MAX_HANGS)
-        lc_report_hang(hwnd, tid, now - s->quiet_since);
+    if (lc_report_hang(tid, now - s->quiet_since))
+    {
+        s->reported = TRUE;
+        g_hang_count++;
+    }
 }
 
 /* ------------------------------------------------------------------------------------------- */
@@ -976,13 +1091,13 @@ static void lc_hash_exe(void)
     DWORD got = 0;
     BOOL ok = buf != NULL;
 
-    while (ok && !g_stop && (ok = ReadFile(f, buf, 1 << 16, &got, NULL)) && got)
+    while (ok && (ok = ReadFile(f, buf, 1 << 16, &got, NULL)) && got)
         lc_sha256_update(&sha, buf, got);
 
     free(buf);
     CloseHandle(f);
 
-    if (ok && !g_stop)
+    if (ok)
     {
         lc_sha256_hex(&sha, g_exe_sha);
         InterlockedExchange(&g_exe_sha_ready, 1);
@@ -1027,16 +1142,17 @@ static DWORD WINAPI lc_reporter(LPVOID unused)
 {
     (void)unused;
 
-    /* Everything the crash path calls, resolved here and not there: a crashing thread may hold
-     * the loader lock that LoadLibrary needs. */
+    /* Everything the helper calls, resolved here and not there: a crashing thread may hold the
+     * loader lock that LoadLibrary needs. */
     HMODULE dbghelp = real_LoadLibraryA("dbghelp.dll");
 
     if (dbghelp)
         g_minidump = (MINIDUMPWRITEDUMPPROC)real_GetProcAddress(dbghelp, "MiniDumpWriteDump");
 
-    g_is_hung = (ISHUNGAPPWINDOWPROC)real_GetProcAddress(GetModuleHandleA("user32.dll"), "IsHungAppWindow");
+    HMODULE user32 = GetModuleHandleA("user32.dll");
+    g_is_hung = (ISHUNGAPPWINDOWPROC)real_GetProcAddress(user32, "IsHungAppWindow");
+    g_ghost_owner = (HUNGWINDOWFROMGHOSTPROC)real_GetProcAddress(user32, "HungWindowFromGhostWindow");
     lc_describe_host();
-    lc_snapshot_modules();
 
     char line[200];
     _snprintf(line, sizeof(line), "crash reports: on (hang reports %s); %s", g_hang_reports ? "on" : "off",
@@ -1051,18 +1167,12 @@ static DWORD WINAPI lc_reporter(LPVOID unused)
     LC_WATCH watch;
     memset(&watch, 0, sizeof(watch));
     watch.quiet_since = GetTickCount();
-    DWORD last_snap = GetTickCount(), last_assert = 0;
+    DWORD last_assert = 0;
 
-    while (!g_stop)
+    for (;;)
     {
         Sleep(250);
         DWORD now = GetTickCount();
-
-        if (now - last_snap >= 2000)
-        {
-            lc_snapshot_modules();
-            last_snap = now;
-        }
 
         if (now - last_assert >= 1000)
         {
@@ -1101,12 +1211,22 @@ void lomhd_crash_install(void)
 
     lc_strcpy(g_dir, sizeof(g_dir), g_exe_path);
     g_dir[lc_basename(g_exe_path) - g_exe_path] = 0;
+    lc_strcpy(g_exe_name, sizeof(g_exe_name), lc_basename(g_exe_path));
 
     /* Lords of Magic only, like the rest of the fork, unless asked for (the test program is not
      * lomse.exe). And off entirely with lomhd_no_crash_reports beside the game. */
-    BOOL lom = strcmp(lc_module_kind(lc_basename(g_exe_path)), "lomse") == 0;
+    if ((strcmp(lc_module_kind(g_exe_name), "lomse") != 0 && !lc_flag("lomhd_crash_reports")) ||
+        lc_flag("lomhd_no_crash_reports"))
+        return;
 
-    if ((!lom && !lc_flag("lomhd_crash_reports")) || lc_flag("lomhd_no_crash_reports"))
+    /* Pinned: the process-wide filter points into this DLL, so it must never be unmapped, even by
+     * an exe that loads and frees ddraw.dll (lomse imports it statically; opted-in exes may not). */
+    BOOL(WINAPI * handle_ex)(DWORD, LPCSTR, HMODULE*) =
+        (void*)real_GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetModuleHandleExA");
+    HMODULE self;
+
+    if (!handle_ex || !handle_ex(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        (LPCSTR)(void*)lc_stub_0, &self))
         return;
 
     g_hang_reports = !lc_flag("lomhd_no_hang_reports");
@@ -1130,8 +1250,22 @@ void lomhd_crash_install(void)
         }
     }
 
-    g_chain[0] = real_SetUnhandledExceptionFilter(lc_filter);
-    g_chain_count = 1;
+    g_request = CreateEventA(NULL, FALSE, FALSE, NULL);
+    g_done = CreateEventA(NULL, FALSE, FALSE, NULL);
+
+    if (!g_request || !g_done)
+        return;
+
+    /* Both threads are created under the loader lock and start once DllMain returns. */
+    g_helper = CreateThread(NULL, 0, lc_helper, NULL, 0, &g_helper_tid);
+
+    if (!g_helper)
+        return;
+
+    for (int i = 0; i < LC_MAX_CHAIN; i++)
+        g_stubs[i] = (void*)g_stub_fn[i];
+
+    lc_chain_init(&g_chain, (void*)real_SetUnhandledExceptionFilter(g_stub_fn[0]));
     InterlockedExchange(&g_installed, 1);
 
     PVOID(WINAPI * add_handler)(ULONG, PVECTORED_EXCEPTION_HANDLER) =
@@ -1140,7 +1274,6 @@ void lomhd_crash_install(void)
     if (add_handler)
         add_handler(0, (PVECTORED_EXCEPTION_HANDLER)lc_vectored);
 
-    /* Created under the loader lock, runs once DllMain returns. */
     HANDLE t = CreateThread(NULL, 0, lc_reporter, NULL, 0, NULL);
 
     if (t)
@@ -1149,22 +1282,14 @@ void lomhd_crash_install(void)
 
 void lomhd_crash_exit(BOOL process_exit)
 {
-    if (!g_installed)
+    /* Installed means pinned, so the only detach we see is the process ending. */
+    if (!g_installed || !process_exit)
         return;
 
     InterlockedExchange(&g_detached, 1);
 
-    if (process_exit)
-    {
-        /* ExitProcess has already ended the reporter thread, so breadcrumbs from its last quarter
-         * second may be unlogged -- and a game that caught an access violation and chose to exit
-         * lands exactly here. Logged now, before any DLL detached after us (Storm, say) can hang. */
-        lc_log_seen(&g_seen_logged_upto, &g_seen_logged);
-        return;             /* the code stays mapped: a crash during shutdown is still reported */
-    }
-
-    /* FreeLibrary: this code is about to go. Hand the process its filter back and stop. */
-    InterlockedExchange(&g_stop, 1);
-    InterlockedExchange(&g_installed, 0);
-    real_SetUnhandledExceptionFilter(g_chain[g_chain_count - 1] == lc_filter ? NULL : g_chain[g_chain_count - 1]);
+    /* ExitProcess has already ended the reporter thread, so breadcrumbs from its last quarter
+     * second may be unlogged -- and a game that caught an access violation and chose to exit lands
+     * exactly here. Logged now, before any DLL detached after us (Storm, say) can hang. */
+    lc_log_seen(&g_seen_logged_upto, &g_seen_logged);
 }

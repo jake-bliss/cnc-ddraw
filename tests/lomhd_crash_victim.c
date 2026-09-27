@@ -1,47 +1,95 @@
 /* A program that loads the built ddraw.dll and misbehaves on purpose, to exercise the crash and hang
- * reporter (src/lomhd_crash.c) under Wine or Windows. A test tool only: never shipped.
+ * reporter (src/lomhd_crash.c) under Wine or Windows. A test tool only: never shipped. Run it through
+ * tests/lomhd_crash_victim.sh, which asserts each mode's exit code and report files.
  *
- *     i686-w64-mingw32-gcc -O1 -o lomhd_crash_victim.exe tests/lomhd_crash_victim.c
- *     (copy it and ddraw.dll into an empty folder, create a file named lomhd_crash_reports there
- *     -- the reporter is otherwise on only for lomse.exe -- and run it with one mode)
- *
- * Modes:
- *   av        installs its own filter through its import table (the path cnc-ddraw patches), then
- *             writes through a near-NULL pointer. Expect a report, then "victim filter called".
- *   bypass    installs its filter through GetProcAddress, around the patched import, waits for the
- *             reporter to re-assert, then crashes. Expect a report, then "victim filter called".
- *   none      no filter of its own; crashes. Expect a report, then Wine's/Windows' usual crash.
- *   caught    faults inside the victim, catches it in its own vectored handler and calls
- *             ExitProcess -- a game that handles its own crash. Expect NO report, but a
- *             "first-chance" line in lomhd.log, written as the DLL detaches.
- *   handled   raises access violations that are caught (IsBadReadPtr/IsBadWritePtr), then exits
- *             0. Expect NO report: a first-chance exception must never produce one.
- *   hang      makes a window, hands it to DirectDraw, pumps for two seconds, then stops pumping
- *             for 40. Expect one lomhd_hang_*.txt after about 20 s while the window is in front.
- *   idle      the same window, pumping messages but making no DirectDraw calls for 40 s, as a menu
- *             waiting for input does. Expect NO hang report: silent is not hung.
- *   minimized the hang, but with the window minimized first (through the real ShowWindow: cnc-ddraw
- *             patches the victim's import). Expect NO hang report.
- *   background the hang, but with another window in front. Expect NO hang report.
- * The victim's filter returns EXCEPTION_EXECUTE_HANDLER, so those runs end without a debugger. */
+ * Its filters stand in for a game's: game_filter is installed through the victim's import table
+ * (the path cnc-ddraw patches), the "bypass" ones through GetProcAddress, around the patch. Each
+ * filter that ends the process does so with its own exit code, so the exit code says which ran:
+ *   3  a vectored handler caught the fault and exited (mode caught)
+ *   43 game_filter called its predecessor, which returned (mode chain)
+ *   44 game_filter ran
+ *   45 bypass_filter ran
+ *   46 bypass_filter called its predecessor, which returned without ending the process
+ *   47 execution resumed after the fault (mode continue)
+ *   0  no fault, or the hang modes ran to the end */
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
 
 typedef HRESULT(WINAPI* DIRECTDRAWCREATE)(GUID*, void**, IUnknown*);
+typedef LPTOP_LEVEL_EXCEPTION_FILTER(WINAPI* SETFILTER)(LPTOP_LEVEL_EXCEPTION_FILTER);
 
-static LONG WINAPI victim_filter(EXCEPTION_POINTERS* ep)
+static LPTOP_LEVEL_EXCEPTION_FILTER g_game_prev, g_bypass_prev;
+static BOOL g_bypass_chains;
+
+static LONG WINAPI game_filter(EXCEPTION_POINTERS* ep)
 {
-    printf("victim filter called: %08lx at %p\n", ep->ExceptionRecord->ExceptionCode,
-        ep->ExceptionRecord->ExceptionAddress);
-    fflush(stdout);
+    printf("game filter: %08lx\n", ep->ExceptionRecord->ExceptionCode);
+    ExitProcess(44);
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
-/* A few frames of the victim's own on the stack, so the report has return addresses to annotate. */
+/* For the stack overflow: no printf on a thread whose stack is spent. */
+static LONG WINAPI game_filter_quiet(EXCEPTION_POINTERS* ep)
+{
+    (void)ep;
+    ExitProcess(44);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static LONG WINAPI game_filter_chaining(EXCEPTION_POINTERS* ep)
+{
+    printf("game filter: calling its predecessor %p\n", (void*)g_game_prev);
+
+    if (g_game_prev)
+        g_game_prev(ep);
+
+    ExitProcess(43);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static LONG WINAPI bypass_filter(EXCEPTION_POINTERS* ep)
+{
+    printf("bypass filter: %08lx\n", ep->ExceptionRecord->ExceptionCode);
+
+    if (g_bypass_chains)
+    {
+        printf("bypass filter: calling its predecessor %p\n", (void*)g_bypass_prev);
+
+        if (g_bypass_prev)
+            g_bypass_prev(ep);
+
+        ExitProcess(46);
+    }
+
+    ExitProcess(45);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+/* Skips the faulting store (always the two-byte `mov %edx,(%eax)` below) and carries on. */
+static LONG WINAPI resuming_filter(EXCEPTION_POINTERS* ep)
+{
+    printf("resuming filter: skipping the faulting store\n");
+    ep->ContextRecord->Eip += 2;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static LONG WINAPI catch_and_exit(EXCEPTION_POINTERS* ep)
+{
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
+    {
+        printf("caught: %08lx, calling ExitProcess\n", ep->ExceptionRecord->ExceptionCode);
+        ExitProcess(3);
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* A few frames of the victim's own on the stack, so the report has return addresses to annotate.
+ * The store is written out so its length is known: 89 10, mov %edx,(%eax). */
 static __attribute__((noinline)) int deepest(volatile int* p, int v)
 {
-    *p = v;
+    __asm__ volatile("movl %%edx, (%%eax)" : : "a"(p), "d"(v) : "memory");
     return v + 1;
 }
 
@@ -55,16 +103,16 @@ static __attribute__((noinline)) int outer(int v)
     return middle(v + 1) + 7;
 }
 
-/* Stands in for a game's own handler that catches a fault and exits: no unhandled filter runs. */
-static LONG WINAPI catch_and_exit(EXCEPTION_POINTERS* ep)
+static __attribute__((noinline)) int recurse(volatile int depth)
 {
-    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
-    {
-        printf("caught: %08lx, calling ExitProcess\n", ep->ExceptionRecord->ExceptionCode);
-        ExitProcess(3);
-    }
+    volatile char pad[256];
+    pad[0] = (char)depth;
+    return recurse(depth + 1) + pad[0];
+}
 
-    return EXCEPTION_CONTINUE_SEARCH;
+static SETFILTER real_set_filter(void)
+{
+    return (SETFILTER)GetProcAddress(GetModuleHandleA("kernel32.dll"), "SetUnhandledExceptionFilter");
 }
 
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
@@ -107,20 +155,21 @@ static int hang(HMODULE ddraw, const char* mode)
 
     if (!hwnd || !create || create(NULL, (void**)&dd, NULL) != 0 || !dd)
     {
-        printf("hang: setup failed\n");
+        printf("%s: setup failed\n", mode);
         return 2;
     }
 
     /* IDirectDraw::SetCooperativeLevel is slot 20 of the vtable. */
     typedef HRESULT(WINAPI* SETCOOP)(void*, HWND, DWORD);
     SETCOOP set_coop = (SETCOOP)((void**)*dd)[20];
-    HRESULT hr = set_coop(dd, hwnd, 8 /* DDSCL_NORMAL */);
+    set_coop(dd, hwnd, 8 /* DDSCL_NORMAL */);
 
     SetForegroundWindow(hwnd);
     pump(2000);
 
     if (strcmp(mode, "minimized") == 0)
     {
+        /* The real ShowWindow: cnc-ddraw patches the victim's import. */
         BOOL(WINAPI * show)(HWND, int) = (void*)GetProcAddress(GetModuleHandleA("user32.dll"), "ShowWindow");
         show(hwnd, SW_MINIMIZE);
         pump(1000);
@@ -135,10 +184,7 @@ static int hang(HMODULE ddraw, const char* mode)
     }
 
     BOOL idle = strcmp(mode, "idle") == 0;
-    printf("%s: SetCooperativeLevel %08lx, foreground %s, minimized %s; %s for 40 s\n", mode,
-        (unsigned long)hr, GetForegroundWindow() == hwnd ? "yes" : "no", IsIconic(hwnd) ? "yes" : "no",
-        idle ? "pumping, no DirectDraw calls" : "not pumping");
-    fflush(stdout);
+    printf("%s: %s for 40 s\n", mode, idle ? "pumping, no DirectDraw calls" : "not pumping");
 
     if (idle)
         pump(40000);
@@ -146,13 +192,11 @@ static int hang(HMODULE ddraw, const char* mode)
         Sleep(40000);
 
     /* The real GetForegroundWindow: cnc-ddraw patches the victim's import to answer with the game
-     * window, which is what the first line above printed (found 2026-09-27; the watchdog in
-     * ddraw.dll calls the real one and saw the other window in front). */
+     * window (found 2026-09-27; the watchdog in ddraw.dll calls the real one). */
     HWND(WINAPI * foreground)(void) = (void*)GetProcAddress(GetModuleHandleA("user32.dll"), "GetForegroundWindow");
-    printf("%s: after 40 s, game window really in front %s, minimized %s\n", mode,
-        foreground() == hwnd ? "yes" : "no", IsIconic(hwnd) ? "yes" : "no");
+    printf("%s: after 40 s, in front %s, minimized %s\n", mode, foreground() == hwnd ? "yes" : "no",
+        IsIconic(hwnd) ? "yes" : "no");
     pump(500);
-    printf("hang: done\n");
     return 0;
 }
 
@@ -169,9 +213,7 @@ int main(int argc, char** argv)
         return 2;
     }
 
-    char path[MAX_PATH];
-    GetModuleFileNameA(ddraw, path, sizeof(path));
-    printf("loaded %s, mode %s\n", path, mode);
+    printf("mode %s\n", mode);
 
     if (strcmp(mode, "hang") == 0 || strcmp(mode, "idle") == 0 || strcmp(mode, "minimized") == 0 ||
         strcmp(mode, "background") == 0)
@@ -188,29 +230,67 @@ int main(int argc, char** argv)
 
     if (strcmp(mode, "caught") == 0)
     {
-        /* Last in line, as a game's own SEH __except is (vectored handlers all run before any
-         * frame handler). Crash at once: the reporter thread has had no chance to log the
-         * breadcrumb itself, so what reaches lomhd.log came from DLL_PROCESS_DETACH. */
+        /* Last in line, as a game's own SEH __except is (vectored handlers all run before any frame
+         * handler). Crash at once: the reporter thread has had no chance to log the breadcrumb, so
+         * what reaches lomhd.log came from DLL_PROCESS_DETACH. */
         AddVectoredExceptionHandler(0, catch_and_exit);
-        printf("crashing now\n");
         return outer(argc);
     }
 
-    if (strcmp(mode, "av") == 0)
+    if (strcmp(mode, "freelib") == 0)
     {
-        LPTOP_LEVEL_EXCEPTION_FILTER prev = SetUnhandledExceptionFilter(victim_filter);
-        printf("av: filter set through the import table, previous %p\n", prev);
+        /* The reporter pins ddraw.dll: after this FreeLibrary its filter must still be mapped. */
+        FreeLibrary(ddraw);
+        printf("freelib: ddraw.dll still loaded after FreeLibrary: %s\n", GetModuleHandleA("ddraw.dll") ? "yes" : "no");
+        SetUnhandledExceptionFilter(game_filter);
     }
+    else if (strcmp(mode, "av") == 0 || strcmp(mode, "noflag") == 0)
+        SetUnhandledExceptionFilter(game_filter);
+    else if (strcmp(mode, "overflow") == 0 || strcmp(mode, "overflow-noflag") == 0)
+        SetUnhandledExceptionFilter(game_filter_quiet);
+    else if (strcmp(mode, "chain") == 0)
+        g_game_prev = SetUnhandledExceptionFilter(game_filter_chaining);
+    else if (strcmp(mode, "continue") == 0)
+        SetUnhandledExceptionFilter(resuming_filter);
     else if (strcmp(mode, "bypass") == 0)
+        g_bypass_prev = real_set_filter()(bypass_filter);
+    else if (strcmp(mode, "bypass-chain") == 0)
     {
-        LPTOP_LEVEL_EXCEPTION_FILTER(WINAPI * set)(LPTOP_LEVEL_EXCEPTION_FILTER) =
-            (void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "SetUnhandledExceptionFilter");
-        LPTOP_LEVEL_EXCEPTION_FILTER prev = set(victim_filter);
-        printf("bypass: filter set around the import table, previous %p\n", prev);
+        SetUnhandledExceptionFilter(game_filter);
+        g_bypass_chains = TRUE;
+        g_bypass_prev = real_set_filter()(bypass_filter);
+    }
+    else if (strcmp(mode, "bypass-restore") == 0)
+    {
+        /* Installed around the patch, re-asserted over, then uninstalled by restoring what it
+         * saved: it must not run at the crash. */
+        SetUnhandledExceptionFilter(game_filter);
+        g_bypass_prev = real_set_filter()(bypass_filter);
+        Sleep(2500);
+        real_set_filter()(g_bypass_prev);
+        printf("bypass-restore: restored %p\n", (void*)g_bypass_prev);
+    }
+    else if (strcmp(mode, "none") != 0)
+    {
+        printf("unknown mode\n");
+        return 2;
     }
 
-    /* Long enough for the reporter thread to hash the exe, snapshot modules and re-assert. */
+    /* Long enough for the reporter thread to hash the exe and re-assert. */
     Sleep(2500);
     printf("crashing now\n");
-    return outer(argc);
+
+    if (strncmp(mode, "overflow", 8) == 0)
+        return recurse(0);
+
+    int r = outer(argc);
+
+    if (strcmp(mode, "continue") == 0)
+    {
+        printf("continue: resumed after the fault (%d)\n", r);
+        Sleep(1500);            /* the helper appends the outcome and logs it */
+        return 47;
+    }
+
+    return r;
 }

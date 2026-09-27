@@ -4,9 +4,10 @@
 #include <windows.h>
 
 /* The pure half of the crash and hang reporter (src/lomhd_crash_core.c): report text, module+offset
- * annotation, the lomhd.log ring buffer, report file names and SHA-256. No Windows calls, so it
- * builds natively for tests (tests/lomhd_crash_test.c) and runs on a crashing thread: no heap, no
- * locks, no C runtime formatting -- everything writes into caller-owned fixed buffers. */
+ * annotation, the lomhd.log ring buffer, report file names, SHA-256, and the bookkeeping for the
+ * chain of top-level exception filters. No Windows calls, no heap, no C runtime: it builds natively
+ * for tests (tests/lomhd_crash_test.c), and the report helper thread can run it while another
+ * thread holds the heap lock -- everything writes into caller-owned fixed buffers. */
 
 /* Text into a fixed buffer. Always NUL-terminated; what does not fit is dropped and counted. */
 typedef struct
@@ -101,7 +102,6 @@ typedef struct
 
     const LC_MODULE* mods;
     int mod_count;
-    DWORD mods_age_ms;                  /* how old the module snapshot is */
 
     const char* exe_path;
     DWORD exe_size, exe_timestamp, exe_checksum;
@@ -136,5 +136,61 @@ typedef struct
 void lc_sha256_init(LC_SHA256* s);
 void lc_sha256_update(LC_SHA256* s, const BYTE* data, unsigned len);
 void lc_sha256_hex(LC_SHA256* s, char out[65]);     /* finishes the hash */
+
+/* The chain of top-level exception filters (see src/lomhd_crash.c for why).
+ *
+ * f[0..count-1] are the other filters, oldest first; f[0] is whatever was installed before ours
+ * (possibly NULL). Ours is installed as one of LC_MAX_CHAIN distinct entry points, one per level:
+ * with `count` entries the process-wide filter is ours at level count-1. Each level has a
+ * meaning -- "the chain as it was when f[level] was the newest" -- so:
+ *   - a filter installed around the patched import saves "ours at level j" as its predecessor;
+ *     when it chains back into that, we continue with f[j], one below it;
+ *   - when something restores "ours at level j" (the filter above it uninstalling), every entry
+ *     above j is gone, exactly as it would be natively.
+ * `stubs` is the table of our entry points, as opaque pointers. None of these functions lock:
+ * the caller serializes changes, and the crash path only reads. */
+#define LC_MAX_CHAIN 8
+
+typedef struct
+{
+    void* f[LC_MAX_CHAIN];
+    int count;
+} LC_CHAIN;
+
+void lc_chain_init(LC_CHAIN* c, void* previous);
+
+/* Which of our entry points `p` is, or -1. */
+int lc_chain_level(void* const stubs[LC_MAX_CHAIN], const void* p);
+
+/* SetUnhandledExceptionFilter through a patched import: `filter` becomes the newest entry and the
+ * call returns what the real one would have (the entry it displaced). Handing back one of ours
+ * (a module that got it from an unpatched call) is a restore. Returns the displaced filter;
+ * *install is the level whose entry point must now be the process-wide filter, or -1 for "no
+ * change". */
+void* lc_chain_set(LC_CHAIN* c, void* const stubs[LC_MAX_CHAIN], void* filter, int* install);
+
+/* The reporter found `current` installed process-wide. Returns the level whose entry point must
+ * be installed now. Ours at the top level: nothing changed. Ours at a lower level: a restore, the
+ * entries above it are dropped. A filter already in the chain at i: restored natively, entries
+ * above i dropped -- never pushed twice. Anything else: a newcomer, pushed (ignored if the chain
+ * is full; then *dropped is set). */
+int lc_chain_observe(LC_CHAIN* c, void* const stubs[LC_MAX_CHAIN], void* current, int* dropped);
+
+/* The filter ours at `level` hands on to: f[level], or the newest entry for a level the chain no
+ * longer has. NULL for none (or one of ours, which must never be called back). */
+void* lc_chain_next(const LC_CHAIN* c, void* const stubs[LC_MAX_CHAIN], int level);
+
+/* Per crashing thread, the levels already entered: a filter chaining into a level it already
+ * passed would loop. Returns FALSE (do not enter) the second time. */
+BOOL lc_chain_enter(DWORD* visited, int level);
+
+/* The same fault delivered again (Wine re-delivers one when winedbg attaches). */
+BOOL lc_same_fault(DWORD code, DWORD address, DWORD thread,
+    DWORD last_code, DWORD last_address, DWORD last_thread);
+
+/* The game window counts as in front when it is the foreground window, or when the foreground
+ * window is the ghost Windows puts up for it once it stops responding (ghost_of_foreground is what
+ * HungWindowFromGhostWindow says the foreground window stands for; NULL if it is no ghost). */
+BOOL lc_in_front(const void* window, const void* foreground, const void* ghost_of_foreground, BOOL iconic);
 
 #endif

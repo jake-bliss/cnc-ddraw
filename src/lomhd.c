@@ -49,7 +49,7 @@ static LOMHD_PACK g_pack;
 
 /* For crash reports: written once by the worker, read by anyone. The pointer is published after
  * the text is complete. */
-static char g_pack_state_text[MAX_PATH + 96];
+static char g_pack_state_text[160];
 static const char* volatile g_pack_state = "lomhd_portraits.pack: not opened yet";
 
 /* Per picture, what has been loaded. The state is the handover between the two threads:
@@ -221,9 +221,11 @@ const char* lomhd_pack_state(void)
     return g_pack_state;
 }
 
+/* The pack's name, not its path: the crash report shows the folder once, in its Exe line. */
 static void pack_state(const char* path, const char* what, long a, long b)
 {
-    _snprintf(g_pack_state_text, sizeof(g_pack_state_text), "%s: ", path);
+    (void)path;
+    _snprintf(g_pack_state_text, sizeof(g_pack_state_text), "lomhd_portraits.pack: ");
     g_pack_state_text[sizeof(g_pack_state_text) - 1] = 0;
     size_t used = strlen(g_pack_state_text);
     _snprintf(g_pack_state_text + used, sizeof(g_pack_state_text) - used, what, a, b);

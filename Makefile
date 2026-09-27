@@ -6,19 +6,21 @@ LDFLAGS  ?= -Wl,--enable-stdcall-fixup -s -static -shared
 CFLAGS   ?= -Iinc -O2 -Wall -std=c99
 LIBS      = -lgdi32 -lwinmm -lole32 -lmsimg32 -lavifil32 -luuid
 
+# The commit is the only git-derived value baked in: the branch name used to be too, so one commit
+# built on two branches gave two DLLs. The release script sets LOMHD_VERSION.
 COMMIT   := $(shell git describe --match=NeVeRmAtCh --always --dirty || echo UNKNOWN)
-BRANCH   := $(shell git rev-parse --abbrev-ref HEAD || echo UNKNOWN)
+LOMHD_VERSION ?= dev
 
 HASH     := \#
 ECHOTEST := $(shell echo \"\")
 ifeq ($(ECHOTEST),\"\")
 	# Windows
 	ECOMMIT  := $(shell echo $(HASH)define GIT_COMMIT "$(COMMIT)" > inc/git.h)
-	EBRANCH  := $(shell echo $(HASH)define GIT_BRANCH "$(BRANCH)" >> inc/git.h)
+	EVERSION := $(shell echo $(HASH)define LOMHD_VERSION "$(LOMHD_VERSION)" >> inc/git.h)
 else
 	# Either *nix or Windows with BusyBox (e.g. w64devkit)
 	ECOMMIT  := $(shell echo "$(HASH)define GIT_COMMIT" \"$(COMMIT)\" > inc/git.h)
-	EBRANCH  := $(shell echo "$(HASH)define GIT_BRANCH" \"$(BRANCH)\" >> inc/git.h)
+	EVERSION := $(shell echo "$(HASH)define LOMHD_VERSION" \"$(LOMHD_VERSION)\" >> inc/git.h)
 endif
 
 ifdef DEBUG

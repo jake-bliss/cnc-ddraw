@@ -1,5 +1,5 @@
 /* The pure half of the crash reporter (src/lomhd_crash_core.c): text, module+offset annotation, the
- * log ring, report names, the report layout and SHA-256.
+ * log ring, report names, the report layout, SHA-256, and the filter-chain bookkeeping.
  *
  *     cc -Itests/native -Iinc -std=c99 -Wall -o /tmp/lc tests/lomhd_crash_test.c \
  *         src/lomhd_crash_core.c && /tmp/lc
@@ -221,6 +221,7 @@ static void test_report(void)
     CHECK(has(buf, "sha256 not computed yet"), "missing hash says so");
     CHECK(has(buf, "Time:       2026-09-27 14:30:05"), "time");
     CHECK(has(buf, "00400000-005FFFFF  lomse.exe"), "module list with ranges");
+    CHECK(has(buf, "Modules (read from memory at report time)"), "module list heading");
     CHECK(has(buf, "C0000005 ACCESS_VIOLATION at Storm.dll+0x00000010 reading 00000000, thread 7, 100 ms"),
         "first-chance breadcrumb");
     CHECK(has(buf, "  12:00:01 pack: 120 images loaded"), "log tail");
@@ -272,6 +273,101 @@ static void test_sha256(void)
     CHECK(strcmp(hex, "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0") == 0, "million a: %s", hex);
 }
 
+/* Stand-ins: our eight entry points, and other filters, as distinct addresses. */
+static char stub_mem[LC_MAX_CHAIN], other_mem[8];
+static void* stubs[LC_MAX_CHAIN];
+#define S(i) ((void*)&stub_mem[i])
+#define F(i) ((void*)&other_mem[i])
+
+static void test_chain(void)
+{
+    for (int i = 0; i < LC_MAX_CHAIN; i++)
+        stubs[i] = S(i);
+
+    LC_CHAIN c;
+    int install, dropped;
+
+    /* Installed over the CRT's filter F0: ours at level 0 hands on to F0. */
+    lc_chain_init(&c, F(0));
+    CHECK(c.count == 1 && lc_chain_next(&c, stubs, 0) == F(0), "init");
+    CHECK(lc_chain_level(stubs, S(3)) == 3 && lc_chain_level(stubs, F(0)) == -1 &&
+        lc_chain_level(stubs, NULL) == -1, "level lookup");
+
+    /* The game sets F1 through the patched import: it gets F0 back, as natively, and ours stays. */
+    void* old = lc_chain_set(&c, stubs, F(1), &install);
+    CHECK(old == F(0) && install == -1 && c.count == 1 && c.f[0] == F(1), "patched set replaces the newest");
+
+    /* Something bypasses the patch with F2 (its predecessor: ours at level 0). Observed: pushed,
+     * and ours goes back on top at level 1, which hands on to F2. */
+    CHECK(lc_chain_observe(&c, stubs, F(2), &dropped) == 1 && c.count == 2 && !dropped, "newcomer pushed");
+    CHECK(lc_chain_next(&c, stubs, 1) == F(2), "top level hands on to the newcomer");
+    /* F2 chains to its predecessor, ours at level 0: that continues with F1, not F2 again. */
+    CHECK(lc_chain_next(&c, stubs, 0) == F(1), "level 0 hands on to the game's filter");
+
+    /* Nothing changed since: ours at the top level is what the reporter finds. */
+    CHECK(lc_chain_observe(&c, stubs, S(1), &dropped) == 1 && c.count == 2, "unchanged");
+
+    /* F2 uninstalls: it restores what it saved, ours at level 0. F2 must leave the chain. */
+    CHECK(lc_chain_observe(&c, stubs, S(0), &dropped) == 0 && c.count == 1, "restore to our lower level drops F2");
+    CHECK(lc_chain_next(&c, stubs, 0) == F(1), "and the game's filter is next again");
+
+    /* Bypass again with F2, then someone restores F1 itself (already in the chain): no duplicate,
+     * everything above F1 is gone. */
+    lc_chain_observe(&c, stubs, F(2), &dropped);
+    CHECK(lc_chain_observe(&c, stubs, F(1), &dropped) == 0 && c.count == 1 && c.f[0] == F(1),
+        "a filter already in the chain is never pushed twice");
+
+    /* With two levels, a patched call replaces the newest entry (natively, it goes on top of it and
+     * chains to it itself), not the oldest. */
+    lc_chain_observe(&c, stubs, F(2), &dropped);
+    old = lc_chain_set(&c, stubs, F(3), &install);
+    CHECK(old == F(2) && c.count == 2 && c.f[1] == F(3) && c.f[0] == F(1), "patched set with two levels");
+    lc_chain_observe(&c, stubs, S(0), &dropped);
+
+    /* A patched call handing back ours at level 0 while the chain has two levels: a restore. */
+    lc_chain_observe(&c, stubs, F(2), &dropped);
+    old = lc_chain_set(&c, stubs, S(0), &install);
+    CHECK(old == F(2) && install == 0 && c.count == 1, "patched hand-back of ours restores that level");
+
+    /* NULL installed around the patch: natively "no filter", so nothing below it runs. */
+    lc_chain_init(&c, F(0));
+    CHECK(lc_chain_observe(&c, stubs, NULL, &dropped) == 1 && c.count == 2 && lc_chain_next(&c, stubs, 1) == NULL,
+        "NULL on top means nothing to hand on to");
+
+    /* Full: a ninth is ignored rather than overwriting (which would loop through our levels). */
+    lc_chain_init(&c, F(0));
+    for (int i = 1; i < LC_MAX_CHAIN; i++)
+        lc_chain_observe(&c, stubs, (void*)&other_mem[i], &dropped);
+    int top = lc_chain_observe(&c, stubs, (void*)((char*)F(7) + 1), &dropped);
+    CHECK(c.count == LC_MAX_CHAIN && top == LC_MAX_CHAIN - 1 && dropped && c.f[LC_MAX_CHAIN - 1] == F(7),
+        "full chain ignores a newcomer, keeping its newest entry");
+
+    /* A level the chain no longer has (a stale entry point) hands on to the newest entry. */
+    lc_chain_init(&c, F(0));
+    CHECK(lc_chain_next(&c, stubs, 5) == F(0) && lc_chain_next(&c, stubs, -1) == NULL, "stale level");
+
+    /* One of ours never ends up called back as a foreign filter. */
+    c.f[0] = S(2);
+    CHECK(lc_chain_next(&c, stubs, 0) == NULL, "ours is never next");
+
+    DWORD visited = 0;
+    CHECK(lc_chain_enter(&visited, 1) && lc_chain_enter(&visited, 0) && !lc_chain_enter(&visited, 1),
+        "a level entered twice on one thread is refused");
+
+    CHECK(lc_same_fault(0xC0000005, 0x401000, 7, 0xC0000005, 0x401000, 7), "same fault");
+    CHECK(!lc_same_fault(0xC0000005, 0x401000, 8, 0xC0000005, 0x401000, 7), "other thread is new");
+    CHECK(!lc_same_fault(0xC0000005, 0x401004, 7, 0xC0000005, 0x401000, 7), "other address is new");
+    CHECK(!lc_same_fault(0, 0, 0, 0, 0, 0), "nothing reported yet");
+
+    int w = 0, fg = 0, ghost = 0;
+    CHECK(lc_in_front(&w, &w, NULL, FALSE), "foreground");
+    CHECK(lc_in_front(&w, &ghost, &w, FALSE), "our ghost is in front: still in front");
+    CHECK(!lc_in_front(&w, &fg, NULL, FALSE), "another window");
+    CHECK(!lc_in_front(&w, &ghost, &fg, FALSE), "another window's ghost");
+    CHECK(!lc_in_front(&w, &w, NULL, TRUE), "minimized");
+    CHECK(!lc_in_front(NULL, NULL, NULL, FALSE), "no window");
+}
+
 int main(void)
 {
     test_text();
@@ -280,6 +376,7 @@ int main(void)
     test_names();
     test_report();
     test_sha256();
+    test_chain();
 
     printf(g_fail ? "%d FAILED\n" : "all passed\n", g_fail);
     return g_fail != 0;

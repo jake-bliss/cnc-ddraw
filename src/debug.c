@@ -12,6 +12,9 @@
 #include "hook.h"
 #include "version.h"
 #include "git.h"
+#ifndef LOMHD_VERSION /* git.h from the Makefile has it; the MSVC project's does not */
+#define LOMHD_VERSION "dev"
+#endif
 #include "versionhelpers.h"
 #include "utils.h"
 #include "crc32.h"
@@ -215,13 +218,13 @@ void dbg_init()
         }
 
         TRACE(
-            "cnc-ddraw version = %d.%d.%d.%d (git~%s, %s)\n",
+            "cnc-ddraw version = %d.%d.%d.%d (git~%s, lomhd %s)\n",
             VERSION_MAJOR,
             VERSION_MINOR,
             VERSION_BUILD,
             VERSION_REVISION,
             GIT_COMMIT,
-            GIT_BRANCH);
+            LOMHD_VERSION);
 
         TRACE("cnc-ddraw = %p\n", g_ddraw_module);
 

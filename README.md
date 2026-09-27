@@ -30,16 +30,22 @@ usual crash dialog (Windows Error Reporting, or Wine's) appears:
   registers and the code bytes at EIP, 64 stack dwords with every value that points into a module
   annotated, the last few first-chance exceptions (marked as possibly handled), the module list,
   the exe's size, PE timestamp and SHA-256 (hashed once at startup), this DLL's version and commit,
-  the pack and terrain state, and the last 30 lines of `lomhd.log`.
+  the pack and terrain state, and the last 30 lines of `lomhd.log`. It shows the exe's full path,
+  so it names the install folder (and on Windows usually the user name).
 - `lomhd_crash_YYYYMMDD_HHMMSS.dmp`, a minidump (threads, stacks, modules, and the data segments of
-  the game, Storm and this DLL). About 12 KB under Wine 10, whose dbghelp writes the stacks but
-  not the data segments; not yet measured on Windows, where the data segments are included.
+  the game, Storm and this DLL). About 12 KB under Wine 10 for an ordinary crash, whose dbghelp
+  writes the stacks but not the data segments; about 2 MB after a stack overflow (the whole spent
+  stack). Not yet measured on Windows, where the data segments are included. This DLL's own copies
+  of the install path (and cnc-ddraw's path settings) are scrambled for the length of the dump,
+  but a minidump still names the folder: its module list holds full paths, and the game's and
+  Storm's memory and the thread stacks may too. Treat a `.dmp` as private.
 
 A **hang** writes `lomhd_hang_YYYYMMDD_HHMMSS.txt` with the window thread's registers and stack. It
 counts as a hang only when all of these hold: the game window's thread has made no DirectDraw call
 (Blt, BltFast, Flip, Lock, Unlock) for 20 seconds, the window was in front and not minimized for
 all of that time, and Windows or Wine itself calls the window hung (it is not pumping messages) --
-so a menu idling in `GetMessage` is not a hang. The thread is suspended only for as long as it
+so a menu idling in `GetMessage` is not a hang. "In front" includes the ghost window Windows puts
+in place of a window that has stopped responding (`HungWindowFromGhostWindow`); Wine does not ghost. The thread is suspended only for as long as it
 takes to read its registers and copy its stack; nothing else about the game is touched. One report
 per hang, at most three per session.
 
@@ -51,7 +57,9 @@ watchdog only, `lomhd_no_crash_reports` stops both. (Files rather than `ddraw.in
 Only **unhandled** exceptions produce a report. The reporter is the process's top-level
 (`SetUnhandledExceptionFilter`) filter, which Windows and Wine call only after every other handler
 has declined, never for an exception that is caught. When the game or Storm installs a filter of its
-own, the report is written first and theirs runs after it, with the result it returns:
+own, the report is written first and theirs runs after it, with the result it returns. Ours is
+installed as one of eight entry points, one per level of the chain, so that a filter's saved
+"previous filter" says where in the chain it sits:
 
 1. cnc-ddraw patches `SetUnhandledExceptionFilter` in the import table of every module in the game
    folder (upstream did this for debug builds; this fork does it for all builds). A call through a
@@ -59,12 +67,28 @@ own, the report is written first and theirs runs after it, with the result it re
    the real call would have returned, so a filter that chains to its predecessor still reaches it.
 2. A call that goes around the patched imports (`GetProcAddress`, or a module outside the game
    folder) does replace ours. Once a second the reporter puts ours back on top and runs the
-   newcomer after the report; when the newcomer chains to its predecessor (ours), the chain goes one
-   level down instead of looping. A crash in the second between the replacement and the re-assert
-   is the one that is missed. The first three re-asserts are noted in `lomhd.log`.
+   newcomer after the report. When the newcomer chains to its predecessor (ours, one level down),
+   the chain continues below it; when it uninstalls itself by restoring that predecessor, it is
+   dropped from the chain and never called again. A filter already in the chain is never added
+   twice. A crash in the second between a replacement and the re-assert is the one that is missed.
+   Changes to the chain are noted in `lomhd.log`.
 
-The report is written, flushed and closed before any other filter runs, so whatever happens next --
-a dialog, `ExitProcess`, or a hang in some DLL's shutdown code -- the report is already on disk.
+If the game's filter resumes execution (`EXCEPTION_CONTINUE_EXECUTION`) the report gains an
+"Outcome" line saying it was not a crash, `lomhd.log` says so, and it does not count against the
+four reports a session may write.
+
+The report is written by a helper thread created at startup. The crashing thread only hands it the
+exception and waits, at most ten seconds, then carries on to the game's filter whatever happened --
+so a report that stalls (dbghelp waiting on a lock the crashing thread holds, say) can delay the
+game's end by ten seconds but never stop it. The crashing thread's own share is a few interlocked
+operations, an event and a wait: `-fstack-usage` measures 4 bytes for the entry point and 60 for
+the function behind it (with the handoff and the chain call inlined), which is why a stack overflow
+gets a report and a minidump too. The text is flushed before the minidump is attempted, and both
+are closed before any other filter runs, so whatever happens next -- a dialog, `ExitProcess`, or a
+hang in some DLL's shutdown code -- the report is already on disk. The module list comes from
+walking memory (VirtualQuery and each image's PE headers), not Toolhelp, so no part of the reporter
+takes the loader lock. The DLL pins itself in memory when the reporter is on, so the filter can
+never point into an unloaded DLL.
 An exception the game *catches* and then exits on produces no report; the first ten such
 exceptions inside the game's exe, Storm or ddraw are noted in `lomhd.log` as "first-chance ... may
 have been handled" -- by the reporter thread within a quarter second, and otherwise as this DLL
@@ -72,8 +96,14 @@ detaches at exit, which is before any DLL detached after it (Storm, say) can han
 where to look when the game closes or hangs with no report.
 
 `tests/lomhd_crash_test.c` covers the report text, module+offset annotation, the log ring buffer,
-the file names and SHA-256 natively; `tests/lomhd_crash_victim.c` is a program that loads the built
-`ddraw.dll` and crashes, hangs or idles on purpose, for running under Wine or Windows.
+the file names, SHA-256 and the filter-chain bookkeeping natively. `tests/lomhd_crash_victim.c` is a
+program that loads the built `ddraw.dll` and crashes, hangs or idles on purpose, and
+`tests/lomhd_crash_victim.sh` runs every mode under Wine in a scratch prefix, asserting each one's
+exit code and report files.
+
+The DLL records one version string: `cnc-ddraw 7.1.0.0, lomhd <LOMHD_VERSION>, git <commit>`.
+`LOMHD_VERSION` is a make variable (default `dev`); the commit is the only value taken from git, so
+one commit builds the same bytes whatever branch it is on.
 
 ---
 

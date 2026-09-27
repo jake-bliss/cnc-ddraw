@@ -2,9 +2,9 @@
 #include <windows.h>
 #include "lomhd_crash.h"
 
-/* The pure half of the crash reporter; see inc/lomhd_crash.h. This code runs on a crashing thread,
- * so it calls nothing: no heap, no C runtime, no Windows. Stack use stays small (a stack overflow
- * reaches here with little left). */
+/* The pure half of the crash reporter; see inc/lomhd_crash.h. It calls nothing: no heap, no C
+ * runtime, no Windows. The chain functions run on a crashing thread; the rest on the report helper
+ * thread, which may be working while the crashing thread holds the heap lock. */
 
 void lc_text_init(LC_TEXT* t, char* buf, unsigned cap)
 {
@@ -537,9 +537,7 @@ void lc_format_report(const LC_REPORT* r, LC_TEXT* t)
 
     lc_nl(t);
 
-    lc_puts(t, "Modules (snapshot ");
-    lc_dec(t, r->mods_age_ms);
-    lc_puts(t, " ms old)");
+    lc_puts(t, "Modules (read from memory at report time)");
     lc_nl(t);
 
     for (int i = 0; i < r->mod_count; i++)
@@ -680,4 +678,122 @@ void lc_sha256_hex(LC_SHA256* s, char out[65])
     }
 
     out[64] = 0;
+}
+
+/* ------------------------------------------------------------------------------------------- */
+/* The filter chain                                                                            */
+/* ------------------------------------------------------------------------------------------- */
+
+void lc_chain_init(LC_CHAIN* c, void* previous)
+{
+    for (int i = 0; i < LC_MAX_CHAIN; i++)
+        c->f[i] = NULL;
+
+    c->f[0] = previous;
+    c->count = 1;
+}
+
+int lc_chain_level(void* const stubs[LC_MAX_CHAIN], const void* p)
+{
+    for (int i = 0; i < LC_MAX_CHAIN; i++)
+        if (p && stubs[i] == p)
+            return i;
+
+    return -1;
+}
+
+void* lc_chain_set(LC_CHAIN* c, void* const stubs[LC_MAX_CHAIN], void* filter, int* install)
+{
+    void* old = c->f[c->count - 1];
+    int level = lc_chain_level(stubs, filter);
+
+    if (level >= 0)
+    {
+        /* Ours handed back: a restore to that level. */
+        if (level < c->count - 1)
+            c->count = level + 1;
+
+        *install = c->count - 1;
+    }
+    else
+    {
+        c->f[c->count - 1] = filter;
+        *install = -1;
+    }
+
+    return old;
+}
+
+int lc_chain_observe(LC_CHAIN* c, void* const stubs[LC_MAX_CHAIN], void* current, int* dropped)
+{
+    int level = lc_chain_level(stubs, current);
+    *dropped = 0;
+
+    if (level >= 0)
+    {
+        if (level < c->count - 1)
+            c->count = level + 1;
+
+        return c->count - 1;
+    }
+
+    for (int i = c->count - 1; i >= 0; i--)
+    {
+        if (c->f[i] == current)
+        {
+            c->count = i + 1;
+            return i;
+        }
+    }
+
+    if (c->count < LC_MAX_CHAIN)
+    {
+        c->f[c->count++] = current;
+        return c->count - 1;
+    }
+
+    *dropped = 1;
+    return c->count - 1;
+}
+
+void* lc_chain_next(const LC_CHAIN* c, void* const stubs[LC_MAX_CHAIN], int level)
+{
+    int count = c->count;
+
+    if (count < 1)
+        return NULL;
+
+    if (level < 0)
+        return NULL;
+
+    if (level >= count)
+        level = count - 1;
+
+    void* f = c->f[level];
+    return lc_chain_level(stubs, f) >= 0 ? NULL : f;
+}
+
+BOOL lc_chain_enter(DWORD* visited, int level)
+{
+    DWORD bit = (DWORD)1 << (level & 31);
+
+    if (*visited & bit)
+        return FALSE;
+
+    *visited |= bit;
+    return TRUE;
+}
+
+BOOL lc_same_fault(DWORD code, DWORD address, DWORD thread,
+    DWORD last_code, DWORD last_address, DWORD last_thread)
+{
+    return last_code != 0 && code == last_code && address == last_address && thread == last_thread;
+}
+
+BOOL lc_in_front(const void* window, const void* foreground, const void* ghost_of_foreground, BOOL iconic)
+{
+    if (!window || iconic)
+        return FALSE;
+
+    return foreground == window || (ghost_of_foreground && ghost_of_foreground == window);
 }
