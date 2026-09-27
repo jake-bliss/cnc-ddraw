@@ -23,6 +23,7 @@
 #include "directinput.h"
 #include "ddpalette.h"
 #include "palette.h"
+#include "lomhd.h"
 
 
 BOOL WINAPI fake_GetCursorPos(LPPOINT lpPoint)
@@ -2255,6 +2256,10 @@ MCIERROR WINAPI fake_mciSendCommandA(MCIDEVICEID IDDevice, UINT uMsg, DWORD_PTR 
 LPTOP_LEVEL_EXCEPTION_FILTER WINAPI fake_SetUnhandledExceptionFilter(
     LPTOP_LEVEL_EXCEPTION_FILTER lpTopLevelExceptionFilter)
 {
+#ifndef _DEBUG
+    return lomhd_crash_set_filter(lpTopLevelExceptionFilter);
+#endif
+
     LPTOP_LEVEL_EXCEPTION_FILTER old = g_dbg_exception_filter;
     g_dbg_exception_filter = lpTopLevelExceptionFilter;
 

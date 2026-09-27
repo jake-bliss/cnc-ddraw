@@ -15,9 +15,62 @@ What the fork adds, all in `src/lomhd*.c` and `inc/lomhd*.h`, with one-line hook
 - **Terrain art from a folder** (`lomhd_files.c`): serves `til\*` from `lomhd_terrain\til\` beside
   the exe instead of `pic.mpq`, so installing it never rewrites the game's archive.
 - **A surface trace** (`lomhd_trace.c`): off unless a file named `lomhd_trace` sits beside the game.
+- **Crash and hang reports** (`lomhd_crash.c`, `lomhd_crash_core.c`): see below.
 
 Everything is inert for any other game, and the terrain parts for any exe but the patched one. The
 upstream README follows; cnc-ddraw is MIT licensed (see `LICENSE`), and so are the additions.
+
+### Crash and hang reports
+
+When `lomse.exe` dies of an exception nothing handled, the DLL writes two files beside it before the
+usual crash dialog (Windows Error Reporting, or Wine's) appears:
+
+- `lomhd_crash_YYYYMMDD_HHMMSS.txt`, meant to be read: the exception and its address as
+  module+offset (lomse, storm, ddraw or other), the faulting read/write and its target, all
+  registers and the code bytes at EIP, 64 stack dwords with every value that points into a module
+  annotated, the last few first-chance exceptions (marked as possibly handled), the module list,
+  the exe's size, PE timestamp and SHA-256 (hashed once at startup), this DLL's version and commit,
+  the pack and terrain state, and the last 30 lines of `lomhd.log`.
+- `lomhd_crash_YYYYMMDD_HHMMSS.dmp`, a minidump (threads, stacks, modules, and the data segments of
+  the game, Storm and this DLL). Tens of KB under Wine; a few MB on Windows.
+
+A **hang** writes `lomhd_hang_YYYYMMDD_HHMMSS.txt` with the window thread's registers and stack. It
+counts as a hang only when all of these hold: the game window's thread has made no DirectDraw call
+(Blt, BltFast, Flip, Lock, Unlock) for 20 seconds, the window was in front and not minimized for
+all of that time, and Windows or Wine itself calls the window hung (it is not pumping messages) --
+so a menu idling in `GetMessage` is not a hang. The thread is suspended only for as long as it
+takes to read its registers and copy its stack; nothing else about the game is touched. One report
+per hang, at most three per session.
+
+To turn them off, put an empty file beside the game: `lomhd_no_hang_reports` stops the hang
+watchdog only, `lomhd_no_crash_reports` stops both. (Files rather than `ddraw.ini` keys, like
+`lomhd_debug` and `lomhd_trace`: the Steam install has no `ddraw.ini`.) For any exe other than
+`lomse*.exe` the reporter is off unless a file named `lomhd_crash_reports` is there.
+
+Only **unhandled** exceptions produce a report. The reporter is the process's top-level
+(`SetUnhandledExceptionFilter`) filter, which Windows and Wine call only after every other handler
+has declined, never for an exception that is caught. When the game or Storm installs a filter of its
+own, the report is written first and theirs runs after it, with the result it returns:
+
+1. cnc-ddraw patches `SetUnhandledExceptionFilter` in the import table of every module in the game
+   folder (upstream did this for debug builds; this fork does it for all builds). A call through a
+   patched import is recorded as the game's filter instead of replacing ours, and gets back what
+   the real call would have returned, so a filter that chains to its predecessor still reaches it.
+2. A call that goes around the patched imports (`GetProcAddress`, or a module outside the game
+   folder) does replace ours. Once a second the reporter puts ours back on top and runs the
+   newcomer after the report; when the newcomer chains to its predecessor (ours), the chain goes one
+   level down instead of looping. A crash in the second between the replacement and the re-assert
+   is the one that is missed. The first three re-asserts are noted in `lomhd.log`.
+
+The report is written, flushed and closed before any other filter runs, so whatever happens next --
+a dialog, `ExitProcess`, or a hang in some DLL's shutdown code -- the report is already on disk.
+An exception the game *catches* and then exits on produces no report; the first few such
+exceptions inside lomse, Storm or ddraw are noted in `lomhd.log` as "first-chance ... may have been
+handled", which is where to look when the game closes or hangs with no report.
+
+`tests/lomhd_crash_test.c` covers the report text, module+offset annotation, the log ring buffer,
+the file names and SHA-256 natively; `tests/lomhd_crash_victim.c` is a program that loads the built
+`ddraw.dll` and crashes, hangs or idles on purpose, for running under Wine or Windows.
 
 ---
 

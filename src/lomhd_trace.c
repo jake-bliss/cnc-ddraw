@@ -163,6 +163,9 @@ void lomhd_trace_surface(const void* s, DWORD width, DWORD height, DWORD bpp, DW
 
 void lomhd_trace_op(char op, const void* dst, const void* src, const RECT* r, long x, long y, DWORD flags)
 {
+    /* Every Blt, BltFast, Flip, Lock and Unlock passes here: progress for the hang watchdog. */
+    lomhd_crash_beat();
+
     if (!trace_on())
         return;
 
