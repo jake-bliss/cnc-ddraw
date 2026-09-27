@@ -32,7 +32,8 @@ usual crash dialog (Windows Error Reporting, or Wine's) appears:
   the exe's size, PE timestamp and SHA-256 (hashed once at startup), this DLL's version and commit,
   the pack and terrain state, and the last 30 lines of `lomhd.log`.
 - `lomhd_crash_YYYYMMDD_HHMMSS.dmp`, a minidump (threads, stacks, modules, and the data segments of
-  the game, Storm and this DLL). Tens of KB under Wine; a few MB on Windows.
+  the game, Storm and this DLL). About 12 KB under Wine 10, whose dbghelp writes the stacks but
+  not the data segments; not yet measured on Windows, where the data segments are included.
 
 A **hang** writes `lomhd_hang_YYYYMMDD_HHMMSS.txt` with the window thread's registers and stack. It
 counts as a hang only when all of these hold: the game window's thread has made no DirectDraw call
