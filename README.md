@@ -95,9 +95,17 @@ Toolhelp, so no part of the reporter takes the loader lock.
 
 Nothing the reporter does at startup takes the loader lock: dbghelp is loaded on the helper when
 a report needs a minidump, after the text is written, and every other lookup happens in `DllMain`,
-which holds that lock already. (A thread ended by `ExitProcess` while holding the loader lock
-hangs every DLL's detach; loading dbghelp on the reporter thread at startup did exactly that, in
-about one run in thirty of the victim's `caught` mode.)
+which holds that lock already. For its first 1.5 seconds the reporter thread does nothing but
+wait, and its exe hash reads into a static buffer rather than the C runtime's heap. The reason:
+`ExitProcess` ends every other thread wherever it is, and a thread ended while holding a lock --
+the loader lock, a heap lock -- leaves it held for everything that runs at exit, `DllMain` detach
+included, which then hangs. A game that exits at once (a failed check at launch) now always finds
+the reporter idle. On Wine 10, measured with the victim's `caught` mode (crash and exit
+immediately after loading): loading dbghelp at startup hung 32 runs in 50; with dbghelp loaded
+lazily, 5 in about 330; with the hash's `malloc` gone as well, 1 in 300; with the quiet start,
+0 in 300. With the reporter off entirely, 0 in 200. The reporter's regular work later on -- a few user32 calls
+every quarter second while the game window exists -- is exposed the same way, briefly, as
+upstream's render thread is all the time.
 
 Limits:
 

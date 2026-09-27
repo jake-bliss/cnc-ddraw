@@ -418,7 +418,7 @@ int main(int argc, char** argv)
         BOOL r = IsBadReadPtr((void*)0x10, 4);
         BOOL w = IsBadWritePtr((void*)0x10, 4);
         printf("handled: IsBadReadPtr %d, IsBadWritePtr %d\n", r, w);
-        Sleep(1500);
+        Sleep(3000);            /* past the reporter's quiet start, so its log line is there */
         return 0;
     }
 
@@ -466,7 +466,7 @@ int main(int argc, char** argv)
     if (strcmp(mode, "caught-heap") == 0)
     {
         AddVectoredExceptionHandler(0, catch_and_exit);
-        Sleep(1500);            /* the reporter is past its startup */
+        Sleep(3000);            /* the reporter is past its quiet start */
         g_heap_held = CreateEventA(NULL, TRUE, FALSE, NULL);
         CreateThread(NULL, 0, hold_heap, NULL, 0, NULL);
         WaitForSingleObject(g_heap_held, INFINITE);
@@ -512,7 +512,7 @@ int main(int argc, char** argv)
          * saved: it must not run at the crash. */
         SetUnhandledExceptionFilter(game_filter);
         g_bypass_prev = real_set_filter()(bypass_filter);
-        Sleep(2500);
+        Sleep(3500);
         real_set_filter()(g_bypass_prev);
         printf("bypass-restore: restored %p\n", (void*)g_bypass_prev);
     }
@@ -522,8 +522,9 @@ int main(int argc, char** argv)
         return 2;
     }
 
-    /* Long enough for the reporter thread to hash the exe and re-assert. */
-    Sleep(2500);
+    /* Long enough for the reporter thread to finish its quiet start (1.5 s), hash the exe and
+     * re-assert (once a second after that). */
+    Sleep(3500);
     printf("crashing now\n");
 
     if (strncmp(mode, "overflow", 8) == 0)

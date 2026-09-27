@@ -72,6 +72,7 @@
 #define LC_MAX_HANGS 3                     /* per session */
 #define LC_HANG_MS 20000
 #define LC_HANDOFF_MS 10000                /* the crashing thread's wait for the helper */
+#define LC_QUIET_START_MS 1500             /* the reporter thread's idle start */
 #define LC_LOG_LINES 30
 #define LC_SEEN_LOG_MAX 10
 #define LC_CHAIN_LOG_MAX 6
@@ -1126,16 +1127,18 @@ static void lc_hash_exe(void)
     if (f == INVALID_HANDLE_VALUE)
         return;
 
-    BYTE* buf = malloc(1 << 16);
+    /* A static buffer, not malloc: ExitProcess can end this thread anywhere, and one ended inside
+     * the C runtime's heap leaves that heap locked for everything that runs at exit -- DllMain
+     * detach included. (The victim's `caught` mode hung about one run in seventy that way.) */
+    static BYTE buf[1 << 16];
     LC_SHA256 sha;
     lc_sha256_init(&sha);
     DWORD got = 0;
-    BOOL ok = buf != NULL;
+    BOOL ok;
 
-    while (ok && (ok = ReadFile(f, buf, 1 << 16, &got, NULL)) && got)
+    while ((ok = ReadFile(f, buf, sizeof(buf), &got, NULL)) && got)
         lc_sha256_update(&sha, buf, got);
 
-    free(buf);
     CloseHandle(f);
 
     if (ok)
@@ -1188,6 +1191,15 @@ static DWORD WINAPI lc_reporter(LPVOID unused)
      * holding the loader lock hangs every DLL's detach. Found 2026-09-27 as a rare hang of the
      * victim's `caught` mode, when this thread loaded dbghelp here. Lookups happen in DllMain,
      * which holds the lock already; dbghelp loads on the helper when a report needs it. */
+    /* And nothing at all for the first moments: a game that exits at once (a failed check at
+     * launch, or the victim's `caught` mode) must find this thread idle in a wait, not inside a
+     * file or heap call whose lock ExitProcess would orphan. Measured on Wine 10: `caught` hung in
+     * about one run in seventy with the startup work done at once, one in 240 with its malloc
+     * gone. The helper is ready from the start; only the log line, the exe hash, the re-assert and
+     * the hang watchdog wait. */
+    if (WaitForSingleObject(g_main, LC_QUIET_START_MS) != WAIT_TIMEOUT)
+        return 0;
+
     char line[200];
     _snprintf(line, sizeof(line), "crash reports: on (hang reports %s)", g_hang_reports ? "on" : "off");
     line[sizeof(line) - 1] = 0;
