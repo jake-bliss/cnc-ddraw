@@ -85,20 +85,33 @@ crashing thread -- then carries on to the game's filter whatever happened. So a 
 but never stop it. A request the crashing thread gave up on stays the helper's until it finishes,
 and the helper works only from the copies, never from the crashing thread's stack. The crashing
 thread's own share is a copy, a few interlocked operations, an event and a wait: `-fstack-usage`
-measures 4 bytes for the entry point and 72 for the function behind it (with the handoff and the
-chain call inlined), which is why a stack overflow gets a report and a minidump too. The text is
+measures 4 bytes for the entry point and 68 for the function behind it (with the handoff and the
+chain call inlined), plus 24 for the bounded lock and 8 for its backoff, which is why a stack overflow gets a report and a minidump too. The text is
 flushed before the minidump is attempted, and both are closed before any other filter runs when the
 helper finishes in time, so whatever happens next -- a dialog, `ExitProcess`, or a hang in some
 DLL's shutdown code -- the report is already on disk. The module list comes from walking memory
 (VirtualQuery, ReadProcessMemory and each image's PE headers, every offset bounds-checked), not
 Toolhelp, so no part of the reporter takes the loader lock.
 
-Two limits. A crash on a thread that holds the process heap lock (a crash inside `HeapFree` on a
-corrupted heap is the common case) gets no report: opening the report file allocates, so the helper
-waits on that lock until the deadline. `lomhd.log` still gets the first-chance line. And the
-helper and the reporter thread exit when the game's main thread does -- they never keep a crashed
-game's process alive, but a crash on another thread after the main thread has ended is not
-reported.
+Nothing the reporter does at startup takes the loader lock: dbghelp is loaded on the helper when
+a report needs a minidump, after the text is written, and every other lookup happens in `DllMain`,
+which holds that lock already. (A thread ended by `ExitProcess` while holding the loader lock
+hangs every DLL's detach; loading dbghelp on the reporter thread at startup did exactly that, in
+about one run in thirty of the victim's `caught` mode.)
+
+Limits:
+
+- A crash on a thread that holds the process heap lock (a crash inside `HeapFree` on a corrupted
+  heap is the common case) gets no report: opening the report file allocates, so the helper waits
+  on that lock until the deadline. `lomhd.log` still gets the first-chance line.
+- The helper and the reporter thread wait on the thread that loaded `ddraw.dll`, and exit when it
+  ends. For `lomse.exe`, which imports `ddraw.dll`, that is the game's main thread. A host that
+  loads `ddraw.dll` on a worker thread loses reporting when that worker ends; any host loses it for
+  crashes after its main thread has ended.
+- A process whose main thread has ended can still be kept alive by threads that have not: upstream
+  cnc-ddraw's render thread does this already, and so does a report helper that is blocked inside a
+  report (on a lock the dead thread held, say) when the main thread ends. The reporter never calls
+  `TerminateProcess` to force the issue.
 
 The DLL pins itself in memory when the reporter is on, so the filter can never point into an
 unloaded DLL.

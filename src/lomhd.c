@@ -107,7 +107,14 @@ static int g_seen_count;
 /* Files (worker thread only)                                                                  */
 /* ------------------------------------------------------------------------------------------- */
 
-static void lomhd_path(char* out, size_t size, const char* name)
+/* The game folder, found once. GetModuleFileName takes the loader lock (on Wine as on Windows),
+ * and ExitProcess can end a thread that holds it -- after which every DLL's detach hangs. So
+ * lomhd_path_init runs in DllMain, which holds that lock already, and our threads only read the
+ * copy. (Found 2026-09-27 with the crash reporter's thread; lomhd.log's writers are the same.) */
+static char g_game_dir[MAX_PATH];
+static volatile LONG g_game_dir_ready;
+
+void lomhd_path_init(void)
 {
     char exe[MAX_PATH];
     DWORD n = GetModuleFileNameA(NULL, exe, sizeof(exe));
@@ -122,7 +129,16 @@ static void lomhd_path(char* out, size_t size, const char* name)
     else
         exe[0] = 0;
 
-    _snprintf(out, size, "%s\\%s", exe, name);
+    memcpy(g_game_dir, exe, sizeof(g_game_dir));
+    InterlockedExchange(&g_game_dir_ready, 1);
+}
+
+static void lomhd_path(char* out, size_t size, const char* name)
+{
+    if (!g_game_dir_ready)
+        lomhd_path_init();
+
+    _snprintf(out, size, "%s\\%s", g_game_dir, name);
     out[size - 1] = 0;
 }
 

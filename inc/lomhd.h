@@ -48,6 +48,10 @@ void lomhd_files_install(void);
 BOOL lomhd_files_on(void);
 long lomhd_files_served(void);
 
+/* Finds the game folder, once; called from DllMain so no other thread ever needs the loader lock
+ * for it. */
+void lomhd_path_init(void);
+
 /* Appends a line to lomhd.log beside the game, from any thread. */
 void lomhd_log(const char* line);
 

@@ -440,6 +440,51 @@ static void test_pe_bounds(void)
     CHECK(lc_pe_name_cap(0x2000, 0x2000, 47) == 0 && lc_pe_name_cap(0, 0x2000, 47) == 0, "name outside");
 }
 
+static DWORD fake_clock;
+static int waits[3];
+
+static DWORD fake_now(void)
+{
+    return fake_clock;
+}
+
+static void fake_wait(int kind)
+{
+    waits[kind]++;
+    fake_clock += kind == LC_SLEEP ? 1 : 0;
+}
+
+static void test_locks(void)
+{
+    CHECK(lc_backoff(0) == LC_SPIN && lc_backoff(3) == LC_SPIN, "spins first");
+    CHECK(lc_backoff(4) == LC_YIELD && lc_backoff(15) == LC_YIELD, "then yields to the owner");
+    CHECK(lc_backoff(16) == LC_SLEEP && lc_backoff(100000) == LC_SLEEP, "then sleeps: never spins forever");
+
+    volatile LONG lock = 0;
+    fake_clock = 1000;
+    CHECK(lc_lock_until(&lock, 2000, fake_now, fake_wait) && lock == 1, "free lock taken at once");
+
+    /* Held and never released (the owner starved or dead): the crash path gives up at its
+     * deadline, having yielded and slept rather than spun. */
+    waits[0] = waits[1] = waits[2] = 0;
+    CHECK(!lc_lock_until(&lock, 1050, fake_now, fake_wait) && fake_clock == 1050, "gives up at the deadline");
+    CHECK(waits[LC_SPIN] == 4 && waits[LC_YIELD] == 12 && waits[LC_SLEEP] == 50, "backoff: %d spins, %d yields, %d sleeps",
+        waits[0], waits[1], waits[2]);
+
+    LC_ADMIT a = { 0, 0, 0, 0 };
+    CHECK(lc_admit_check(&a, 0xC0000005, 0x401000, 7, 4), "first crash admitted");
+
+    /* Checked but no slot claimed: nothing counted, and it is not a duplicate next time. */
+    CHECK(a.reports == 0 && lc_admit_check(&a, 0xC0000005, 0x401000, 7, 4), "a check alone commits nothing");
+
+    lc_admit_commit(&a, 0xC0000005, 0x401000, 7);
+    CHECK(a.reports == 1 && !lc_admit_check(&a, 0xC0000005, 0x401000, 7, 4), "committed: counted and deduplicated");
+    CHECK(lc_admit_check(&a, 0xC0000005, 0x401000, 8, 4), "another thread's fault is new");
+
+    a.reports = 4;
+    CHECK(!lc_admit_check(&a, 0xC0000094, 0x402000, 9, 4), "cap reached");
+}
+
 int main(void)
 {
     test_text();
@@ -451,6 +496,7 @@ int main(void)
     test_chain();
     test_mailbox();
     test_pe_bounds();
+    test_locks();
 
     printf(g_fail ? "%d FAILED\n" : "all passed\n", g_fail);
     return g_fail != 0;

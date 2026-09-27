@@ -39,7 +39,7 @@ overflow       |44|1|1|0|report written to          |crashing now             |S
 overflow-noflag|44|0|0|0|-                          |crashing now             |
 overflow-loud  |* |1|1|0|report written to          |crashing now             |STACK_OVERFLOW
 exitthread     |* |1|1|0|report written to          |ends the faulting thread |
-deadline       |49|?|?|0|                           |B reached the game filter|
+deadline       |49|1|0|0|first-chance c0000005      |B reached the game filter|ACCESS_VIOLATION
 abandon        |0 |1|1|0|resumed after              |dump holds the copied    |Outcome:
 continue       |47|1|1|0|resumed after              |resumed after the fault  |Outcome:
 freelib        |44|1|1|0|report written to          |still loaded after FreeLibrary: yes|

@@ -231,4 +231,25 @@ DWORD lc_pe_name_cap(DWORD rva, DWORD image_size, DWORD cap);   /* bytes that ma
 /* Milliseconds left before `deadline` (GetTickCount time), 0 once passed; wrap-safe. */
 DWORD lc_left(DWORD deadline, DWORD now);
 
+/* A spinlock that cannot starve its owner: after a few spins it yields (SwitchToThread), then
+ * sleeps (Sleep(1)), so a low-priority owner gets to run and release it. lc_backoff says which,
+ * for the n-th failed attempt. lc_lock_until gives up at `deadline` (a crashing thread must reach
+ * the game's filter on time); `now` and `wait` are the clock and the backoff, passed in so the
+ * policy is testable without threads. */
+enum { LC_SPIN, LC_YIELD, LC_SLEEP };
+int lc_backoff(int attempt);
+BOOL lc_lock_until(volatile LONG* lock, DWORD deadline, DWORD (*now)(void), void (*wait)(int kind));
+
+/* Whether a crash gets a report: not the same fault as the last one reported, and under the cap.
+ * Checked first; committed -- counted, and made the duplicate reference -- only once the report is
+ * really asked for (a request slot claimed), so a crash that finds both slots busy costs nothing. */
+typedef struct
+{
+    DWORD last_code, last_address, last_thread;
+    volatile LONG reports;
+} LC_ADMIT;
+
+BOOL lc_admit_check(const LC_ADMIT* a, DWORD code, DWORD address, DWORD thread, LONG max);
+void lc_admit_commit(LC_ADMIT* a, DWORD code, DWORD address, DWORD thread);
+
 #endif

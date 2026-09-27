@@ -122,9 +122,8 @@ typedef struct
 } LC_THREAD;
 
 static LC_THREAD g_threads[LC_MAX_THREADS];
-static volatile LONG g_reports;
-static volatile LONG g_dedupe_lock;        /* held for a few instructions, never across a wait */
-static DWORD g_last_code, g_last_address, g_last_thread;   /* the last exception reported */
+static LC_ADMIT g_admit;                   /* the report count and the duplicate reference */
+static volatile LONG g_admit_lock;         /* held for a few instructions, never across a wait */
 static int g_hang_count;                   /* reporter thread only */
 
 /* The handoff to the helper thread: the mailbox (lomhd_crash_core.c) and, per slot, the crashing
@@ -169,10 +168,28 @@ static volatile DWORD g_window_tid;
 /* Small helpers                                                                               */
 /* ------------------------------------------------------------------------------------------- */
 
+/* Backoff for our spinlocks (policy: lc_backoff): spin, then yield, then sleep, so an owner at
+ * lower priority always gets to run. */
+static void lc_wait(int kind)
+{
+    if (kind == LC_SPIN)
+        __asm__ volatile("pause");
+    else if (kind == LC_YIELD)
+        SwitchToThread();
+    else
+        Sleep(1);
+}
+
+static DWORD lc_now(void)
+{
+    return GetTickCount();
+}
+
+/* The chain lock: never on a crash path, so it may wait as long as it takes. */
 static void lc_spin_lock(volatile LONG* lock)
 {
-    while (InterlockedCompareExchange(lock, 1, 0) != 0)
-        Sleep(0);
+    for (int attempt = 0; InterlockedCompareExchange(lock, 1, 0) != 0; attempt++)
+        lc_wait(lc_backoff(attempt));
 }
 
 static void lc_spin_unlock(volatile LONG* lock)
@@ -471,6 +488,21 @@ static __attribute__((noinline)) void lc_write_dump(LC_WORK* w, EXCEPTION_POINTE
     lc_text_init(&t, line, sizeof(line));
     lc_puts(&t, "Minidump:   ");
 
+    /* Loaded here, on the helper, after the text is written -- never at startup, where a thread
+     * inside LoadLibrary holds the loader lock and ExitProcess could kill it holding it, hanging
+     * every DLL's detach. If the crashing thread holds the loader lock, this load waits, and the
+     * crashing thread's deadline lets the game go on regardless. */
+    static BOOL tried;
+
+    if (!g_minidump && !tried)
+    {
+        tried = TRUE;
+        HMODULE dbghelp = real_LoadLibraryA("dbghelp.dll");
+
+        if (dbghelp)
+            g_minidump = (MINIDUMPWRITEDUMPPROC)real_GetProcAddress(dbghelp, "MiniDumpWriteDump");
+    }
+
     if (!g_minidump)
     {
         lc_puts(&t, "not written (dbghelp.dll unavailable)");
@@ -636,7 +668,7 @@ static void lc_note_resumed(LONG gen)
     _snprintf(line, sizeof(line), "crash: the game's filter resumed after %s; not a crash", w->name);
     line[sizeof(line) - 1] = 0;
     lomhd_log(line);
-    InterlockedDecrement(&g_reports);
+    InterlockedDecrement(&g_admit.reports);
 }
 
 static DWORD WINAPI lc_helper(LPVOID unused)
@@ -716,22 +748,20 @@ static LONG lc_handoff(EXCEPTION_POINTERS* ep, DWORD me, DWORD deadline)
     if (!e || !ep->ContextRecord || g_detached || !g_helper || WaitForSingleObject(g_helper, 0) != WAIT_TIMEOUT)
         return 0;
 
-    lc_spin_lock(&g_dedupe_lock);
-    BOOL report = !lc_same_fault(e->ExceptionCode, (DWORD)e->ExceptionAddress, me, g_last_code, g_last_address,
-        g_last_thread) && g_reports < LC_MAX_REPORTS;
+    /* Bounded by this thread's deadline: a lock whose owner never runs again cannot keep a
+     * crashing thread from the game's filter. */
+    if (!lc_lock_until(&g_admit_lock, deadline, lc_now, lc_wait))
+        return 0;
 
-    if (report)
-    {
-        g_last_code = e->ExceptionCode;
-        g_last_address = (DWORD)e->ExceptionAddress;
-        g_last_thread = me;
-        InterlockedIncrement(&g_reports);
-    }
+    /* A report is counted, and becomes the duplicate reference, only once a slot is claimed. Both
+     * slots busy (the helper stuck on one, another queued): no report, and nothing counted. */
+    int slot = -1;
 
-    lc_spin_unlock(&g_dedupe_lock);
+    if (lc_admit_check(&g_admit, e->ExceptionCode, (DWORD)e->ExceptionAddress, me, LC_MAX_REPORTS) &&
+        (slot = lc_mail_claim(&g_mail)) >= 0)
+        lc_admit_commit(&g_admit, e->ExceptionCode, (DWORD)e->ExceptionAddress, me);
 
-    /* Both slots busy (the helper stuck on one, another queued): no report for this one. */
-    int slot = report ? lc_mail_claim(&g_mail) : -1;
+    lc_spin_unlock(&g_admit_lock);
 
     if (slot < 0)
         return 0;
@@ -1153,21 +1183,13 @@ static DWORD WINAPI lc_reporter(LPVOID unused)
 {
     (void)unused;
 
-    /* Everything the helper calls, resolved here and not there: a crashing thread may hold the
-     * loader lock that LoadLibrary needs. */
-    HMODULE dbghelp = real_LoadLibraryA("dbghelp.dll");
-
-    if (dbghelp)
-        g_minidump = (MINIDUMPWRITEDUMPPROC)real_GetProcAddress(dbghelp, "MiniDumpWriteDump");
-
-    HMODULE user32 = GetModuleHandleA("user32.dll");
-    g_is_hung = (ISHUNGAPPWINDOWPROC)real_GetProcAddress(user32, "IsHungAppWindow");
-    g_ghost_owner = (HUNGWINDOWFROMGHOSTPROC)real_GetProcAddress(user32, "HungWindowFromGhostWindow");
-    lc_describe_host();
-
+    /* Nothing here takes the loader lock -- no LoadLibrary, GetModuleHandle or GetProcAddress
+     * (Wine's take it too): ExitProcess can end this thread at any moment, and a thread ended
+     * holding the loader lock hangs every DLL's detach. Found 2026-09-27 as a rare hang of the
+     * victim's `caught` mode, when this thread loaded dbghelp here. Lookups happen in DllMain,
+     * which holds the lock already; dbghelp loads on the helper when a report needs it. */
     char line[200];
-    _snprintf(line, sizeof(line), "crash reports: on (hang reports %s); %s", g_hang_reports ? "on" : "off",
-        g_minidump ? "minidumps on" : "no dbghelp.dll, text reports only");
+    _snprintf(line, sizeof(line), "crash reports: on (hang reports %s)", g_hang_reports ? "on" : "off");
     line[sizeof(line) - 1] = 0;
     lomhd_log(line);
 
@@ -1261,19 +1283,40 @@ void lomhd_crash_install(void)
         }
     }
 
+    /* Lookups here, under the loader lock DllMain already holds, so our threads never need it. */
+    HMODULE user32 = GetModuleHandleA("user32.dll");
+    g_is_hung = (ISHUNGAPPWINDOWPROC)real_GetProcAddress(user32, "IsHungAppWindow");
+    g_ghost_owner = (HUNGWINDOWFROMGHOSTPROC)real_GetProcAddress(user32, "HungWindowFromGhostWindow");
+    lc_describe_host();
+
     g_request = CreateEventA(NULL, FALSE, FALSE, NULL);
     g_done = CreateEventA(NULL, FALSE, FALSE, NULL);
 
-    /* DllMain runs on the thread that loaded us: for lomse (a static import) the main thread. */
-    if (!g_request || !g_done || !DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+    /* DllMain runs on the thread that loaded us: for lomse (a static import) the main thread. A
+     * host that loads ddraw.dll on a worker thread gets that thread instead, and loses reporting
+     * when it ends (see the README). */
+    if (g_request && g_done && DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
         &g_main, SYNCHRONIZE, FALSE, 0))
-        return;
-
-    /* Both threads are created under the loader lock and start once DllMain returns. */
-    g_helper = CreateThread(NULL, 0, lc_helper, NULL, 0, &g_helper_tid);
+    {
+        /* Both threads are created under the loader lock and start once DllMain returns. */
+        g_helper = CreateThread(NULL, 0, lc_helper, NULL, 0, &g_helper_tid);
+    }
 
     if (!g_helper)
+    {
+        /* Partly set up: give back what was made, and stay off. */
+        if (g_main)
+            CloseHandle(g_main);
+
+        if (g_request)
+            CloseHandle(g_request);
+
+        if (g_done)
+            CloseHandle(g_done);
+
+        g_main = g_request = g_done = NULL;
         return;
+    }
 
     for (int i = 0; i < LC_MAX_CHAIN; i++)
         g_stubs[i] = (void*)g_stub_fn[i];

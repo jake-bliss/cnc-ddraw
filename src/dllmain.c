@@ -133,6 +133,7 @@ BOOL WINAPI DllMain(HANDLE hDll, DWORD dwReason, LPVOID lpReserved)
                 set_aware();
         }
 
+        lomhd_path_init();
         lomhd_files_install();
         lomhd_crash_install();
 

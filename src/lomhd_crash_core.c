@@ -895,3 +895,40 @@ DWORD lc_left(DWORD deadline, DWORD now)
     LONG left = (LONG)(deadline - now);
     return left > 0 ? (DWORD)left : 0;
 }
+
+/* ------------------------------------------------------------------------------------------- */
+/* Locks and admission                                                                         */
+/* ------------------------------------------------------------------------------------------- */
+
+int lc_backoff(int attempt)
+{
+    return attempt < 4 ? LC_SPIN : attempt < 16 ? LC_YIELD : LC_SLEEP;
+}
+
+BOOL lc_lock_until(volatile LONG* lock, DWORD deadline, DWORD (*now)(void), void (*wait)(int kind))
+{
+    for (int attempt = 0;; attempt++)
+    {
+        if (InterlockedCompareExchange(lock, 1, 0) == 0)
+            return TRUE;
+
+        if (!lc_left(deadline, now()))
+            return FALSE;
+
+        wait(lc_backoff(attempt));
+    }
+}
+
+BOOL lc_admit_check(const LC_ADMIT* a, DWORD code, DWORD address, DWORD thread, LONG max)
+{
+    return !lc_same_fault(code, address, thread, a->last_code, a->last_address, a->last_thread) &&
+        a->reports < max;
+}
+
+void lc_admit_commit(LC_ADMIT* a, DWORD code, DWORD address, DWORD thread)
+{
+    a->last_code = code;
+    a->last_address = address;
+    a->last_thread = thread;
+    InterlockedIncrement(&a->reports);
+}

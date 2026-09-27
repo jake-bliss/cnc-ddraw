@@ -151,9 +151,12 @@ static LONG WINAPI exit_thread_filter(EXCEPTION_POINTERS* ep)
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
-/* deadline: thread A takes the heap lock and faults, so the report helper stalls in dbghelp; B
- * faults half a second later. B must reach the game's filter about ten seconds after its fault,
- * not ten for the report lock plus ten for the handoff. */
+/* deadline: thread A takes the loader lock and faults. The helper writes A's text report (which
+ * needs no loader lock) and then stalls loading dbghelp for the minidump; B faults half a second
+ * later. B must reach the game's filter about ten seconds after its fault, not ten for the report
+ * lock plus ten for the handoff -- and A's text report must exist. */
+typedef LONG(WINAPI* LDRLOCKLOADERLOCK)(ULONG, ULONG*, ULONG_PTR*);
+static LDRLOCKLOADERLOCK g_lock_loader;
 static volatile DWORD g_a_tid, g_b_tid, g_b_fault_tick;
 static HANDLE g_a_locked, g_a_clobbered, g_b_ready;
 static volatile DWORD g_a_top, g_a_fault_address;
@@ -171,17 +174,18 @@ static LONG WINAPI deadline_filter(EXCEPTION_POINTERS* ep)
         TerminateProcess(GetCurrentProcess(), ms <= 11500 ? 49 : 50);
     }
 
-    Sleep(INFINITE);            /* A: keeps the heap locked */
+    Sleep(INFINITE);            /* A: keeps the loader lock */
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-/* A locks the heap only once B is running: creating a thread allocates (the thread-attach calls
- * of the C runtimes too), so creating B after A held the lock deadlocked the victim itself. */
+/* A takes the lock only once B is running: creating a thread needs the loader lock (thread-attach
+ * calls) and allocates, so creating B after A held it deadlocked the victim itself. */
 static DWORD WINAPI deadline_a(LPVOID unused)
 {
     (void)unused;
     WaitForSingleObject(g_b_ready, INFINITE);
-    HeapLock(GetProcessHeap());
+    ULONG_PTR magic = 0;
+    g_lock_loader(0, NULL, &magic);
     SetEvent(g_a_locked);
     return (DWORD)outer(1);
 }
@@ -421,6 +425,14 @@ int main(int argc, char** argv)
     if (strcmp(mode, "deadline") == 0)
     {
         SetUnhandledExceptionFilter(deadline_filter);
+        g_lock_loader = (LDRLOCKLOADERLOCK)GetProcAddress(GetModuleHandleA("ntdll.dll"), "LdrLockLoaderLock");
+
+        if (!g_lock_loader)
+        {
+            put("deadline: no LdrLockLoaderLock\n");
+            return 2;
+        }
+
         g_a_locked = CreateEventA(NULL, TRUE, FALSE, NULL);
         g_b_ready = CreateEventA(NULL, TRUE, FALSE, NULL);
         HANDLE b = CreateThread(NULL, 0, deadline_b, NULL, 0, (DWORD*)&g_b_tid);
