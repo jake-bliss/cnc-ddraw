@@ -788,11 +788,12 @@ static BOOL same_spot(const PLACEMENT* a, const PORTRAIT* ra, int x, int y, cons
 static BOOL window_of(const PORTRAIT* win, const PORTRAIT* frame)
 {
     if (!win->window || frame->window || !frame->masked || frame->w != win->w || frame->h <= win->h ||
-        frame->nspans <= win->nspans || memcmp(frame->pal, win->pal, sizeof(*win->pal)) != 0)
+        frame->nspans < win->nspans || memcmp(frame->pal, win->pal, sizeof(*win->pal)) != 0)
         return FALSE;
 
+    /* The frame's runs after the window's must all lie below it (it may have none). */
     if (memcmp(frame->spans, win->spans, sizeof(WORD) * 3 * win->nspans) != 0 ||
-        frame->spans[3 * win->nspans] < win->h)
+        (frame->nspans > win->nspans && frame->spans[3 * win->nspans] < win->h))
         return FALSE;
 
     return memcmp(frame->opix, win->opix, win->opaque) == 0;
@@ -806,7 +807,7 @@ typedef struct
     PLACEMENT* out;
     LOMHD_STATS stats;
     int band_verifications;             /* this band's sprite comparisons so far */
-    int failed[8][4], nfailed;          /* wholes that did not pass where their window was found */
+    int failed[16][4], nfailed;         /* wholes that did not pass where their window was found */
     int matched_of[LOMHD_MAX_PLACEMENTS], total_of[LOMHD_MAX_PLACEMENTS];
 } SEARCH;
 
@@ -851,13 +852,14 @@ static void try_probes(SEARCH* s, unsigned long long h, int probe_width, int x, 
             if (!same_spot(&out[k], rk, left, top, r))
                 continue;
 
-            if (window_of(r, rk))
+            /* Stored runs are compared, so only placements of one orientation. */
+            if (out[k].mirror == probe->mirror && window_of(r, rk))
             {
                 inside = TRUE;
                 break;
             }
 
-            if (window_of(rk, r))
+            if (out[k].mirror == probe->mirror && window_of(rk, r))
             {
                 over_window = TRUE;
                 continue;
@@ -877,7 +879,7 @@ static void try_probes(SEARCH* s, unsigned long long h, int probe_width, int x, 
          * it again: once is enough per spot and orientation. */
         BOOL tried = FALSE;
 
-        for (int k = 0; over_window && k < s->nfailed && k < 8; k++)
+        for (int k = 0; over_window && k < s->nfailed && k < 16; k++)
             tried |= s->failed[k][0] == probe->portrait && s->failed[k][1] == left && s->failed[k][2] == top &&
                 s->failed[k][3] == probe->mirror;
 
@@ -901,7 +903,7 @@ static void try_probes(SEARCH* s, unsigned long long h, int probe_width, int x, 
         {
             if (over_window)
             {
-                int* f = s->failed[s->nfailed++ % 8];
+                int* f = s->failed[s->nfailed++ % 16];
                 f[0] = probe->portrait;
                 f[1] = left;
                 f[2] = top;
