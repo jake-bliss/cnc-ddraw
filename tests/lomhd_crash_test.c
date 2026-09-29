@@ -368,6 +368,21 @@ static void test_chain(void)
     CHECK(!lc_in_front(NULL, NULL, NULL, FALSE), "no window");
 }
 
+static void test_hang_outcome(void)
+{
+    char buf[256];
+    LC_TEXT t;
+
+    lc_text_init(&t, buf, sizeof(buf));
+    lc_hang_outcome(&t, 45999, FALSE);
+    CHECK(strcmp(buf, "Outcome:    the window thread resumed after 45 s.\r\n") == 0, "hang outcome, Windows");
+
+    lc_text_init(&t, buf, sizeof(buf));
+    lc_hang_outcome(&t, 21000, TRUE);
+    CHECK(strstr(buf, "resumed after 21 s -- on Wine") && strstr(buf, "background, not a hang.\r\n"),
+        "hang outcome, Wine");
+}
+
 static void test_mailbox(void)
 {
     LC_MAILBOX m = { { 0 }, { 0 }, 0 };
@@ -497,6 +512,7 @@ int main(void)
     test_mailbox();
     test_pe_bounds();
     test_locks();
+    test_hang_outcome();
 
     printf(g_fail ? "%d FAILED\n" : "all passed\n", g_fail);
     return g_fail != 0;

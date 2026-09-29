@@ -192,6 +192,7 @@ BOOL lc_same_fault(DWORD code, DWORD address, DWORD thread,
  * window is the ghost Windows puts up for it once it stops responding (ghost_of_foreground is what
  * HungWindowFromGhostWindow says the foreground window stands for; NULL if it is no ghost). */
 BOOL lc_in_front(const void* window, const void* foreground, const void* ghost_of_foreground, BOOL iconic);
+void lc_hang_outcome(LC_TEXT* t, DWORD stalled_ms, BOOL wine);
 
 /* The handoff between crashing threads and the report helper: LC_SLOTS request slots, each with
  * its own copy of the exception (so the helper never reads a crashing thread's stack after that

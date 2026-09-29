@@ -11,6 +11,7 @@
 #endif
 #include "version.h"
 #include "config.h"
+#include "versionhelpers.h"
 #include "dllmain.h"
 #include "lomhd.h"
 #include "lomhd_crash.h"
@@ -1029,11 +1030,47 @@ static BOOL lc_report_hang(DWORD tid, DWORD silent_ms)
     return TRUE;
 }
 
+/* The reported hang ended. Say so in its report, and on Wine give back its place under the cap:
+ * there every switch to another app can look like a hang (see lc_hang_outcome). */
+static void lc_note_hang_recovered(DWORD stalled_ms)
+{
+    LC_WORK* w = &g_hang_work;
+    BOOL wine = IsWine();
+    char path[MAX_PATH], outcome[160];
+    LC_TEXT t;
+
+    lc_text_init(&t, outcome, sizeof(outcome));
+    lc_hang_outcome(&t, stalled_ms, wine);
+
+    if (lc_join(path, sizeof(path), w->name))
+    {
+        HANDLE f = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+        lc_wipe(path, sizeof(path));
+
+        if (f != INVALID_HANDLE_VALUE)
+        {
+            lc_write_all(f, "\r\n", 2);
+            lc_write_all(f, outcome, t.len);
+            CloseHandle(f);
+        }
+    }
+
+    char line[160];
+    _snprintf(line, sizeof(line), "hang: %s resumed after %lu s%s", w->name, (unsigned long)(stalled_ms / 1000),
+        wine ? " (Wine: likely a background window, not counted)" : "");
+    line[sizeof(line) - 1] = 0;
+    lomhd_log(line);
+
+    if (wine && g_hang_count > 0)
+        g_hang_count--;
+}
+
 typedef struct
 {
     LONG beats;
     DWORD quiet_since;          /* the last beat, or the last moment the window was not in front */
     BOOL reported;              /* this hang is reported; re-armed by the next beat */
+    BOOL written;               /* ...and its report is g_hang_work.name */
     HWND hwnd;
 } LC_WATCH;
 
@@ -1061,9 +1098,13 @@ static void lc_watch(LC_WATCH* s, DWORD now)
 
     if (beats != s->beats)
     {
+        if (s->written)
+            lc_note_hang_recovered(now - s->quiet_since);
+
         s->beats = beats;
         s->quiet_since = now;
         s->reported = FALSE;
+        s->written = FALSE;
         return;
     }
 
@@ -1111,6 +1152,7 @@ static void lc_watch(LC_WATCH* s, DWORD now)
     if (lc_report_hang(tid, now - s->quiet_since))
     {
         s->reported = TRUE;
+        s->written = g_hang_work.name[0] != 0;
         g_hang_count++;
     }
 }

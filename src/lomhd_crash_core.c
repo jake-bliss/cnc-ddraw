@@ -798,6 +798,21 @@ BOOL lc_in_front(const void* window, const void* foreground, const void* ghost_o
     return foreground == window || (ghost_of_foreground && ghost_of_foreground == window);
 }
 
+/* The line appended to a hang report when the window thread comes back. On Wine a thread that only
+ * sat still while the player was in another app looks exactly like a hang: Wine keeps it the
+ * foreground window, because the stalled thread is the one that would process the switch. */
+void lc_hang_outcome(LC_TEXT* t, DWORD stalled_ms, BOOL wine)
+{
+    lc_puts(t, "Outcome:    the window thread resumed after ");
+    lc_dec(t, stalled_ms / 1000);
+    lc_puts(t, " s");
+
+    if (wine)
+        lc_puts(t, " -- on Wine this is most likely the game window sitting in the background, not a hang");
+
+    lc_puts(t, ".\r\n");
+}
+
 /* ------------------------------------------------------------------------------------------- */
 /* The request mailbox                                                                         */
 /* ------------------------------------------------------------------------------------------- */

@@ -44,6 +44,7 @@ abandon        |0 |1|1|0|resumed after              |dump holds the copied    |O
 continue       |47|1|1|0|resumed after              |resumed after the fault  |Outcome:
 freelib        |44|1|1|0|report written to          |still loaded after FreeLibrary: yes|
 hang           |0 |0|0|1|hang: report written       |not pumping              |
+resume         |0 |0|0|1|not counted)               |resumed, Lock ok         |Outcome:
 idle           |0 |0|0|0|crash reports: on          |pumping, no DirectDraw   |
 minimized      |0 |0|0|0|crash reports: on          |minimized yes            |
 background     |0 |0|0|0|crash reports: on          |in front no              |
@@ -89,7 +90,7 @@ for mode in "${MODES[@]}"; do
   if [ "$want_log" = "-" ]; then [ ! -e "$dir/lomhd.log" ] || problems+=" lomhd.log exists (want none)"
   elif [ -n "$want_log" ]; then grep -q -- "$want_log" "$dir/lomhd.log" 2>/dev/null || problems+=" lomhd.log lacks '$want_log'"; fi
   [ -z "$want_out" ] || grep -q -- "$want_out" "$dir/stdout.txt" || problems+=" stdout lacks '$want_out'"
-  [ -z "$want_in_txt" ] || cat "$dir"/lomhd_crash_*.txt 2>/dev/null | grep -q -- "$want_in_txt" || problems+=" report lacks '$want_in_txt'"
+  [ -z "$want_in_txt" ] || { cat "$dir"/lomhd_crash_*.txt "$dir"/lomhd_hang_*.txt 2>/dev/null || true; } | grep -q -- "$want_in_txt" || problems+=" report lacks '$want_in_txt'"
 
   if [ -z "$problems" ]; then
     echo "ok    $mode (exit $code, $have_txt txt, $have_dmp dmp, $have_hang hang)"

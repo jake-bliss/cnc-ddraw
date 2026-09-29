@@ -385,6 +385,37 @@ static int hang(HMODULE ddraw, const char* mode)
     else
         Sleep(40000);
 
+    if (strcmp(mode, "resume") == 0)
+    {
+        /* Back from the stall: one Lock/Unlock on the window thread is the beat the watchdog waits
+         * for. IDirectDraw::CreateSurface is slot 6; IDirectDrawSurface Lock 25, Unlock 32. */
+        typedef HRESULT(WINAPI* CREATESURFACE)(void*, void*, void***, void*);
+        typedef HRESULT(WINAPI* LOCK)(void*, RECT*, void*, DWORD, HANDLE);
+        typedef HRESULT(WINAPI* UNLOCK)(void*, void*);
+        DWORD desc[27];                                     /* DDSURFACEDESC, 108 bytes */
+        void** surface = NULL;
+
+        memset(desc, 0, sizeof(desc));
+        desc[0] = sizeof(desc);
+        desc[1] = 1;                                        /* DDSD_CAPS */
+        desc[26] = 0x200;                                   /* DDSCAPS_PRIMARYSURFACE */
+
+        if (((CREATESURFACE)((void**)*dd)[6])(dd, desc, &surface, NULL) != 0 || !surface)
+        {
+            printf("%s: CreateSurface failed\n", mode);
+            return 2;
+        }
+
+        desc[0] = sizeof(desc);
+        HRESULT locked = ((LOCK)((void**)*surface)[25])(surface, NULL, desc, 1 /* DDLOCK_WAIT */, NULL);
+
+        if (locked == 0)
+            ((UNLOCK)((void**)*surface)[32])(surface, NULL);
+
+        printf("%s: resumed, Lock %s\n", mode, locked == 0 ? "ok" : "failed");
+        pump(1500);
+    }
+
     /* The real GetForegroundWindow: cnc-ddraw patches the victim's import to answer with the game
      * window (found 2026-09-27; the watchdog in ddraw.dll calls the real one). */
     HWND(WINAPI * foreground)(void) = (void*)GetProcAddress(GetModuleHandleA("user32.dll"), "GetForegroundWindow");
@@ -409,7 +440,7 @@ int main(int argc, char** argv)
 
     printf("mode %s\n", mode);
 
-    if (strcmp(mode, "hang") == 0 || strcmp(mode, "idle") == 0 || strcmp(mode, "minimized") == 0 ||
+    if (strcmp(mode, "hang") == 0 || strcmp(mode, "resume") == 0 || strcmp(mode, "idle") == 0 || strcmp(mode, "minimized") == 0 ||
         strcmp(mode, "background") == 0)
         return hang(ddraw, mode);
 
