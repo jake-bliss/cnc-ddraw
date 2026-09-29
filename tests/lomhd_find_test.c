@@ -318,6 +318,47 @@ int main(void)
         background(42); draw_sprite(f1, 40, 60, 300, 100);
         expect("... in either pack order", (const char*[]){ "f1@300,100" }, 1);
 
+        /* A window never takes its whole's place. Touch only the whole's probe rows below the
+         * window, so the window's probes are the last to hit: the whole (still at 98%) is found
+         * first and the window must not replace it (found in review: nothing pinned this). */
+        {
+            LOMHD_PACK pk; PLACEMENT o[LOMHD_MAX_PLACEMENTS];
+            int rows[16], nr = 0;
+            begin(2); tp_add_sprite("tall", 40, 96, tall, 0); tp_add_sprite("strip__top", 40, 40, tall, 0);
+            background(40); draw_sprite(tall, 40, 96, 300, 100);
+            if (find(o, &pk) >= 0)
+            {
+                for (DWORD i = 0; i <= pk.table_mask && nr < 16; i++)
+                    if (pk.table[i].portrait == 0 && pk.table[i].row >= 40) rows[nr++] = pk.table[i].row;
+                lomhd_pack_free(&pk);
+            }
+            begin(2); tp_add_sprite("tall", 40, 96, tall, 0); tp_add_sprite("strip__top", 40, 40, tall, 0);
+            background(40); draw_sprite(tall, 40, 96, 300, 100);
+            for (int k = 0; k < nr; k++) damage_rows(300, 100, 40, rows[k], rows[k] + 1);
+            printf("    (%d probe rows below the window touched; whole keeps %d%%)\n", nr,
+                kept_percent(tall, 40, 96, 300, 100));
+            expect("the whole found first is not replaced by its window", (const char*[]){ "tall@300,100" }, 1);
+        }
+
+        /* A window is a frame's only if its pixels are the frame's: B has A's top rows with one
+         * pixel in sixteen changed, and passes where only A's window is drawn -- it must not be
+         * let past that window as if it were its whole (found in review: each content check in
+         * window_of could be removed with the suite still green). */
+        {
+            static BYTE ga[40 * 60], gb[40 * 60];
+            sprite(ga, 40, 60, 77);
+            memset(gb, 0, sizeof gb);
+            memcpy(gb, ga, 40 * 30);
+            for (int k = 0; k < 40 * 30; k += 16) if (gb[k] > 1) gb[k] = (BYTE)(gb[k] == 100 ? 101 : 100);
+            for (int j = 30; j < 33; j++) for (int i = 10; i < 30; i++) gb[j * 40 + i] = ga[j * 40 + i];
+            begin(3); tp_add_sprite("ga", 40, 60, ga, 0); tp_add_sprite("strip__ga", 40, 30, ga, 0);
+            tp_add_sprite("gb", 40, 60, gb, 0);
+            background(90); draw_sprite(ga, 40, 30, 200, 100);
+            printf("    (ga keeps %d%%, gb %d%%)\n", kept_percent(ga, 40, 60, 200, 100), kept_percent(gb, 40, 60, 200, 100));
+            expect("a look-alike of the window's frame does not pass over the window",
+                (const char*[]){ "strip__ga@200,100" }, 1);
+        }
+
         /* Two frames of one sprite that share their top rows both hold either one's window. With
          * each window right after its frame, the one drawn whole still beats both windows --
          * found in review of a version that linked each window to one frame by pack position. */
@@ -338,8 +379,9 @@ int main(void)
     }
 
     /* The strip: twelve windows in one band, each frame in the pack right before its window, as
-     * setup writes them. Each whole fails where its window stands and is tried once per spot, not
-     * once per probe hit (60 verifications before the failed ring, 36 with it). */
+     * setup writes them. Each whole fails where its window stands; once the window is found the
+     * whole is not scored there again (60 verifications before the failed ring, 36 with it: the
+     * window, and the whole before and once after its window is found). */
     {
         static BYTE units[12][40 * 60];
         static char names[12][2][24];
@@ -360,7 +402,7 @@ int main(void)
             windows += strncmp(pack.portraits[out[i].portrait].name, "strip__", 7) == 0;
         printf("    (%d verifications)\n", st.verifications);
         check_that("a strip of twelve: every window found, nothing else", n == 12 && windows == 12);
-        check_that("... each whole tried once at its spot (at most 3 verifications a unit)",
+        check_that("... wholes not re-scored where their window stands (at most 3 a unit)",
             st.verifications <= 36);
         if (n >= 0) lomhd_pack_free(&pack);
     }

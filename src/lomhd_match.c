@@ -17,7 +17,6 @@
 
 #define HASH_BASE 1000003ULL
 
-
 static WORD rgb565_truncate(const BYTE* c)
 {
     return (WORD)(((c[0] >> 3) << 11) | ((c[1] >> 2) << 5) | (c[2] >> 3));
