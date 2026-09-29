@@ -588,6 +588,10 @@ BOOL lomhd_pack_open(LOMHD_READ read, void* ctx, DWORD size, LOMHD_PACK* pack, D
     pack->probes = npending;
     free(pending);
 
+    for (int p = 0; p < count; p++)
+        pack->portraits[p].window = pack->portraits[p].masked &&
+            strncmp(pack->portraits[p].name, LOMHD_WINDOW_PREFIX, sizeof(LOMHD_WINDOW_PREFIX) - 1) == 0;
+
     pack->resident = sizeof(PORTRAIT) * count + sizeof(LOMHD_PALETTE) * pack->palette_count +
         sizeof(PROBE) * slots;
 
@@ -777,6 +781,24 @@ static BOOL same_spot(const PLACEMENT* a, const PORTRAIT* ra, int x, int y, cons
     return 2 * w * h >= smaller;
 }
 
+/* Whether `win`, one of setup's strip windows, is exactly the top rows of `frame`: same width and
+ * palette, and its runs and their pixels are the frame's first ones. Decided by content where the
+ * two meet, not by pack position -- two frames of one sprite can share their top rows, and then
+ * both frames hold the window. Only asked of records at one top-left, which is rare. */
+static BOOL window_of(const PORTRAIT* win, const PORTRAIT* frame)
+{
+    if (!win->window || frame->window || !frame->masked || frame->w != win->w || frame->h <= win->h ||
+        frame->nspans < win->nspans || memcmp(frame->pal, win->pal, sizeof(*win->pal)) != 0)
+        return FALSE;
+
+    /* The frame's runs after the window's must all lie below it (it may have none). */
+    if (memcmp(frame->spans, win->spans, sizeof(WORD) * 3 * win->nspans) != 0 ||
+        (frame->nspans > win->nspans && frame->spans[3 * win->nspans] < win->h))
+        return FALSE;
+
+    return memcmp(frame->opix, win->opix, win->opaque) == 0;
+}
+
 typedef struct
 {
     const LOMHD_PACK* pack;
@@ -785,6 +807,7 @@ typedef struct
     PLACEMENT* out;
     LOMHD_STATS stats;
     int band_verifications;             /* this band's sprite comparisons so far */
+    int failed[16][4], nfailed;         /* wholes that did not pass where their window was found */
     int matched_of[LOMHD_MAX_PLACEMENTS], total_of[LOMHD_MAX_PLACEMENTS];
 } SEARCH;
 
@@ -813,19 +836,54 @@ static void try_probes(SEARCH* s, unsigned long long h, int probe_width, int x, 
          * image seen again (another probe row, the other RGB565 rule) is just another candidate.
          * Needing more than the best rival lets the count stop early on repeats. Scores are
          * compared as fractions by cross-multiplying, in integers. */
+        /* A whole figure and a strip window cut from it (setup's strip__ records) share a top-left
+         * when the window is the figure's top rows. Where the whole is drawn and
+         * passes it is the better answer however the window scores -- the window is at 100%
+         * whenever the covered rows are all below it -- so it need not beat the window, and a
+         * window never replaces its whole. Any other pair at one spot is decided by score. */
         SCORING sc = scoring(r);
         int needed = sc.needed;
+        BOOL inside = FALSE, over_window = FALSE;
 
         for (int k = 0; k < s->found; k++)
         {
             const PORTRAIT* rk = &pack->portraits[out[k].portrait];
+
+            if (!same_spot(&out[k], rk, left, top, r))
+                continue;
+
+            /* Stored runs are compared, so only placements of one orientation. */
+            if (out[k].mirror == probe->mirror && window_of(r, rk))
+            {
+                inside = TRUE;
+                break;
+            }
+
+            if (out[k].mirror == probe->mirror && window_of(rk, r))
+            {
+                over_window = TRUE;
+                continue;
+            }
+
             int beat = (int)((long long)s->matched_of[k] * sc.total / s->total_of[k]) + 1;
 
-            if (same_spot(&out[k], rk, left, top, r) && beat > needed)
+            if (beat > needed)
                 needed = beat;
         }
 
-        if (needed > sc.total)
+        if (inside || needed > sc.total)
+            continue;
+
+        /* In the strip the whole usually fails (it passes only when the window holds 70% of it,
+         * and then drawing it is the same pixels), and each of its probe hits there would count
+         * it again: once is enough per spot and orientation. */
+        BOOL tried = FALSE;
+
+        for (int k = 0; over_window && k < s->nfailed && k < 16; k++)
+            tried |= s->failed[k][0] == probe->portrait && s->failed[k][1] == left && s->failed[k][2] == top &&
+                s->failed[k][3] == probe->mirror;
+
+        if (tried)
             continue;
 
         /* A frame no capture comes near -- a battle nobody has recorded -- must not stall the game:
@@ -842,7 +900,18 @@ static void try_probes(SEARCH* s, unsigned long long h, int probe_width, int x, 
         int matched = score(s->frame, s->pitch_px, left, top, r, probe->rule, probe->mirror, needed);
 
         if (matched < 0)
+        {
+            if (over_window)
+            {
+                int* f = s->failed[s->nfailed++ % 16];
+                f[0] = probe->portrait;
+                f[1] = left;
+                f[2] = top;
+                f[3] = probe->mirror;
+            }
+
             continue;
+        }
 
         /* It beats everything at its spot: drop those, then add it. */
         int kept = 0;

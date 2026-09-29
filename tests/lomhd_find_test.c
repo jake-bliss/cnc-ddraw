@@ -283,6 +283,130 @@ int main(void)
     background(25); draw_sprite(t1b, 40, 36, 60, 60);
     expect("... in either pack order", (const char*[]){ "t1b@60,60" }, 1);
 
+    /* A whole figure and the window of it a strip shows (setup's strip__ records): 40 of 96 rows,
+     * from the top, so both sit at one top-left. Where the whole figure is drawn and passes, it
+     * wins even with its lower rows covered -- the window is then at 100%, the whole below that. */
+    {
+        static BYTE tall[40 * 96];
+        sprite(tall, 40, 96, 31);
+        /* "top" is the first 40 rows of "tall": the same bytes, fewer rows. */
+        begin(2); tp_add_sprite("tall", 40, 96, tall, 0); tp_add_sprite("strip__top", 40, 40, tall, 0);
+        background(40); draw_sprite(tall, 40, 96, 300, 100); damage_rows(300, 100, 40, 77, 96);
+        printf("    (whole keeps %d%%)\n", kept_percent(tall, 40, 96, 300, 100));
+        expect("a whole figure, lower rows covered, beats its top window at one spot",
+            (const char*[]){ "tall@300,100" }, 1);
+        begin(2); tp_add_sprite("strip__top", 40, 40, tall, 0); tp_add_sprite("tall", 40, 96, tall, 0);
+        background(40); draw_sprite(tall, 40, 96, 300, 100); damage_rows(300, 100, 40, 77, 96);
+        expect("... in either pack order", (const char*[]){ "tall@300,100" }, 1);
+
+        begin(2); tp_add_sprite("tall", 40, 96, tall, 0); tp_add_sprite("strip__top", 40, 40, tall, 0);
+        background(41); draw_sprite(tall, 40, 40, 300, 100);
+        expect("only the window drawn: the window is found, the whole is not", (const char*[]){ "strip__top@300,100" }, 1);
+
+        /* Size is not enough: a taller look-alike sharing only some top rows is not a whole of the
+         * shorter frame, and the one drawn still wins on score (found in review of the first
+         * version of this rule, which went by rectangles). */
+        static BYTE f1[40 * 60], f2[40 * 64];
+        sprite(f1, 40, 60, 33);
+        sprite(f2, 40, 64, 33);
+        memcpy(f2, f1, 40 * 50);
+        begin(2); tp_add_sprite("f1", 40, 60, f1, 0); tp_add_sprite("f2", 40, 64, f2, 0);
+        background(42); draw_sprite(f1, 40, 60, 300, 100);
+        printf("    (the taller look-alike keeps %d%%)\n", kept_percent(f2, 40, 64, 300, 100));
+        expect("a taller look-alike does not beat the shorter frame drawn", (const char*[]){ "f1@300,100" }, 1);
+        begin(2); tp_add_sprite("f2", 40, 64, f2, 0); tp_add_sprite("f1", 40, 60, f1, 0);
+        background(42); draw_sprite(f1, 40, 60, 300, 100);
+        expect("... in either pack order", (const char*[]){ "f1@300,100" }, 1);
+
+        /* A window never takes its whole's place. Touch only the whole's probe rows below the
+         * window, so the window's probes are the last to hit: the whole (still at 98%) is found
+         * first and the window must not replace it (found in review: nothing pinned this). */
+        {
+            LOMHD_PACK pk; PLACEMENT o[LOMHD_MAX_PLACEMENTS];
+            int rows[16], nr = 0;
+            begin(2); tp_add_sprite("tall", 40, 96, tall, 0); tp_add_sprite("strip__top", 40, 40, tall, 0);
+            background(40); draw_sprite(tall, 40, 96, 300, 100);
+            if (find(o, &pk) >= 0)
+            {
+                for (DWORD i = 0; i <= pk.table_mask && nr < 16; i++)
+                    if (pk.table[i].portrait == 0 && pk.table[i].row >= 40) rows[nr++] = pk.table[i].row;
+                lomhd_pack_free(&pk);
+            }
+            begin(2); tp_add_sprite("tall", 40, 96, tall, 0); tp_add_sprite("strip__top", 40, 40, tall, 0);
+            background(40); draw_sprite(tall, 40, 96, 300, 100);
+            for (int k = 0; k < nr; k++) damage_rows(300, 100, 40, rows[k], rows[k] + 1);
+            printf("    (%d probe rows below the window touched; whole keeps %d%%)\n", nr,
+                kept_percent(tall, 40, 96, 300, 100));
+            expect("the whole found first is not replaced by its window", (const char*[]){ "tall@300,100" }, 1);
+        }
+
+        /* A window is a frame's only if its pixels are the frame's: B has A's top rows with one
+         * pixel in sixteen changed, and passes where only A's window is drawn -- it must not be
+         * let past that window as if it were its whole (found in review: each content check in
+         * window_of could be removed with the suite still green). */
+        {
+            static BYTE ga[40 * 60], gb[40 * 60];
+            sprite(ga, 40, 60, 77);
+            memset(gb, 0, sizeof gb);
+            memcpy(gb, ga, 40 * 30);
+            for (int k = 0; k < 40 * 30; k += 16) if (gb[k] > 1) gb[k] = (BYTE)(gb[k] == 100 ? 101 : 100);
+            for (int j = 30; j < 33; j++) for (int i = 10; i < 30; i++) gb[j * 40 + i] = ga[j * 40 + i];
+            begin(3); tp_add_sprite("ga", 40, 60, ga, 0); tp_add_sprite("strip__ga", 40, 30, ga, 0);
+            tp_add_sprite("gb", 40, 60, gb, 0);
+            background(90); draw_sprite(ga, 40, 30, 200, 100);
+            printf("    (ga keeps %d%%, gb %d%%)\n", kept_percent(ga, 40, 60, 200, 100), kept_percent(gb, 40, 60, 200, 100));
+            expect("a look-alike of the window's frame does not pass over the window",
+                (const char*[]){ "strip__ga@200,100" }, 1);
+        }
+
+        /* Two frames of one sprite that share their top rows both hold either one's window. With
+         * each window right after its frame, the one drawn whole still beats both windows --
+         * found in review of a version that linked each window to one frame by pack position. */
+        static BYTE fa[40 * 60], fb[40 * 60];
+        sprite(fa, 40, 60, 34);
+        sprite(fb, 40, 60, 35);
+        memcpy(fb, fa, 40 * 30);
+        begin(4); tp_add_sprite("fa", 40, 60, fa, 0); tp_add_sprite("strip__fa", 40, 20, fa, 0);
+        tp_add_sprite("fb", 40, 60, fb, 0); tp_add_sprite("strip__fb", 40, 20, fb, 0);
+        background(43); draw_sprite(fb, 40, 60, 300, 100); damage_rows(300, 100, 40, 52, 60);
+        expect("a frame sharing its top rows with another beats both windows", (const char*[]){ "fb@300,100" }, 1);
+
+        /* Only setup's strip windows are windows: the same pair under ordinary names is decided by
+         * score, like any two frames at one spot (the top rows win at 100%). */
+        begin(2); tp_add_sprite("tall", 40, 96, tall, 0); tp_add_sprite("top", 40, 40, tall, 0);
+        background(40); draw_sprite(tall, 40, 96, 300, 100); damage_rows(300, 100, 40, 77, 96);
+        expect("an ordinary frame that is another's top rows is not a window", (const char*[]){ "top@300,100" }, 1);
+    }
+
+    /* The strip: twelve windows in one band, each frame in the pack right before its window, as
+     * setup writes them. Each whole fails where its window stands; once the window is found the
+     * whole is not scored there again (60 verifications before the failed ring, 36 with it: the
+     * window, and the whole before and once after its window is found). */
+    {
+        static BYTE units[12][40 * 60];
+        static char names[12][2][24];
+        begin(24);
+        background(44);
+        for (int u = 0; u < 12; u++)
+        {
+            sprite(units[u], 40, 60, 50 + u);
+            snprintf(names[u][0], sizeof names[u][0], "unit%02d", u);
+            snprintf(names[u][1], sizeof names[u][1], "strip__unit%02d", u);
+            tp_add_sprite(names[u][0], 40, 60, units[u], 0);
+            tp_add_sprite(names[u][1], 40, 30, units[u], 0);
+            draw_sprite(units[u], 40, 30, 10 + 52 * u, 400);
+        }
+        LOMHD_PACK pack; PLACEMENT out[LOMHD_MAX_PLACEMENTS]; LOMHD_STATS st;
+        int n = find_stats(out, &pack, &st), windows = 0;
+        for (int i = 0; i < n; i++)
+            windows += strncmp(pack.portraits[out[i].portrait].name, "strip__", 7) == 0;
+        printf("    (%d verifications)\n", st.verifications);
+        check_that("a strip of twelve: every window found, nothing else", n == 12 && windows == 12);
+        check_that("... wholes not re-scored where their window stands (at most 3 a unit)",
+            st.verifications <= 36);
+        if (n >= 0) lomhd_pack_free(&pack);
+    }
+
     /* A forest: as many copies as there are placements. */
     {
         static char names[LOMHD_MAX_PLACEMENTS][16];
