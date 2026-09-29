@@ -17,6 +17,8 @@
 
 #define HASH_BASE 1000003ULL
 
+static int whole_of(const PORTRAIT* all, int count, int p);
+
 static WORD rgb565_truncate(const BYTE* c)
 {
     return (WORD)(((c[0] >> 3) << 11) | ((c[1] >> 2) << 5) | (c[2] >> 3));
@@ -588,6 +590,9 @@ BOOL lomhd_pack_open(LOMHD_READ read, void* ctx, DWORD size, LOMHD_PACK* pack, D
     pack->probes = npending;
     free(pending);
 
+    for (int p = 0; p < count; p++)
+        pack->portraits[p].whole = whole_of(pack->portraits, count, p);
+
     pack->resident = sizeof(PORTRAIT) * count + sizeof(LOMHD_PALETTE) * pack->palette_count +
         sizeof(PROBE) * slots;
 
@@ -606,6 +611,43 @@ corrupt:
     *bad_offset = (DWORD)(pos > size ? size : pos);
     lomhd_pack_free(pack);
     return FALSE;
+}
+
+/* The record this sprite is the top rows of, or -1. Setup writes a strip window right after the
+ * frame it was cut from (a repeat's window after the frame kept), so only the few records around
+ * it are looked at; it is a window only if its runs and their pixels are exactly the first ones of
+ * that frame, which none of a look-alike's are. */
+static int whole_of(const PORTRAIT* all, int count, int p)
+{
+    const PORTRAIT* r = &all[p];
+
+    if (!r->masked)
+        return -1;
+
+    for (int q = p - 3; q <= p + 3; q++)
+    {
+        if (q < 0 || q >= count || q == p)
+            continue;
+
+        const PORTRAIT* w = &all[q];
+
+        if (!w->masked || w->w != r->w || w->h <= r->h || w->nspans <= r->nspans ||
+            memcmp(w->pal, r->pal, sizeof(*r->pal)) != 0)
+            continue;
+
+        if (memcmp(w->spans, r->spans, sizeof(WORD) * 3 * r->nspans) != 0 || w->spans[3 * r->nspans] < r->h)
+            continue;
+
+        int pixels = 0;
+
+        for (int k = 0; k < r->nspans; k++)
+            pixels += r->spans[3 * k + 2];
+
+        if (pixels == r->opaque && memcmp(w->opix, r->opix, pixels) == 0)
+            return q;
+    }
+
+    return -1;
 }
 
 static BOOL is_large(const PORTRAIT* r)
@@ -777,15 +819,6 @@ static BOOL same_spot(const PLACEMENT* a, const PORTRAIT* ra, int x, int y, cons
     return 2 * w * h >= smaller;
 }
 
-/* A sprite whose rectangle holds another's, both at one top-left: a whole figure and the window
- * of it a strip shows (setup's strip__ records). Where the whole figure is drawn and passes, it
- * is the better answer however the part scores -- the part is at 100% whenever the covered rows
- * are all outside it. */
-static BOOL holds(const PORTRAIT* a, const PORTRAIT* b)
-{
-    return a->w >= b->w && a->h >= b->h && (a->w > b->w || a->h > b->h);
-}
-
 typedef struct
 {
     const LOMHD_PACK* pack;
@@ -794,6 +827,7 @@ typedef struct
     PLACEMENT* out;
     LOMHD_STATS stats;
     int band_verifications;             /* this band's sprite comparisons so far */
+    int failed[8][3], nfailed;          /* wholes that did not pass where their window was found */
     int matched_of[LOMHD_MAX_PLACEMENTS], total_of[LOMHD_MAX_PLACEMENTS];
 } SEARCH;
 
@@ -822,9 +856,14 @@ static void try_probes(SEARCH* s, unsigned long long h, int probe_width, int x, 
          * image seen again (another probe row, the other RGB565 rule) is just another candidate.
          * Needing more than the best rival lets the count stop early on repeats. Scores are
          * compared as fractions by cross-multiplying, in integers. */
+        /* A whole figure and a strip window cut from it (setup's strip__ records, PORTRAIT.whole)
+         * share a top-left when the window is the figure's top rows. Where the whole is drawn and
+         * passes it is the better answer however the window scores -- the window is at 100%
+         * whenever the covered rows are all below it -- so it need not beat the window, and a
+         * window never replaces its whole. Any other pair at one spot is decided by score. */
         SCORING sc = scoring(r);
         int needed = sc.needed;
-        BOOL inside = FALSE;
+        BOOL inside = FALSE, over_window = FALSE;
 
         for (int k = 0; k < s->found; k++)
         {
@@ -833,14 +872,17 @@ static void try_probes(SEARCH* s, unsigned long long h, int probe_width, int x, 
             if (!same_spot(&out[k], rk, left, top, r))
                 continue;
 
-            if (r->masked && holds(rk, r))
+            if (r->whole == out[k].portrait)
             {
-                inside = TRUE;          /* the whole figure is already found here */
+                inside = TRUE;
                 break;
             }
 
-            if (r->masked && holds(r, rk))
-                continue;               /* passing on its own is enough to replace the part */
+            if (rk->whole == probe->portrait)
+            {
+                over_window = TRUE;
+                continue;
+            }
 
             int beat = (int)((long long)s->matched_of[k] * sc.total / s->total_of[k]) + 1;
 
@@ -849,6 +891,16 @@ static void try_probes(SEARCH* s, unsigned long long h, int probe_width, int x, 
         }
 
         if (inside || needed > sc.total)
+            continue;
+
+        /* In the strip the whole never passes, and each of its probe hits there would count it
+         * again: once is enough per spot. */
+        BOOL tried = FALSE;
+
+        for (int k = 0; over_window && k < s->nfailed && k < 8; k++)
+            tried |= s->failed[k][0] == probe->portrait && s->failed[k][1] == left && s->failed[k][2] == top;
+
+        if (tried)
             continue;
 
         /* A frame no capture comes near -- a battle nobody has recorded -- must not stall the game:
@@ -865,7 +917,17 @@ static void try_probes(SEARCH* s, unsigned long long h, int probe_width, int x, 
         int matched = score(s->frame, s->pitch_px, left, top, r, probe->rule, probe->mirror, needed);
 
         if (matched < 0)
+        {
+            if (over_window)
+            {
+                int* f = s->failed[s->nfailed++ % 8];
+                f[0] = probe->portrait;
+                f[1] = left;
+                f[2] = top;
+            }
+
             continue;
+        }
 
         /* It beats everything at its spot: drop those, then add it. */
         int kept = 0;

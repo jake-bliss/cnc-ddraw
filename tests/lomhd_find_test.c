@@ -285,7 +285,7 @@ int main(void)
 
     /* A whole figure and the window of it a strip shows (setup's strip__ records): 40 of 96 rows,
      * from the top, so both sit at one top-left. Where the whole figure is drawn and passes, it
-     * wins even with its lower rows covered -- the window is then at 100%, the whole at 80%. */
+     * wins even with its lower rows covered -- the window is then at 100%, the whole below that. */
     {
         static BYTE tall[40 * 96];
         sprite(tall, 40, 96, 31);
@@ -302,6 +302,21 @@ int main(void)
         begin(2); tp_add_sprite("tall", 40, 96, tall, 0); tp_add_sprite("top", 40, 40, tall, 0);
         background(41); draw_sprite(tall, 40, 40, 300, 100);
         expect("only the window drawn: the window is found, the whole is not", (const char*[]){ "top@300,100" }, 1);
+
+        /* Size is not enough: a taller look-alike sharing only some top rows is not a whole of the
+         * shorter frame, and the one drawn still wins on score (found in review of the first
+         * version of this rule, which went by rectangles). */
+        static BYTE f1[40 * 60], f2[40 * 64];
+        sprite(f1, 40, 60, 33);
+        sprite(f2, 40, 64, 33);
+        memcpy(f2, f1, 40 * 50);
+        begin(2); tp_add_sprite("f1", 40, 60, f1, 0); tp_add_sprite("f2", 40, 64, f2, 0);
+        background(42); draw_sprite(f1, 40, 60, 300, 100);
+        printf("    (the taller look-alike keeps %d%%)\n", kept_percent(f2, 40, 64, 300, 100));
+        expect("a taller look-alike does not beat the shorter frame drawn", (const char*[]){ "f1@300,100" }, 1);
+        begin(2); tp_add_sprite("f2", 40, 64, f2, 0); tp_add_sprite("f1", 40, 60, f1, 0);
+        background(42); draw_sprite(f1, 40, 60, 300, 100);
+        expect("... in either pack order", (const char*[]){ "f1@300,100" }, 1);
     }
 
     /* A forest: as many copies as there are placements. */
