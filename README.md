@@ -15,9 +15,129 @@ What the fork adds, all in `src/lomhd*.c` and `inc/lomhd*.h`, with one-line hook
 - **Terrain art from a folder** (`lomhd_files.c`): serves `til\*` from `lomhd_terrain\til\` beside
   the exe instead of `pic.mpq`, so installing it never rewrites the game's archive.
 - **A surface trace** (`lomhd_trace.c`): off unless a file named `lomhd_trace` sits beside the game.
+- **Crash and hang reports** (`lomhd_crash.c`, `lomhd_crash_core.c`): see below.
 
 Everything is inert for any other game, and the terrain parts for any exe but the patched one. The
 upstream README follows; cnc-ddraw is MIT licensed (see `LICENSE`), and so are the additions.
+
+### Crash and hang reports
+
+When `lomse.exe` dies of an exception nothing handled, the DLL writes two files beside it before the
+usual crash dialog (Windows Error Reporting, or Wine's) appears:
+
+- `lomhd_crash_YYYYMMDD_HHMMSS.txt`, meant to be read: the exception and its address as
+  module+offset (lomse, storm, ddraw or other), the faulting read/write and its target, all
+  registers and the code bytes at EIP, 64 stack dwords with every value that points into a module
+  annotated, the last few first-chance exceptions (marked as possibly handled), the module list,
+  the exe's size, PE timestamp and SHA-256 (hashed once at startup), this DLL's version and commit,
+  the pack and terrain state, and the last 30 lines of `lomhd.log`. It shows the exe's full path,
+  so it names the install folder (and on Windows usually the user name).
+- `lomhd_crash_YYYYMMDD_HHMMSS.dmp`, a minidump (threads, stacks, modules, and the data segments of
+  the game, Storm and this DLL). About 12 KB under Wine 10 for an ordinary crash, whose dbghelp
+  writes the stacks but not the data segments; about 2 MB after a stack overflow (the whole spent
+  stack). Not yet measured on Windows, where the data segments are included. A minidump names the
+  install folder, and on Windows usually the user: its module list holds full paths, and the
+  game's, Storm's and this DLL's memory and the thread stacks hold more. Treat a `.dmp` as private
+  and share it only on purpose.
+
+A **hang** writes `lomhd_hang_YYYYMMDD_HHMMSS.txt` with the window thread's registers and stack. It
+counts as a hang only when all of these hold: the game window's thread has made no DirectDraw call
+(Blt, BltFast, Flip, Lock, Unlock) for 20 seconds, the window was in front and not minimized for
+all of that time, and Windows or Wine itself calls the window hung (it is not pumping messages) --
+so a menu idling in `GetMessage` is not a hang. "In front" includes the ghost window Windows puts
+in place of a window that has stopped responding (`HungWindowFromGhostWindow`); Wine does not ghost. The thread is suspended only for as long as it
+takes to read its registers and copy its stack; nothing else about the game is touched. One report
+per hang, at most three per session.
+
+To turn them off, put an empty file beside the game: `lomhd_no_hang_reports` stops the hang
+watchdog only, `lomhd_no_crash_reports` stops both. (Files rather than `ddraw.ini` keys, like
+`lomhd_debug` and `lomhd_trace`: the Steam install has no `ddraw.ini`.) For any exe other than
+`lomse*.exe` the reporter is off unless a file named `lomhd_crash_reports` is there.
+
+Only **unhandled** exceptions produce a report. The reporter is the process's top-level
+(`SetUnhandledExceptionFilter`) filter, which Windows and Wine call only after every other handler
+has declined, never for an exception that is caught. When the game or Storm installs a filter of its
+own, the report is written first and theirs runs after it, with the result it returns. Ours is
+installed as one of eight entry points, one per level of the chain, so that a filter's saved
+"previous filter" says where in the chain it sits:
+
+1. cnc-ddraw patches `SetUnhandledExceptionFilter` in the import table of every module in the game
+   folder (upstream did this for debug builds; this fork does it for all builds). A call through a
+   patched import is recorded as the game's filter instead of replacing ours, and gets back what
+   the real call would have returned, so a filter that chains to its predecessor still reaches it.
+2. A call that goes around the patched imports (`GetProcAddress`, or a module outside the game
+   folder) does replace ours. Once a second the reporter puts ours back on top and runs the
+   newcomer after the report. When the newcomer chains to its predecessor (ours, one level down),
+   the chain continues below it; when it uninstalls itself by restoring that predecessor, it is
+   dropped from the chain and never called again. A filter already in the chain is never added
+   twice. A crash in the second between a replacement and the re-assert is the one that is missed.
+   Changes to the chain are noted in `lomhd.log`.
+
+If the game's filter resumes execution (`EXCEPTION_CONTINUE_EXECUTION`) the report gains an
+"Outcome" line saying it was not a crash, `lomhd.log` says so, and it does not count against the
+four reports a session may write.
+
+The report is written by a helper thread created at startup. The crashing thread copies its
+exception record and registers into one of two request slots, signals the helper, and waits until
+a single deadline ten seconds after it entered -- however long it spent queued behind another
+crashing thread -- then carries on to the game's filter whatever happened. So a report that stalls
+(dbghelp waiting on a lock the crashing thread holds, say) can delay the game's end by ten seconds
+but never stop it. A request the crashing thread gave up on stays the helper's until it finishes,
+and the helper works only from the copies, never from the crashing thread's stack. The crashing
+thread's own share is a copy, a few interlocked operations, an event and a wait: `-fstack-usage`
+measures 4 bytes for the entry point and 68 for the function behind it (with the handoff and the
+chain call inlined), plus 24 for the bounded lock and 8 for its backoff, which is why a stack overflow gets a report and a minidump too. The text is
+flushed before the minidump is attempted, and both are closed before any other filter runs when the
+helper finishes in time, so whatever happens next -- a dialog, `ExitProcess`, or a hang in some
+DLL's shutdown code -- the report is already on disk. The module list comes from walking memory
+(VirtualQuery, ReadProcessMemory and each image's PE headers, every offset bounds-checked), not
+Toolhelp, so no part of the reporter takes the loader lock.
+
+Nothing the reporter does at startup takes the loader lock: dbghelp is loaded on the helper when
+a report needs a minidump, after the text is written, and every other lookup happens in `DllMain`,
+which holds that lock already. For its first 1.5 seconds the reporter thread does nothing but
+wait, and its exe hash reads into a static buffer rather than the C runtime's heap. The reason:
+`ExitProcess` ends every other thread wherever it is, and a thread ended while holding a lock --
+the loader lock, a heap lock -- leaves it held for everything that runs at exit, `DllMain` detach
+included, which then hangs. A game that exits at once (a failed check at launch) now always finds
+the reporter idle. On Wine 10, measured with the victim's `caught` mode (crash and exit
+immediately after loading): loading dbghelp at startup hung 32 runs in 50; with dbghelp loaded
+lazily, 5 in about 330; with the hash's `malloc` gone as well, 1 in 300; with the quiet start,
+0 in 300. With the reporter off entirely, 0 in 200. The reporter's regular work later on -- a few user32 calls
+every quarter second while the game window exists -- is exposed the same way, briefly, as
+upstream's render thread is all the time.
+
+Limits:
+
+- A crash on a thread that holds the process heap lock (a crash inside `HeapFree` on a corrupted
+  heap is the common case) gets no report: opening the report file allocates, so the helper waits
+  on that lock until the deadline. `lomhd.log` still gets the first-chance line.
+- The helper and the reporter thread wait on the thread that loaded `ddraw.dll`, and exit when it
+  ends. For `lomse.exe`, which imports `ddraw.dll`, that is the game's main thread. A host that
+  loads `ddraw.dll` on a worker thread loses reporting when that worker ends; any host loses it for
+  crashes after its main thread has ended.
+- A process whose main thread has ended can still be kept alive by threads that have not: upstream
+  cnc-ddraw's render thread does this already, and so does a report helper that is blocked inside a
+  report (on a lock the dead thread held, say) when the main thread ends. The reporter never calls
+  `TerminateProcess` to force the issue.
+
+The DLL pins itself in memory when the reporter is on, so the filter can never point into an
+unloaded DLL.
+An exception the game *catches* and then exits on produces no report; the first ten such
+exceptions inside the game's exe, Storm or ddraw are noted in `lomhd.log` as "first-chance ... may
+have been handled" -- by the reporter thread within a quarter second, and otherwise as this DLL
+detaches at exit, which is before any DLL detached after it (Storm, say) can hang. That line is
+where to look when the game closes or hangs with no report.
+
+`tests/lomhd_crash_test.c` covers the report text, module+offset annotation, the log ring buffer,
+the file names, SHA-256 and the filter-chain bookkeeping natively. `tests/lomhd_crash_victim.c` is a
+program that loads the built `ddraw.dll` and crashes, hangs or idles on purpose, and
+`tests/lomhd_crash_victim.sh` runs every mode under Wine in a scratch prefix, asserting each one's
+exit code and report files.
+
+The DLL records one version string: `cnc-ddraw 7.1.0.0, lomhd <LOMHD_VERSION>, git <commit>`.
+`LOMHD_VERSION` is a make variable (default `dev`); the commit is the only value taken from git, so
+one commit builds the same bytes whatever branch it is on.
 
 ---
 

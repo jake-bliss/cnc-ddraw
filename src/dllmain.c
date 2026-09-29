@@ -133,7 +133,9 @@ BOOL WINAPI DllMain(HANDLE hDll, DWORD dwReason, LPVOID lpReserved)
                 set_aware();
         }
 
+        lomhd_path_init();
         lomhd_files_install();
+        lomhd_crash_install();
 
         /* Make sure screensaver will stay off and monitors will stay on */
         SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED);
@@ -174,6 +176,8 @@ BOOL WINAPI DllMain(HANDLE hDll, DWORD dwReason, LPVOID lpReserved)
         {
             SystemParametersInfoA(SPI_SETSCREENSAVEACTIVE, TRUE, NULL, 0);
         }
+
+        lomhd_crash_exit(lpReserved != NULL);
 
         ULONG(WINAPI* remove_handler)(PVOID) =
             (void*)real_GetProcAddress(GetModuleHandleA("Kernel32.dll"), "RemoveVectoredExceptionHandler");

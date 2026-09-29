@@ -1,5 +1,8 @@
 #include "inc/version.h"
 #include "inc/git.h"
+#ifndef LOMHD_VERSION /* git.h from the Makefile has it; the MSVC project's does not */
+#define LOMHD_VERSION "dev"
+#endif
 
 
 1 VERSIONINFO
@@ -12,13 +15,13 @@ PRODUCTVERSION VERSION
         {
             VALUE "CompanyName", "github.com/FunkyFr3sh"
             VALUE "FileDescription", "DirectDraw replacement"
-            VALUE "FileVersion", VERSION_STRING " (git~" GIT_COMMIT ", " GIT_BRANCH ")"
+            VALUE "FileVersion", VERSION_STRING " (git~" GIT_COMMIT ", lomhd " LOMHD_VERSION ")"
             VALUE "InternalName", "ddraw"
             VALUE "LegalCopyright", "Copyright (c) 2010-2024"
             VALUE "LegalTrademarks", ""
             VALUE "OriginalFileName", "ddraw.dll"
             VALUE "ProductName", "cnc-ddraw"
-            VALUE "ProductVersion", VERSION_STRING " (git~" GIT_COMMIT ", " GIT_BRANCH ")"
+            VALUE "ProductVersion", VERSION_STRING " (git~" GIT_COMMIT ", lomhd " LOMHD_VERSION ")"
             VALUE "Comments", "https://github.com/FunkyFr3sh/cnc-ddraw"
         }
     }

@@ -48,6 +48,25 @@ void lomhd_files_install(void);
 BOOL lomhd_files_on(void);
 long lomhd_files_served(void);
 
+/* Finds the game folder, once; called from DllMain so no other thread ever needs the loader lock
+ * for it. */
+void lomhd_path_init(void);
+
+/* Appends a line to lomhd.log beside the game, from any thread. */
+void lomhd_log(const char* line);
+
+/* lomhd_portraits.pack as the worker last found it, for crash reports. Never NULL. */
+const char* lomhd_pack_state(void);
+
+/* Crash and hang reports; see lomhd_crash.c. Install from DllMain before hook_init, so the patched
+ * SetUnhandledExceptionFilter (lomhd_crash_set_filter) finds ours in place. The beat is progress
+ * on the game window's thread, for the hang watchdog; the log line feeds the report's log tail. */
+void lomhd_crash_install(void);
+void lomhd_crash_exit(BOOL process_exit);
+LPTOP_LEVEL_EXCEPTION_FILTER lomhd_crash_set_filter(LPTOP_LEVEL_EXCEPTION_FILTER filter);
+void lomhd_crash_beat(void);
+void lomhd_crash_log_line(const char* line);
+
 /* Surface traffic trace, for designing the HD terrain composite. Off unless lomhd_trace sits beside
  * the game; see lomhd_trace.c. Safe to call from any thread. */
 void lomhd_trace_surface(const void* s, DWORD width, DWORD height, DWORD bpp, DWORD caps, LONG pitch,

@@ -47,6 +47,11 @@ static DWORD g_frame_w, g_frame_h, g_frame_bpp;
 static HANDLE g_pack_file;                  /* worker only */
 static LOMHD_PACK g_pack;
 
+/* For crash reports: written once by the worker, read by anyone. The pointer is published after
+ * the text is complete. */
+static char g_pack_state_text[160];
+static const char* volatile g_pack_state = "lomhd_portraits.pack: not opened yet";
+
 /* Per picture, what has been loaded. The state is the handover between the two threads:
  *   NONE -> REQUESTED   render thread, when the picture is found and not loaded
  *   REQUESTED -> READY  worker, after filling rgb (and idx for a large picture); or -> FAILED
@@ -102,7 +107,14 @@ static int g_seen_count;
 /* Files (worker thread only)                                                                  */
 /* ------------------------------------------------------------------------------------------- */
 
-static void lomhd_path(char* out, size_t size, const char* name)
+/* The game folder, found once. GetModuleFileName takes the loader lock (on Wine as on Windows),
+ * and ExitProcess can end a thread that holds it -- after which every DLL's detach hangs. So
+ * lomhd_path_init runs in DllMain, which holds that lock already, and our threads only read the
+ * copy. (Found 2026-09-27 with the crash reporter's thread; lomhd.log's writers are the same.) */
+static char g_game_dir[MAX_PATH];
+static volatile LONG g_game_dir_ready;
+
+void lomhd_path_init(void)
 {
     char exe[MAX_PATH];
     DWORD n = GetModuleFileNameA(NULL, exe, sizeof(exe));
@@ -117,21 +129,23 @@ static void lomhd_path(char* out, size_t size, const char* name)
     else
         exe[0] = 0;
 
-    _snprintf(out, size, "%s\\%s", exe, name);
+    memcpy(g_game_dir, exe, sizeof(g_game_dir));
+    InterlockedExchange(&g_game_dir_ready, 1);
+}
+
+static void lomhd_path(char* out, size_t size, const char* name)
+{
+    if (!g_game_dir_ready)
+        lomhd_path_init();
+
+    _snprintf(out, size, "%s\\%s", g_game_dir, name);
     out[size - 1] = 0;
 }
 
-static void lomhd_log(const char* line)
+/* Any thread: each line opens, appends and closes. Every line also goes to the crash reporter's
+ * in-memory tail, so a crash report carries the last of the log without reading a file. */
+void lomhd_log(const char* line)
 {
-    char path[MAX_PATH];
-    lomhd_path(path, sizeof(path), "lomhd.log");
-
-    HANDLE f = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-        OPEN_ALWAYS, 0, NULL);
-
-    if (f == INVALID_HANDLE_VALUE)
-        return;
-
     SYSTEMTIME t;
     GetLocalTime(&t);
 
@@ -140,7 +154,21 @@ static void lomhd_log(const char* line)
         t.wHour, t.wMinute, t.wSecond, line);
 
     if (len < 0 || len >= (int)sizeof(stamped))
+    {
         len = (int)sizeof(stamped) - 1;
+        stamped[len] = 0;
+    }
+
+    lomhd_crash_log_line(stamped);
+
+    char path[MAX_PATH];
+    lomhd_path(path, sizeof(path), "lomhd.log");
+
+    HANDLE f = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+        OPEN_ALWAYS, 0, NULL);
+
+    if (f == INVALID_HANDLE_VALUE)
+        return;
 
     DWORD written;
     WriteFile(f, stamped, (DWORD)len, &written, NULL);
@@ -204,6 +232,23 @@ static BOOL pack_read(void* ctx, DWORD off, DWORD len, BYTE* out)
         ReadFile(f, out, len, &got, NULL) && got == len;
 }
 
+const char* lomhd_pack_state(void)
+{
+    return g_pack_state;
+}
+
+/* The pack's name, not its path: the crash report shows the folder once, in its Exe line. */
+static void pack_state(const char* path, const char* what, long a, long b)
+{
+    (void)path;
+    _snprintf(g_pack_state_text, sizeof(g_pack_state_text), "lomhd_portraits.pack: ");
+    g_pack_state_text[sizeof(g_pack_state_text) - 1] = 0;
+    size_t used = strlen(g_pack_state_text);
+    _snprintf(g_pack_state_text + used, sizeof(g_pack_state_text) - used, what, a, b);
+    g_pack_state_text[sizeof(g_pack_state_text) - 1] = 0;
+    InterlockedExchangePointer((PVOID volatile*)&g_pack_state, g_pack_state_text);
+}
+
 static BOOL lomhd_load_pack(void)
 {
     char path[MAX_PATH];
@@ -214,6 +259,7 @@ static BOOL lomhd_load_pack(void)
     if (g_pack_file == INVALID_HANDLE_VALUE)
     {
         g_pack_file = NULL;
+        pack_state(path, "not found, overlay off", 0, 0);
         lomhd_log("pack: lomhd_portraits.pack not found -- overlay off, game unchanged");
         return FALSE;
     }
@@ -228,6 +274,7 @@ static BOOL lomhd_load_pack(void)
      * refused every pack it could read (Claude review, 2026-09-23). */
     if (lomhd_pack_version((const BYTE*)head, got) == LOMHD_PACK_OTHER_VERSION)
     {
+        pack_state(path, "refused, made by a different setup version", 0, 0);
         lomhd_log("pack: made by a different setup version -- run lomhd_setup.py again. Overlay off");
         return FALSE;
     }
@@ -236,6 +283,7 @@ static BOOL lomhd_load_pack(void)
 
     if (!lomhd_pack_open(pack_read, g_pack_file, size, &g_pack, &bad))
     {
+        pack_state(path, "refused, corrupt near byte %ld of %ld", (long)bad, (long)size);
         lomhd_logf("pack: unreadable or corrupt near byte %ld of %ld -- overlay off",
             (long)bad, (long)size, 0);
         return FALSE;
@@ -245,9 +293,12 @@ static BOOL lomhd_load_pack(void)
 
     if (!g_img)
     {
+        pack_state(path, "out of memory, overlay off", 0, 0);
         lomhd_log("pack: out of memory -- overlay off");
         return FALSE;
     }
+
+    pack_state(path, "format %ld, %ld images, loaded", (long)(LOMHD_PACK_MAGIC[7] - '0'), (long)g_pack.count);
 
     /* The probe width doubles as a build check: a stale object linked against an older
      * LOMHD_PACK layout once printed a pointer here instead of the width (2026-09-22). */

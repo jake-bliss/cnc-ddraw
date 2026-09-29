@@ -36,6 +36,7 @@
 
 #define LOMHD_FLAG_MASKED 1             /* a sprite: see lomhd_pack_open */
 #define LOMHD_FLAG_MIRROR 2             /* a sprite the game also draws flipped left to right */
+#define LOMHD_WINDOW_PREFIX "strip__"  /* setup's names for a window of a sprite frame */
 
 /* Reads len bytes at offset of the pack file into out; FALSE on any failure. */
 typedef BOOL (*LOMHD_READ)(void* ctx, DWORD offset, DWORD len, BYTE* out);
@@ -67,6 +68,8 @@ typedef struct
     WORD* spans;                        /* sprites: (row, col, length) of every opaque run ... */
     BYTE* opix;                         /* ... and those runs' indices, back to back */
     int nspans;
+    BOOL window;                        /* one of setup's strip windows (LOMHD_WINDOW_PREFIX): the
+                                         * top rows of a frame, see window_of */
     DWORD idx_off, idx_len;             /* zlib(w*h indices) in the pack file */
     DWORD hd_off, hd_len;               /* zlib(hw*hh*3 RGB, or *4 RGBA if masked) in the pack */
 } PORTRAIT;

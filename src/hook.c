@@ -204,7 +204,7 @@ HOOKLIST g_hook_hooklist[] =
             { "GetDiskFreeSpaceA", (PROC)fake_GetDiskFreeSpaceA, (PROC*)&real_GetDiskFreeSpaceA, 0 },
             { "GetVersion", (PROC)fake_GetVersion, (PROC*)&real_GetVersion, 0 },
             { "GetVersionExA", (PROC)fake_GetVersionExA, (PROC*)&real_GetVersionExA, 0 },
-#if defined(_DEBUG) && defined(__GNUC__)
+#if defined(__GNUC__) /* all builds: the lomhd crash reporter chains the game's filter (lomhd_crash.c) */
             { "SetUnhandledExceptionFilter", (PROC)fake_SetUnhandledExceptionFilter, (PROC*)&real_SetUnhandledExceptionFilter, 0 },
 #endif
             { "", NULL, NULL, 0 }
