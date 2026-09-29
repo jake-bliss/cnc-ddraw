@@ -777,6 +777,15 @@ static BOOL same_spot(const PLACEMENT* a, const PORTRAIT* ra, int x, int y, cons
     return 2 * w * h >= smaller;
 }
 
+/* A sprite whose rectangle holds another's, both at one top-left: a whole figure and the window
+ * of it a strip shows (setup's strip__ records). Where the whole figure is drawn and passes, it
+ * is the better answer however the part scores -- the part is at 100% whenever the covered rows
+ * are all outside it. */
+static BOOL holds(const PORTRAIT* a, const PORTRAIT* b)
+{
+    return a->w >= b->w && a->h >= b->h && (a->w > b->w || a->h > b->h);
+}
+
 typedef struct
 {
     const LOMHD_PACK* pack;
@@ -815,17 +824,31 @@ static void try_probes(SEARCH* s, unsigned long long h, int probe_width, int x, 
          * compared as fractions by cross-multiplying, in integers. */
         SCORING sc = scoring(r);
         int needed = sc.needed;
+        BOOL inside = FALSE;
 
         for (int k = 0; k < s->found; k++)
         {
             const PORTRAIT* rk = &pack->portraits[out[k].portrait];
+
+            if (!same_spot(&out[k], rk, left, top, r))
+                continue;
+
+            if (r->masked && holds(rk, r))
+            {
+                inside = TRUE;          /* the whole figure is already found here */
+                break;
+            }
+
+            if (r->masked && holds(r, rk))
+                continue;               /* passing on its own is enough to replace the part */
+
             int beat = (int)((long long)s->matched_of[k] * sc.total / s->total_of[k]) + 1;
 
-            if (same_spot(&out[k], rk, left, top, r) && beat > needed)
+            if (beat > needed)
                 needed = beat;
         }
 
-        if (needed > sc.total)
+        if (inside || needed > sc.total)
             continue;
 
         /* A frame no capture comes near -- a battle nobody has recorded -- must not stall the game:

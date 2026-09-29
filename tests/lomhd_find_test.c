@@ -283,6 +283,27 @@ int main(void)
     background(25); draw_sprite(t1b, 40, 36, 60, 60);
     expect("... in either pack order", (const char*[]){ "t1b@60,60" }, 1);
 
+    /* A whole figure and the window of it a strip shows (setup's strip__ records): 40 of 96 rows,
+     * from the top, so both sit at one top-left. Where the whole figure is drawn and passes, it
+     * wins even with its lower rows covered -- the window is then at 100%, the whole at 80%. */
+    {
+        static BYTE tall[40 * 96];
+        sprite(tall, 40, 96, 31);
+        /* "top" is the first 40 rows of "tall": the same bytes, fewer rows. */
+        begin(2); tp_add_sprite("tall", 40, 96, tall, 0); tp_add_sprite("top", 40, 40, tall, 0);
+        background(40); draw_sprite(tall, 40, 96, 300, 100); damage_rows(300, 100, 40, 77, 96);
+        printf("    (whole keeps %d%%)\n", kept_percent(tall, 40, 96, 300, 100));
+        expect("a whole figure, lower rows covered, beats its top window at one spot",
+            (const char*[]){ "tall@300,100" }, 1);
+        begin(2); tp_add_sprite("top", 40, 40, tall, 0); tp_add_sprite("tall", 40, 96, tall, 0);
+        background(40); draw_sprite(tall, 40, 96, 300, 100); damage_rows(300, 100, 40, 77, 96);
+        expect("... in either pack order", (const char*[]){ "tall@300,100" }, 1);
+
+        begin(2); tp_add_sprite("tall", 40, 96, tall, 0); tp_add_sprite("top", 40, 40, tall, 0);
+        background(41); draw_sprite(tall, 40, 40, 300, 100);
+        expect("only the window drawn: the window is found, the whole is not", (const char*[]){ "top@300,100" }, 1);
+    }
+
     /* A forest: as many copies as there are placements. */
     {
         static char names[LOMHD_MAX_PLACEMENTS][16];
