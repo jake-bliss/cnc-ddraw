@@ -332,6 +332,56 @@ static void pump(DWORD ms)
     }
 }
 
+/* One Lock/Unlock on the window thread: the beat the hang watchdog waits for. IDirectDraw::
+ * CreateSurface is slot 6; IDirectDrawSurface Release 2, Lock 25, Unlock 32. */
+static BOOL beat(void** dd, const char* mode)
+{
+    typedef HRESULT(WINAPI* CREATESURFACE)(void*, void*, void***, void*);
+    typedef HRESULT(WINAPI* LOCK)(void*, RECT*, void*, DWORD, HANDLE);
+    typedef HRESULT(WINAPI* UNLOCK)(void*, void*);
+    typedef ULONG(WINAPI* RELEASE)(void*);
+    DWORD desc[27];                                         /* DDSURFACEDESC, 108 bytes */
+    void** surface = NULL;
+
+    memset(desc, 0, sizeof(desc));
+    desc[0] = sizeof(desc);
+    desc[1] = 1;                                            /* DDSD_CAPS */
+    desc[26] = 0x200;                                       /* DDSCAPS_PRIMARYSURFACE */
+
+    if (((CREATESURFACE)((void**)*dd)[6])(dd, desc, &surface, NULL) != 0 || !surface)
+    {
+        printf("%s: CreateSurface failed\n", mode);
+        return FALSE;
+    }
+
+    desc[0] = sizeof(desc);
+    HRESULT locked = ((LOCK)((void**)*surface)[25])(surface, NULL, desc, 1 /* DDLOCK_WAIT */, NULL);
+
+    if (locked == 0)
+        ((UNLOCK)((void**)*surface)[32])(surface, NULL);
+
+    ((RELEASE)((void**)*surface)[2])(surface);
+    printf("%s: resumed, Lock %s\n", mode, locked == 0 ? "ok" : "failed");
+    return locked == 0;
+}
+
+/* "away": while the window thread is stuck, another thread puts a window in front, the way a
+ * player alt-tabs away from a hung game. */
+static DWORD WINAPI step_away(LPVOID unused)
+{
+    Sleep(25000);
+    HWND other = CreateWindowExA(0, "lomhd_crash_victim", "lomhd crash victim (in front)",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE, 200, 200, 320, 200, NULL, NULL, GetModuleHandleA(NULL), NULL);
+    SetForegroundWindow(other);
+    MSG m;
+
+    for (DWORD end = GetTickCount() + 20000; GetTickCount() < end; Sleep(10))
+        while (PeekMessageA(&m, NULL, 0, 0, PM_REMOVE))
+            DispatchMessageA(&m);
+
+    return 0;
+}
+
 static int hang(HMODULE ddraw, const char* mode)
 {
     WNDCLASSA wc;
@@ -377,6 +427,26 @@ static int hang(HMODULE ddraw, const char* mode)
         pump(1000);
     }
 
+    if (strcmp(mode, "resume4") == 0)
+    {
+        /* Four stalls that each recover: on Wine all four are reported, past LC_MAX_HANGS. */
+        for (int i = 0; i < 4; i++)
+        {
+            printf("%s: not pumping for 22 s (%d)\n", mode, i + 1);
+            Sleep(22000);
+
+            if (!beat(dd, mode))
+                return 2;
+
+            pump(1000);
+        }
+
+        return 0;
+    }
+
+    if (strcmp(mode, "away") == 0)
+        CloseHandle(CreateThread(NULL, 0, step_away, NULL, 0, NULL));
+
     BOOL idle = strcmp(mode, "idle") == 0;
     printf("%s: %s for 40 s\n", mode, idle ? "pumping, no DirectDraw calls" : "not pumping");
 
@@ -385,34 +455,11 @@ static int hang(HMODULE ddraw, const char* mode)
     else
         Sleep(40000);
 
-    if (strcmp(mode, "resume") == 0)
+    if (strcmp(mode, "resume") == 0 || strcmp(mode, "away") == 0)
     {
-        /* Back from the stall: one Lock/Unlock on the window thread is the beat the watchdog waits
-         * for. IDirectDraw::CreateSurface is slot 6; IDirectDrawSurface Lock 25, Unlock 32. */
-        typedef HRESULT(WINAPI* CREATESURFACE)(void*, void*, void***, void*);
-        typedef HRESULT(WINAPI* LOCK)(void*, RECT*, void*, DWORD, HANDLE);
-        typedef HRESULT(WINAPI* UNLOCK)(void*, void*);
-        DWORD desc[27];                                     /* DDSURFACEDESC, 108 bytes */
-        void** surface = NULL;
-
-        memset(desc, 0, sizeof(desc));
-        desc[0] = sizeof(desc);
-        desc[1] = 1;                                        /* DDSD_CAPS */
-        desc[26] = 0x200;                                   /* DDSCAPS_PRIMARYSURFACE */
-
-        if (((CREATESURFACE)((void**)*dd)[6])(dd, desc, &surface, NULL) != 0 || !surface)
-        {
-            printf("%s: CreateSurface failed\n", mode);
+        if (!beat(dd, mode))
             return 2;
-        }
 
-        desc[0] = sizeof(desc);
-        HRESULT locked = ((LOCK)((void**)*surface)[25])(surface, NULL, desc, 1 /* DDLOCK_WAIT */, NULL);
-
-        if (locked == 0)
-            ((UNLOCK)((void**)*surface)[32])(surface, NULL);
-
-        printf("%s: resumed, Lock %s\n", mode, locked == 0 ? "ok" : "failed");
         pump(1500);
     }
 
@@ -440,7 +487,8 @@ int main(int argc, char** argv)
 
     printf("mode %s\n", mode);
 
-    if (strcmp(mode, "hang") == 0 || strcmp(mode, "resume") == 0 || strcmp(mode, "idle") == 0 || strcmp(mode, "minimized") == 0 ||
+    if (strcmp(mode, "hang") == 0 || strcmp(mode, "resume") == 0 || strcmp(mode, "resume4") == 0 ||
+        strcmp(mode, "away") == 0 || strcmp(mode, "idle") == 0 || strcmp(mode, "minimized") == 0 ||
         strcmp(mode, "background") == 0)
         return hang(ddraw, mode);
 

@@ -44,7 +44,9 @@ abandon        |0 |1|1|0|resumed after              |dump holds the copied    |O
 continue       |47|1|1|0|resumed after              |resumed after the fault  |Outcome:
 freelib        |44|1|1|0|report written to          |still loaded after FreeLibrary: yes|
 hang           |0 |0|0|1|hang: report written       |not pumping              |
-resume         |0 |0|0|1|not counted)               |resumed, Lock ok         |Outcome:
+resume         |0 |0|0|1|not counted)               |resumed, Lock ok         |resumed after [34][0-9] s -- on Wine
+resume4        |0 |0|0|4|not counted)               |not pumping for 22 s (4) |resumed after 2[0-3] s
+away           |0 |0|0|1|resumed after [34][0-9] s  |in front no              |resumed after [34][0-9] s
 idle           |0 |0|0|0|crash reports: on          |pumping, no DirectDraw   |
 minimized      |0 |0|0|0|crash reports: on          |minimized yes            |
 background     |0 |0|0|0|crash reports: on          |in front no              |

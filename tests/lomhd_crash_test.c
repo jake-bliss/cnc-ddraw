@@ -381,6 +381,19 @@ static void test_hang_outcome(void)
     lc_hang_outcome(&t, 21000, TRUE);
     CHECK(strstr(buf, "resumed after 21 s -- on Wine") && strstr(buf, "background, not a hang.\r\n"),
         "hang outcome, Wine");
+
+    static char big[8192];
+    LC_REPORT r;
+    memset(&r, 0, sizeof(r));
+    r.kind = "hang";
+    lc_text_init(&t, big, sizeof(big));
+    lc_format_report(&r, &t);
+    CHECK(!strstr(big, "On Wine"), "hang lead, Windows: no Wine note");
+    r.wine = TRUE;
+    lc_text_init(&t, big, sizeof(big));
+    lc_format_report(&r, &t);
+    CHECK(strstr(big, "while in front. The game was not stopped") && strstr(big, "On Wine a game window"),
+        "hang lead, Wine: the note follows the lead");
 }
 
 static void test_mailbox(void)

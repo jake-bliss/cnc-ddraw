@@ -71,6 +71,7 @@
 #define LC_MAX_THREADS 8
 #define LC_MAX_REPORTS 4                   /* per session */
 #define LC_MAX_HANGS 3                     /* per session */
+#define LC_MAX_HANG_REFUNDS 6              /* Wine: recovered hangs given back to the cap, per session */
 #define LC_HANG_MS 20000
 #define LC_HANDOFF_MS 10000                /* the crashing thread's wait for the helper */
 #define LC_QUIET_START_MS 1500             /* the reporter thread's idle start */
@@ -127,6 +128,7 @@ static LC_THREAD g_threads[LC_MAX_THREADS];
 static LC_ADMIT g_admit;                   /* the report count and the duplicate reference */
 static volatile LONG g_admit_lock;         /* held for a few instructions, never across a wait */
 static int g_hang_count;                   /* reporter thread only */
+static int g_hang_refunds;                 /* reporter thread only */
 
 /* The handoff to the helper thread: the mailbox (lomhd_crash_core.c) and, per slot, the crashing
  * thread's exception copied out of its stack -- so nothing the helper reads can vanish when a
@@ -983,6 +985,7 @@ static BOOL lc_report_hang(DWORD tid, DWORD silent_ms)
     r->thread_id = tid;
     r->window_thread = TRUE;
     r->hang_ms = silent_ms;
+    r->wine = IsWine();
 
     HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
 
@@ -1042,6 +1045,8 @@ static void lc_note_hang_recovered(DWORD stalled_ms)
     lc_text_init(&t, outcome, sizeof(outcome));
     lc_hang_outcome(&t, stalled_ms, wine);
 
+    BOOL appended = FALSE;
+
     if (lc_join(path, sizeof(path), w->name))
     {
         HANDLE f = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
@@ -1049,20 +1054,29 @@ static void lc_note_hang_recovered(DWORD stalled_ms)
 
         if (f != INVALID_HANDLE_VALUE)
         {
-            lc_write_all(f, "\r\n", 2);
-            lc_write_all(f, outcome, t.len);
+            DWORD a = 0, b = 0;
+            appended = WriteFile(f, "\r\n", 2, &a, NULL) && WriteFile(f, outcome, t.len, &b, NULL) &&
+                a == 2 && b == t.len;
             CloseHandle(f);
         }
     }
 
-    char line[160];
-    _snprintf(line, sizeof(line), "hang: %s resumed after %lu s%s", w->name, (unsigned long)(stalled_ms / 1000),
-        wine ? " (Wine: likely a background window, not counted)" : "");
+    /* Bounded: a game that really does stall 20 s and recover, again and again, still stops
+     * writing reports after LC_MAX_HANGS + LC_MAX_HANG_REFUNDS. */
+    BOOL refund = wine && g_hang_count > 0 && g_hang_refunds < LC_MAX_HANG_REFUNDS;
+
+    if (refund)
+    {
+        g_hang_count--;
+        g_hang_refunds++;
+    }
+
+    char line[200];
+    _snprintf(line, sizeof(line), "hang: %s resumed after %lu s%s%s", w->name, (unsigned long)(stalled_ms / 1000),
+        wine ? (refund ? " (Wine: likely a background window, not counted)" : " (Wine: likely a background window)") : "",
+        appended ? "" : "; could not add this to the report");
     line[sizeof(line) - 1] = 0;
     lomhd_log(line);
-
-    if (wine && g_hang_count > 0)
-        g_hang_count--;
 }
 
 typedef struct
@@ -1071,6 +1085,7 @@ typedef struct
     DWORD quiet_since;          /* the last beat, or the last moment the window was not in front */
     BOOL reported;              /* this hang is reported; re-armed by the next beat */
     BOOL written;               /* ...and its report is g_hang_work.name */
+    DWORD hang_since;           /* when the reported hang's silence began */
     HWND hwnd;
 } LC_WATCH;
 
@@ -1080,10 +1095,12 @@ static void lc_watch(LC_WATCH* s, DWORD now)
     DWORD pid = 0;
     DWORD tid = hwnd && IsWindow(hwnd) ? GetWindowThreadProcessId(hwnd, &pid) : 0;
 
+    /* A report belongs to its window: beats from a new window do not mean the old one recovered. */
     if (!tid || pid != GetCurrentProcessId())
     {
         s->quiet_since = now;
         s->hwnd = NULL;
+        s->written = FALSE;
         return;
     }
 
@@ -1091,6 +1108,7 @@ static void lc_watch(LC_WATCH* s, DWORD now)
     {
         s->hwnd = hwnd;
         s->quiet_since = now;
+        s->written = FALSE;
     }
 
     InterlockedExchange((volatile LONG*)&g_window_tid, (LONG)tid);
@@ -1099,7 +1117,7 @@ static void lc_watch(LC_WATCH* s, DWORD now)
     if (beats != s->beats)
     {
         if (s->written)
-            lc_note_hang_recovered(now - s->quiet_since);
+            lc_note_hang_recovered(now - s->hang_since);
 
         s->beats = beats;
         s->quiet_since = now;
@@ -1153,6 +1171,7 @@ static void lc_watch(LC_WATCH* s, DWORD now)
     {
         s->reported = TRUE;
         s->written = g_hang_work.name[0] != 0;
+        s->hang_since = s->quiet_since;
         g_hang_count++;
     }
 }

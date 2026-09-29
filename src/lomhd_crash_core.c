@@ -341,6 +341,11 @@ void lc_format_report(const LC_REPORT* r, LC_TEXT* t)
     lc_puts(t, crash ? "An exception the game did not handle. Nothing was changed; the game ended as it "
         "would have without this report." : "The game window stopped responding while in front. The "
         "game was not stopped or changed; this is a snapshot of where its window thread was.");
+
+    if (!crash && r->wine)
+        lc_puts(t, " On Wine a game window left in the background can look exactly like this; if the "
+            "thread came back, an Outcome line at the end says so.");
+
     lc_nl(t);
     lc_nl(t);
 

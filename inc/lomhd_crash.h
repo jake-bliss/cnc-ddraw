@@ -91,6 +91,7 @@ typedef struct
     DWORD thread_id;
     BOOL window_thread;                 /* the thread that owns the game window */
     DWORD hang_ms;                      /* hang: how long the window thread made no progress */
+    BOOL wine;                          /* hang: Wine cannot tell a background window from a hang */
 
     BOOL has_regs;
     LC_REGS regs;
