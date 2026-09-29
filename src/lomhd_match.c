@@ -621,7 +621,9 @@ static int whole_of(const PORTRAIT* all, int count, int p)
 {
     const PORTRAIT* r = &all[p];
 
-    if (!r->masked)
+    /* Only setup's strip windows: an ordinary animation frame can be the exact top of the one
+     * before it too (cursors#041 of #040), and is not a window of it. */
+    if (!r->masked || strncmp(r->name, LOMHD_WINDOW_PREFIX, sizeof(LOMHD_WINDOW_PREFIX) - 1) != 0)
         return -1;
 
     for (int q = p - 3; q <= p + 3; q++)

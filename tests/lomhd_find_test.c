@@ -290,18 +290,18 @@ int main(void)
         static BYTE tall[40 * 96];
         sprite(tall, 40, 96, 31);
         /* "top" is the first 40 rows of "tall": the same bytes, fewer rows. */
-        begin(2); tp_add_sprite("tall", 40, 96, tall, 0); tp_add_sprite("top", 40, 40, tall, 0);
+        begin(2); tp_add_sprite("tall", 40, 96, tall, 0); tp_add_sprite("strip__top", 40, 40, tall, 0);
         background(40); draw_sprite(tall, 40, 96, 300, 100); damage_rows(300, 100, 40, 77, 96);
         printf("    (whole keeps %d%%)\n", kept_percent(tall, 40, 96, 300, 100));
         expect("a whole figure, lower rows covered, beats its top window at one spot",
             (const char*[]){ "tall@300,100" }, 1);
-        begin(2); tp_add_sprite("top", 40, 40, tall, 0); tp_add_sprite("tall", 40, 96, tall, 0);
+        begin(2); tp_add_sprite("strip__top", 40, 40, tall, 0); tp_add_sprite("tall", 40, 96, tall, 0);
         background(40); draw_sprite(tall, 40, 96, 300, 100); damage_rows(300, 100, 40, 77, 96);
         expect("... in either pack order", (const char*[]){ "tall@300,100" }, 1);
 
-        begin(2); tp_add_sprite("tall", 40, 96, tall, 0); tp_add_sprite("top", 40, 40, tall, 0);
+        begin(2); tp_add_sprite("tall", 40, 96, tall, 0); tp_add_sprite("strip__top", 40, 40, tall, 0);
         background(41); draw_sprite(tall, 40, 40, 300, 100);
-        expect("only the window drawn: the window is found, the whole is not", (const char*[]){ "top@300,100" }, 1);
+        expect("only the window drawn: the window is found, the whole is not", (const char*[]){ "strip__top@300,100" }, 1);
 
         /* Size is not enough: a taller look-alike sharing only some top rows is not a whole of the
          * shorter frame, and the one drawn still wins on score (found in review of the first
@@ -317,6 +317,12 @@ int main(void)
         begin(2); tp_add_sprite("f2", 40, 64, f2, 0); tp_add_sprite("f1", 40, 60, f1, 0);
         background(42); draw_sprite(f1, 40, 60, 300, 100);
         expect("... in either pack order", (const char*[]){ "f1@300,100" }, 1);
+
+        /* Only setup's strip windows are windows: the same pair under ordinary names is decided by
+         * score, like any two frames at one spot (the top rows win at 100%). */
+        begin(2); tp_add_sprite("tall", 40, 96, tall, 0); tp_add_sprite("top", 40, 40, tall, 0);
+        background(40); draw_sprite(tall, 40, 96, 300, 100); damage_rows(300, 100, 40, 77, 96);
+        expect("an ordinary frame that is another's top rows is not a window", (const char*[]){ "top@300,100" }, 1);
     }
 
     /* A forest: as many copies as there are placements. */

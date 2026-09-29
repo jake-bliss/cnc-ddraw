@@ -36,6 +36,7 @@
 
 #define LOMHD_FLAG_MASKED 1             /* a sprite: see lomhd_pack_open */
 #define LOMHD_FLAG_MIRROR 2             /* a sprite the game also draws flipped left to right */
+#define LOMHD_WINDOW_PREFIX "strip__"  /* setup's names for a window of a sprite frame */
 
 /* Reads len bytes at offset of the pack file into out; FALSE on any failure. */
 typedef BOOL (*LOMHD_READ)(void* ctx, DWORD offset, DWORD len, BYTE* out);
