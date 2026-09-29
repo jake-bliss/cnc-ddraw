@@ -318,11 +318,51 @@ int main(void)
         background(42); draw_sprite(f1, 40, 60, 300, 100);
         expect("... in either pack order", (const char*[]){ "f1@300,100" }, 1);
 
+        /* Two frames of one sprite that share their top rows both hold either one's window. With
+         * each window right after its frame, the one drawn whole still beats both windows --
+         * found in review of a version that linked each window to one frame by pack position. */
+        static BYTE fa[40 * 60], fb[40 * 60];
+        sprite(fa, 40, 60, 34);
+        sprite(fb, 40, 60, 35);
+        memcpy(fb, fa, 40 * 30);
+        begin(4); tp_add_sprite("fa", 40, 60, fa, 0); tp_add_sprite("strip__fa", 40, 20, fa, 0);
+        tp_add_sprite("fb", 40, 60, fb, 0); tp_add_sprite("strip__fb", 40, 20, fb, 0);
+        background(43); draw_sprite(fb, 40, 60, 300, 100); damage_rows(300, 100, 40, 52, 60);
+        expect("a frame sharing its top rows with another beats both windows", (const char*[]){ "fb@300,100" }, 1);
+
         /* Only setup's strip windows are windows: the same pair under ordinary names is decided by
          * score, like any two frames at one spot (the top rows win at 100%). */
         begin(2); tp_add_sprite("tall", 40, 96, tall, 0); tp_add_sprite("top", 40, 40, tall, 0);
         background(40); draw_sprite(tall, 40, 96, 300, 100); damage_rows(300, 100, 40, 77, 96);
         expect("an ordinary frame that is another's top rows is not a window", (const char*[]){ "top@300,100" }, 1);
+    }
+
+    /* The strip: twelve windows in one band, each frame in the pack right before its window, as
+     * setup writes them. Each whole fails where its window stands and is tried once per spot, not
+     * once per probe hit (60 verifications before the failed ring, 36 with it). */
+    {
+        static BYTE units[12][40 * 60];
+        static char names[12][2][24];
+        begin(24);
+        background(44);
+        for (int u = 0; u < 12; u++)
+        {
+            sprite(units[u], 40, 60, 50 + u);
+            snprintf(names[u][0], sizeof names[u][0], "unit%02d", u);
+            snprintf(names[u][1], sizeof names[u][1], "strip__unit%02d", u);
+            tp_add_sprite(names[u][0], 40, 60, units[u], 0);
+            tp_add_sprite(names[u][1], 40, 30, units[u], 0);
+            draw_sprite(units[u], 40, 30, 10 + 52 * u, 400);
+        }
+        LOMHD_PACK pack; PLACEMENT out[LOMHD_MAX_PLACEMENTS]; LOMHD_STATS st;
+        int n = find_stats(out, &pack, &st), windows = 0;
+        for (int i = 0; i < n; i++)
+            windows += strncmp(pack.portraits[out[i].portrait].name, "strip__", 7) == 0;
+        printf("    (%d verifications)\n", st.verifications);
+        check_that("a strip of twelve: every window found, nothing else", n == 12 && windows == 12);
+        check_that("... each whole tried once at its spot (at most 3 verifications a unit)",
+            st.verifications <= 36);
+        if (n >= 0) lomhd_pack_free(&pack);
     }
 
     /* A forest: as many copies as there are placements. */

@@ -68,8 +68,8 @@ typedef struct
     WORD* spans;                        /* sprites: (row, col, length) of every opaque run ... */
     BYTE* opix;                         /* ... and those runs' indices, back to back */
     int nspans;
-    int whole;                          /* sprites: this record is the top rows of that record (a
-                                         * strip window setup cut from it), or -1 */
+    BOOL window;                        /* one of setup's strip windows (LOMHD_WINDOW_PREFIX): the
+                                         * top rows of a frame, see window_of */
     DWORD idx_off, idx_len;             /* zlib(w*h indices) in the pack file */
     DWORD hd_off, hd_len;               /* zlib(hw*hh*3 RGB, or *4 RGBA if masked) in the pack */
 } PORTRAIT;
