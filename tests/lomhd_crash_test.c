@@ -382,6 +382,28 @@ static void test_hang_outcome(void)
     CHECK(strstr(buf, "resumed after 21 s -- on Wine") && strstr(buf, "background, not a hang.\r\n"),
         "hang outcome, Wine");
 
+    /* The cap: 3 reports, and on Wine 6 of them given back -- so at most 9, however often it recovers. */
+    int count = 0, refunds = 0, written = 0;
+
+    for (int i = 0; i < 50; i++)
+    {
+        if (count >= 3)
+            continue;
+
+        count++;
+        written++;
+
+        if (lc_hang_refund(TRUE, count, refunds, 6))
+        {
+            count--;
+            refunds++;
+        }
+    }
+
+    CHECK(written == 9 && refunds == 6, "Wine: 50 recovered hangs write 9 reports");
+    CHECK(!lc_hang_refund(FALSE, 1, 0, 6), "Windows: never refunded");
+    CHECK(!lc_hang_refund(TRUE, 0, 0, 6), "nothing counted, nothing to refund");
+
     static char big[8192];
     LC_REPORT r;
     memset(&r, 0, sizeof(r));

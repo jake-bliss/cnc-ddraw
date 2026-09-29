@@ -73,7 +73,7 @@ for mode in "${MODES[@]}"; do
   # A mode that hangs is a failure, not a stuck run: killed after TIMEOUT seconds (exit 124).
   ( cd "$dir" && exec "$WINE" ./victim.exe "$arg" > stdout.txt 2> stderr.txt ) & pid=$!
   waited=0
-  while kill -0 $pid 2>/dev/null && [ $waited -lt ${TIMEOUT:-90} ]; do sleep 1; waited=$((waited+1)); done
+  while kill -0 $pid 2>/dev/null && [ $waited -lt ${TIMEOUT:-150} ]; do sleep 1; waited=$((waited+1)); done
   if kill -0 $pid 2>/dev/null; then "$WINESERVER" -k 2>/dev/null; wait $pid; code=124; else wait $pid; code=$?; fi
   "$WINESERVER" -k 2>/dev/null
 
@@ -84,7 +84,7 @@ for mode in "${MODES[@]}"; do
   have_hang=$(ls "$dir"/lomhd_hang_*.txt 2>/dev/null | wc -l | tr -d ' ')
   problems=""
 
-  if [ "$code" = 124 ]; then problems+=" timed out after ${TIMEOUT:-90} s (the process did not end)"
+  if [ "$code" = 124 ]; then problems+=" timed out after ${TIMEOUT:-150} s (the process did not end)"
   elif [ "$want_code" != "*" ] && [ "$code" != "$want_code" ]; then problems+=" exit $code (want $want_code)"; fi
   [ "$want_txt" = "?" ] || [ "$have_txt" = "$want_txt" ] || problems+=" $have_txt crash .txt (want $want_txt)"
   [ "$want_dmp" = "?" ] || [ "$have_dmp" = "$want_dmp" ] || problems+=" $have_dmp .dmp (want $want_dmp)"

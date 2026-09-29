@@ -806,6 +806,13 @@ BOOL lc_in_front(const void* window, const void* foreground, const void* ghost_o
 /* The line appended to a hang report when the window thread comes back. On Wine a thread that only
  * sat still while the player was in another app looks exactly like a hang: Wine keeps it the
  * foreground window, because the stalled thread is the one that would process the switch. */
+/* Whether a recovered hang goes back to the per-session cap: only on Wine, and only max_refunds
+ * times, so a game that really stalls and recovers again and again still stops writing reports. */
+BOOL lc_hang_refund(BOOL wine, int count, int refunds, int max_refunds)
+{
+    return wine && count > 0 && refunds < max_refunds;
+}
+
 void lc_hang_outcome(LC_TEXT* t, DWORD stalled_ms, BOOL wine)
 {
     lc_puts(t, "Outcome:    the window thread resumed after ");

@@ -1063,7 +1063,7 @@ static void lc_note_hang_recovered(DWORD stalled_ms)
 
     /* Bounded: a game that really does stall 20 s and recover, again and again, still stops
      * writing reports after LC_MAX_HANGS + LC_MAX_HANG_REFUNDS. */
-    BOOL refund = wine && g_hang_count > 0 && g_hang_refunds < LC_MAX_HANG_REFUNDS;
+    BOOL refund = lc_hang_refund(wine, g_hang_count, g_hang_refunds, LC_MAX_HANG_REFUNDS);
 
     if (refund)
     {
@@ -1100,6 +1100,7 @@ static void lc_watch(LC_WATCH* s, DWORD now)
     {
         s->quiet_since = now;
         s->hwnd = NULL;
+        s->reported = FALSE;
         s->written = FALSE;
         return;
     }
@@ -1108,6 +1109,7 @@ static void lc_watch(LC_WATCH* s, DWORD now)
     {
         s->hwnd = hwnd;
         s->quiet_since = now;
+        s->reported = FALSE;
         s->written = FALSE;
     }
 
