@@ -122,9 +122,8 @@ def setup_op(emu, rng):
     this = HEAP_LO + 0x400
     arr = HEAP_LO + 0x1000 + 8 * rng.randrange(0, 4)
     limit = rng.randrange(0, 9)
-    sp = rng.choice([0, 0, 1, 2, rng.randrange(0, 11), limit, limit - 1, limit + 1])
-    sp = max(sp, 0)
-    emu.poke(this + 0x50, struct.pack("<III", arr, sp, limit))
+    sp = rng.choice([0, 0, 1, 2, -2, -2, -1, rng.randrange(0, 11), limit, limit - 1, limit + 1])
+    emu.poke(this + 0x50, struct.pack("<IiI", arr, sp, limit))
     for i in range(16):
         emu.poke(arr + 8 * i, rand_value_slot(rng))
     regs = rand_regs(rng)

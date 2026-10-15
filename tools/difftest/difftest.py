@@ -9,6 +9,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import emu as E
 import targets as T
+import coverage as C
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DEFAULT_EXE = "/Users/jakebliss/personal-projects/lom-artifacts-keep/decomp/bin/lomse.exe"
@@ -119,7 +120,13 @@ def main():
         print("  first divergence: trial %d (seed %s)" % first[:2])
         for line in first[2]:
             print("    " + line)
-    return bad
+    proven = True
+    if args.mode == "reimpl":
+        code = bytes(emu.uc.mem_read(addr, tgt["end"] - addr))
+        ok, *_ = C.report(addr, tgt["end"], code, emu.executed, tgt["name"])
+        proven = ok and bad == 0
+        print("  %s" % ("PROVEN" if proven else "UNPROVEN"))
+    return 1 if (bad or not proven) else 0
 
 
 if __name__ == "__main__":

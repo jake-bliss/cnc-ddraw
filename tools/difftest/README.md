@@ -9,7 +9,7 @@ Proves, offline, that a C rewrite in `src/reimpl/*.c` behaves like the original 
     tools/difftest/run.sh all --trials 5000   # everything; options: --trials N --seed S
 
 First run creates `.venv` (gitignored) and installs `unicorn`. `LOMSE_EXE` overrides the exe path
-(default: `lom-artifacts-keep/decomp/bin/lomse.exe`). Exit 0 only if all three pass:
+(default: `lom-artifacts-keep/decomp/bin/lomse.exe`). Exit 0 only if all three pass and the function is PROVEN (see Coverage):
 1. reimpl vs original: 0 divergent trials
 2. control 1, original vs itself (second run on a shifted stack): 0 divergent
 3. control 2, reimpl built with `-DMUTANT` (a flipped constant): must diverge
@@ -32,6 +32,17 @@ First run creates `.venv` (gitignored) and installs `unicorn`. `LOMSE_EXE` overr
   stack depth, the net memory effect (bytes changed outside the function's own stack frame), and
   the ordered callee trace including the memory state visible at each call.
 
+## Coverage
+
+Every trial records which original instructions executed. The function's bytes are swept with
+capstone, split into basic blocks at branch targets and after branches/returns, and reported as
+instruction % and block %, with each unreached block, its address range and the branch edge into it.
+A function is PROVEN only if reimpl shows 0 divergences and every block is reached or waived in
+`waivers.json` (`{"0x<func>": {"0x<block start>": "reason"}}`); otherwise it prints UNPROVEN and
+exits non-zero. Coverage is of the original only, per run of the `reimpl` mode, and counts "reached
+at the instruction level" (it does not measure data-dependent behaviour inside a block, e.g. all
+float classes). No waivers are currently needed.
+
 ## What it does not prove
 
 - Only paths the random inputs reach. Sanity lines show faults, callee sequences and bytes written.
@@ -51,11 +62,15 @@ First run creates `.venv` (gitignored) and installs `unicorn`. `LOMSE_EXE` overr
 Wall time is agent working time on this function (harness build excluded, about 6 min of the
 total). Seed 1, 2000 trials each; run time is for reimpl + self + mutant together.
 
-| Function | Size | Wall time | Trials | reimpl | self control | mutant control |
-|---|---|---|---|---|---|---|
-| 0x404ab0 script_raise_error | 36 B | ~1 min | 2000 | 0 divergent | 0 | caught (2000/2000) |
-| 0x4026a0 script_value_decode | 149 B | ~3 min | 2000 | 0 divergent | 0 | caught (324/2000) |
-| 0x4ac0b0 op_abracadabra | 363 B | ~3 min | 2000 | 0 divergent | 0 | caught (540/2000) |
+| Function | Size | Wall time | Trials | reimpl | self control | mutant control | Coverage (insn / blocks) | Verdict |
+|---|---|---|---|---|---|---|---|---|
+| 0x404ab0 script_raise_error | 36 B | ~1 min | 2000 | 0 divergent | 0 | caught (2000/2000) | 10/10, 1/1 | PROVEN |
+| 0x4026a0 script_value_decode | 149 B | ~3 min | 2000 | 0 divergent | 0 | caught (324/2000) | 54/54, 7/7 | PROVEN |
+| 0x4ac0b0 op_abracadabra | 363 B | ~3 min | 2000 | 0 divergent | 0 | caught (540/2000) | 112/112, 19/19 | PROVEN |
+
+Coverage before targeted inputs: 0x404ab0 and 0x4026a0 were already complete; 0x4ac0b0 was 111/112
+instructions and 18/19 blocks (the sp==0 push-failure block at 0x4ac1d6 was unreachable with
+non-negative `sp`; fixed by generating negative `sp`, which makes two successful pops land on 0).
 
 Real divergences the harness found on the first drafts: `(int)float` saturates to INT_MIN while
 the original `__ftol` stores 64 bits and keeps the low word (fixed with `lom_ftol`, 156/2000 trials

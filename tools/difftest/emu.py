@@ -106,6 +106,7 @@ class Emu:
         self.in_intrinsic_until = None
         self.entry_esp = 0
         self.nargs = 0
+        self.executed = set()
         self.call_idx = 0
         self.seed = 0
         uc.hook_add(UC_HOOK_MEM_WRITE, self._on_write)
@@ -157,8 +158,11 @@ class Emu:
         if self.in_intrinsic_until is not None:
             if addr == self.in_intrinsic_until:
                 self.in_intrinsic_until = None
+                if self.fn_lo <= addr < self.fn_hi:
+                    self.executed.add(addr)
             return
         if self.fn_lo <= addr < self.fn_hi:
+            self.executed.add(addr)
             return
         esp = uc.reg_read(UC_X86_REG_ESP)
         if addr in self.intrinsics:
