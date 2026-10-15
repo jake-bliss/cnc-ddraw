@@ -40,6 +40,7 @@ static ScriptValue pop_value(GameScript *s)
    (flags 0x40000) and pushes the integer result. */
 void lom_op_abracadabra(GameScript *self)
 {
+    LOM_COUNT(2);
     ScriptValue first = pop_value(self);
     int32_t arg;
 

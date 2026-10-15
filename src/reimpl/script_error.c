@@ -6,6 +6,7 @@ typedef void(LOM_THISCALL *ReportScriptErrorFn)(GameScript *);
 /* 0x404ab0: publish `code` for the reporter to read, run it, then clear the error state. */
 void LOM_THISCALL lom_script_raise_error(GameScript *self, int32_t code)
 {
+    LOM_COUNT(0);
     self->error_code = code;
     orig_report_script_error(self);
     self->error_code = 0;

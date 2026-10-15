@@ -75,3 +75,12 @@ non-negative `sp`; fixed by generating negative `sp`, which makes two successful
 Real divergences the harness found on the first drafts: `(int)float` saturates to INT_MIN while
 the original `__ftol` stores 64 bits and keeps the low word (fixed with `lom_ftol`, 156/2000 trials
 in 0x4026a0, 45/2000 in the operator); and an aliasing-order difference in 0x4026a0's outputs.
+
+## Runtime redirect (not covered by this harness)
+
+`src/lomhd_reimpl.c` patches the originals with `jmp rel32` to the reimpls at DLL attach; the
+harness tests the C bodies (including their call counters, whose writes it ignores) but does not
+emulate the patched image. The jmp encoding, hash and header checks are unit-tested natively:
+`cc -Iinc -Itests/native -std=c99 -Wall -o /tmp/lr tests/lomhd_reimpl_test.c src/lomhd_reimpl_core.c && LOMSE_EXE=<lomse.exe> /tmp/lr`.
+Gating: folder `lomhd_reimpl\` beside the exe; inside it a file `all`, or one file per address
+(`0x4026a0`), enables entries. Rows live in `LOMHD_REIMPL_LIST` (`inc/lomhd_reimpl.h`).

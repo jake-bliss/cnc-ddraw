@@ -139,8 +139,8 @@ class Emu:
         """Bytes whose value differs from before the run, outside the callee's own stack frame."""
         first_old, last = {}, {}
         for addr, size, old, new, tag in self.log:
-            if tag not in ("emu", "model"):
-                continue
+            if tag not in ("emu", "model") or BLOB_BASE <= addr < BLOB_BASE + 0x1000000:
+                continue  # the blob's own call counters are not behaviour
             for i in range(size):
                 first_old.setdefault(addr + i, old[i])
                 last[addr + i] = new[i]

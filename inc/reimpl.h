@@ -9,6 +9,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Per-function call counter, read by the DLL's log (see lomhd_reimpl.h). Atomic, no OS calls, so
+   the offline harness runs the very same code. */
+extern volatile int32_t lom_reimpl_calls[];
+#define LOM_COUNT(i) ((void)__sync_fetch_and_add(&lom_reimpl_calls[i], 1))
+
 #define LOM_THISCALL __attribute__((thiscall))
 #define LOM_ORIG(addr, type) ((type)(uintptr_t)(addr))
 

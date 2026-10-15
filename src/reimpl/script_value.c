@@ -5,6 +5,7 @@
 int lom_script_value_decode(const ScriptValue *v, int32_t *out_int, int32_t *out_fixed,
                             float *out_float)
 {
+    LOM_COUNT(1);
     switch (v->tag & 0xff) {
     case SCRIPT_INT: {
         int32_t n = v->i;

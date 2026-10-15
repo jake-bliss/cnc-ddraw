@@ -6,6 +6,7 @@
 #include "ddsurface.h"
 #include "opengl_utils.h"
 #include "lomhd.h"
+#include "lomhd_reimpl.h"
 #include "lomhd_match.h"
 
 /* Lords of Magic HD overlay.
@@ -457,6 +458,8 @@ static DWORD WINAPI lomhd_worker(LPVOID unused)
         }
 
         DWORD now = GetTickCount();
+
+        lomhd_reimpl_tick();
 
         if (g_debug && now - last_report >= 5000)
         {
