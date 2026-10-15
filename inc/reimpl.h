@@ -1,10 +1,10 @@
 #ifndef REIMPL_H
 #define REIMPL_H
 
-/* Clean-room C replacements for functions inside lomse.exe (MSVC5, x86, base 0x400000).
-   Each one keeps the original calling convention and stack discipline so the DLL can later
-   redirect the original address to it. Functions not yet rewritten are reached through their
-   original addresses with LOM_ORIG. */
+/* C reimplementations (from the decompiled control flow) of functions inside lomse.exe (MSVC5, x86,
+   base 0x400000). Each keeps the original calling convention and stack discipline so the DLL can
+   redirect the original address to it. Other functions are called by their original address with
+   LOM_ORIG; that address may itself be redirected, but none of these calls its own address. */
 
 #include <stddef.h>
 #include <stdint.h>
@@ -35,7 +35,7 @@ typedef struct ScriptValue {
 /* The script VM object (the `this` of the GameScript operators). Only the fields used so far. */
 typedef struct GameScript {
     uint8_t pad0[0x50];
-    ScriptValue *values;  /* 0x50: value array; a pop reads values[sp] after incrementing sp */
+    ScriptValue *values;  /* 0x50: value array; a pop increments sp and reads values[sp-1] */
     int32_t sp;           /* 0x54: number of slots consumed from the top; pushes decrement it */
     int32_t limit;        /* 0x58: pops fail once sp reaches this */
     uint8_t pad5c[0x90 - 0x5c];

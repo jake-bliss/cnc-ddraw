@@ -18,10 +18,8 @@ DEFAULT_EXE = "/Users/jakebliss/personal-projects/lom-artifacts-keep/decomp/bin/
 def diff_obs(a, b, ret):
     """Return a list of human-readable differences between two observations."""
     d = []
-    if a["fault"] or b["fault"]:
-        if a["fault"] != b["fault"]:
-            d.append("fault: %s vs %s" % (a["fault"], b["fault"]))
-        return d
+    if a["fault"] != b["fault"]:
+        d.append("fault: %s vs %s" % (a["fault"], b["fault"]))
     if a["eip"] != b["eip"]:
         d.append("did not return to sentinel: %#x vs %#x" % (a["eip"], b["eip"]))
     if a["esp_delta"] != b["esp_delta"]:
@@ -72,14 +70,21 @@ def run_pair(emu, tgt, entry_a, range_a, entry_b, range_b, seed, shift_b):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("addr")
-    ap.add_argument("--mode", choices=["reimpl", "self", "mutant"], default="reimpl")
+    ap.add_argument("--mode", choices=["reimpl", "self", "mutant", "mutant_cache"], default="reimpl")
+    ap.add_argument("--i486", action="store_true", help="build the reimpls with -march=i486 as build.cmd does")
     ap.add_argument("--trials", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--exe", default=os.environ.get("LOMSE_EXE", DEFAULT_EXE))
     args = ap.parse_args()
     addr = int(args.addr, 0)
     tgt = T.TARGETS[addr]
-    blob, syms = E.build_blob(REPO, os.path.join(REPO, "tools/difftest/build", args.mode), args.mode == "mutant")
+    if args.mode == "mutant_cache" and not tgt.get("cache_mutant"):
+        print("%s %s [mutant_cache]: n/a (no callee-cached state to mutate)" % (hex(addr), tgt["name"]))
+        return 0
+    defines = {"mutant": ["-DMUTANT"], "mutant_cache": ["-DMUTANT_CACHE"]}.get(args.mode, [])
+    flags = ["-march=i486"] if args.i486 else []
+    tag = args.mode + ("-i486" if args.i486 else "")
+    blob, syms = E.build_blob(REPO, os.path.join(REPO, "tools/difftest/build", tag), defines + flags)
     emu = E.Emu(args.exe, blob)
     emu.sigs = T.SIGS
     emu.intrinsics = T.INTRINSICS
@@ -109,7 +114,7 @@ def main():
             if first is None:
                 first = (t, seed, d)
     dt = time.time() - t0
-    print("%s %s [%s]: trials=%d divergent=%d time=%.1fs" % (hex(addr), tgt["name"], args.mode,
+    print("%s %s [%s]: trials=%d divergent=%d time=%.1fs" % (hex(addr), tgt["name"], tag,
                                                            args.trials, bad, dt))
     print("  sanity: faults=%(faults)d no_return=%(no_return)d callees_traced=%(callees)d "
           "net_bytes_written=%(writes)d (summed over both runs)" % stats)
@@ -124,7 +129,9 @@ def main():
     if args.mode == "reimpl":
         code = bytes(emu.uc.mem_read(addr, tgt["end"] - addr))
         ok, *_ = C.report(addr, tgt["end"], code, emu.executed, tgt["name"])
-        proven = ok and bad == 0
+        proven = ok and bad == 0 and stats["faults"] == 0 and stats["no_return"] == 0
+        if stats["faults"] or stats["no_return"]:
+            print("  faulted or non-returning runs present: not proof")
         print("  %s" % ("PROVEN" if proven else "UNPROVEN"))
     return 1 if (bad or not proven) else 0
 

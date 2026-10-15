@@ -13,8 +13,8 @@
  *   4. the entry is enabled: a file named `all` in the folder enables every entry, or a file named
  *      like the address (`0x4026a0`, lower case) enables just that one.
  * Each reimpl bumps lom_reimpl_calls[i]; the counts are logged every 10 s while they change and at
- * exit. Reimpls call un-rewritten originals by address and never the function they replace, so a
- * redirect cannot recurse. */
+ * exit. Reimpls call other functions by original address, which may itself be redirected; none calls
+ * its own address, so a redirect cannot recurse. */
 
 typedef struct {
     uint32_t addr, len, fnv;
@@ -79,6 +79,12 @@ void lomhd_reimpl_install(void)
         return;
 
     lomhd_log("reimpl: lomhd_reimpl folder found");
+
+    if ((uintptr_t)GetModuleHandleA(NULL) != LOMHD_EXE_BASE)
+    {
+        lomhd_log("reimpl: exe is not loaded at 0x400000 -- nothing patched");
+        return;
+    }
 
     if (!lomhd_reimpl_header_ok((const uint8_t *)LOMHD_EXE_BASE, 0x1000))
     {

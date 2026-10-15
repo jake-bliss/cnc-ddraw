@@ -62,11 +62,16 @@ float classes). No waivers are currently needed.
 Wall time is agent working time on this function (harness build excluded, about 6 min of the
 total). Seed 1, 2000 trials each; run time is for reimpl + self + mutant together.
 
-| Function | Size | Wall time | Trials | reimpl | self control | mutant control | Coverage (insn / blocks) | Verdict |
-|---|---|---|---|---|---|---|---|---|
-| 0x404ab0 script_raise_error | 36 B | ~1 min | 2000 | 0 divergent | 0 | caught (2000/2000) | 10/10, 1/1 | PROVEN |
-| 0x4026a0 script_value_decode | 149 B | ~3 min | 2000 | 0 divergent | 0 | caught (324/2000) | 54/54, 7/7 | PROVEN |
-| 0x4ac0b0 op_abracadabra | 363 B | ~3 min | 2000 | 0 divergent | 0 | caught (540/2000) | 112/112, 19/19 | PROVEN |
+| Function | Size | Wall time | Trials | reimpl (default / -march=i486) | self control | mutant control | cache mutant | Coverage (insn / blocks) | Verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| 0x404ab0 script_raise_error | 36 B | ~1 min | 2000 | 0 / 0 divergent | 0 | caught (2000/2000) | n/a | 10/10, 1/1 | PROVEN |
+| 0x4026a0 script_value_decode | 149 B | ~3 min | 2000 | 0 / 0 divergent | 0 | caught (324/2000) | n/a | 54/54, 7/7 | PROVEN |
+| 0x4ac0b0 op_abracadabra | 363 B | ~3 min | 2000 | 0 / 0 divergent | 0 | caught (401/2000) | caught (266/2000) | 112/112, 19/19 | PROVEN |
+
+The cache mutant (`-DMUTANT_CACHE`) keeps the script stack pointer across the combat-state call;
+callee models for 0x4d4550 and 0x4abec0 scramble the script object (sp, value slots, error flag,
+counter) so such caching shows up. Faulted or non-returning runs make a function UNPROVEN; all runs
+above had none.
 
 Coverage before targeted inputs: 0x404ab0 and 0x4026a0 were already complete; 0x4ac0b0 was 111/112
 instructions and 18/19 blocks (the sp==0 push-failure block at 0x4ac1d6 was unreachable with

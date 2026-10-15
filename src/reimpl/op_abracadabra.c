@@ -66,6 +66,9 @@ void lom_op_abracadabra(GameScript *self)
     }
 
     ScriptValue second = pop_value(self);
+#ifdef MUTANT_CACHE
+    int32_t cached_sp = self->sp;
+#endif
     int32_t as_int, as_fixed;
     float as_float;
 
@@ -80,11 +83,16 @@ void lom_op_abracadabra(GameScript *self)
     int32_t result = orig_combat_query(COMBAT_STATE, as_int, arg, 0x40000);
 #endif
 
-    if (self->sp == 0) {
+#ifdef MUTANT_CACHE
+    int32_t sp = cached_sp;
+#else
+    int32_t sp = self->sp;
+#endif
+    if (sp == 0) {
         raise_inline(self, ERR_STACK_EMPTY);
         return;
     }
-    self->sp--;
-    self->values[self->sp].tag = SCRIPT_INT;
-    self->values[self->sp].i = result;
+    self->sp = sp - 1;
+    self->values[sp - 1].tag = SCRIPT_INT;
+    self->values[sp - 1].i = result;
 }

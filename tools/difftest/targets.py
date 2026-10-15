@@ -76,6 +76,37 @@ class Describe4026a0:
         return int(ok)
 
 
+def scramble_script(emu, rng):
+    """What a callee that re-enters the VM may do to the script object: seeded writes to the
+    stack pointer, value slots, error flag and counter. Identical in both runs."""
+    this = emu.script_this
+    if this is None:
+        return
+    arr, _, limit = struct.unpack("<IiI", bytes(emu.uc.mem_read(this + 0x50, 12)))
+    if rng.random() < 0.7:
+        emu.poke(this + 0x54, struct.pack("<i", rng.randrange(-2, 12)), "model")
+    if HEAP_LO <= arr < HEAP_LO + 0x3000 and rng.random() < 0.7:
+        for i in range(rng.randrange(1, 5)):
+            emu.poke(arr + 8 * rng.randrange(-3, 12), rand_value_slot(rng), "model")
+    if rng.random() < 0.5:
+        emu.poke(this + 0xA4, struct.pack("<I", rng.randrange(2)), "model")
+    n = emu.u32(this + 0xA78)
+    emu.poke(this + 0xA78, struct.pack("<I", (n + 1) & MASK), "model")
+
+
+class ScriptCallee:
+    """0x4d4550 / 0x4abec0: return a seeded value after scrambling the script object."""
+
+    @staticmethod
+    def describe(emu, args, ecx):
+        return ()
+
+    @staticmethod
+    def apply(emu, rng, args, ecx):
+        scramble_script(emu, rng)
+        return rng.getrandbits(32)
+
+
 class Generic:
     @staticmethod
     def describe(emu, args, ecx):
@@ -87,9 +118,9 @@ class Generic:
 
 
 SIGS = {
-    0x4D4550: {"conv": "thiscall", "nargs": 0, "model": Generic},
+    0x4D4550: {"conv": "thiscall", "nargs": 0, "model": ScriptCallee},
     0x404AB0: {"conv": "thiscall", "nargs": 1, "model": Generic},
-    0x4ABEC0: {"conv": "thiscall", "nargs": 3, "model": Generic},
+    0x4ABEC0: {"conv": "thiscall", "nargs": 3, "model": ScriptCallee},
     0x4026A0: {"conv": "cdecl", "nargs": 4, "model": Describe4026a0},
 }
 INTRINSICS = {0x5394A0}  # __ftol: runs for real in the original, inlined by the compiler in C
@@ -105,7 +136,7 @@ def setup_404ab0(emu, rng):
     arg = rand_int(rng)
     regs = rand_regs(rng)
     regs["ecx"] = this
-    return {"args": [arg], "regs": regs}
+    return {"args": [arg], "regs": regs, "script_this": this}
 
 
 def setup_4026a0(emu, rng):
@@ -127,7 +158,7 @@ def setup_op(emu, rng):
     for i in range(16):
         emu.poke(arr + 8 * i, rand_value_slot(rng))
     regs = rand_regs(rng)
-    return {"args": [this], "regs": regs}
+    return {"args": [this], "regs": regs, "script_this": this}
 
 
 # name -> spec. ret: "void" | "eax" | "eax_edx"
@@ -137,5 +168,5 @@ TARGETS = {
     0x4026A0: dict(name="script_value_decode", sym="lom_script_value_decode", end=0x402735,
                    ret="eax", setup=setup_4026a0, thiscall=False),
     0x4AC0B0: dict(name="op_abracadabra", sym="lom_op_abracadabra", end=0x4AC21B,
-                   ret="void", setup=setup_op, thiscall=False),
+                   ret="void", setup=setup_op, thiscall=False, cache_mutant=True),
 }

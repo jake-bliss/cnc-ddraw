@@ -44,15 +44,14 @@ def page_up(n):
     return (n + PAGE - 1) & ~(PAGE - 1)
 
 
-def build_blob(repo, outdir, mutant):
+def build_blob(repo, outdir, extra_flags):
     """Compile src/reimpl/*.c with the DLL's compiler/flags and link to a fixed-base PE."""
     os.makedirs(outdir, exist_ok=True)
     srcs = sorted(os.path.join(repo, "src/reimpl", f)
                   for f in os.listdir(os.path.join(repo, "src/reimpl")) if f.endswith(".c"))
     cflags = ["-I" + os.path.join(repo, "inc"), "-O2", "-Wall", "-std=c99", "-ffreestanding",
               "-fno-stack-protector", "-fno-asynchronous-unwind-tables"]
-    if mutant:
-        cflags.append("-DMUTANT")
+    cflags += extra_flags
     objs = []
     for s in srcs:
         o = os.path.join(outdir, os.path.basename(s)[:-2] + ".o")
@@ -107,6 +106,7 @@ class Emu:
         self.entry_esp = 0
         self.nargs = 0
         self.executed = set()
+        self.script_this = None
         self.call_idx = 0
         self.seed = 0
         uc.hook_add(UC_HOOK_MEM_WRITE, self._on_write)
@@ -189,6 +189,7 @@ class Emu:
         """Run one call from the already-prepared memory; returns an observation dict."""
         uc = self.uc
         self.callees, self.call_idx, self.seed = [], 0, seed
+        self.script_this = spec.get("script_this")
         self.fn_lo, self.fn_hi = fn_range
         self.in_intrinsic_until = None
         esp = STACK_HI - 0x1000 - esp_shift
