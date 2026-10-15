@@ -7,6 +7,7 @@ Proves, offline, that a C rewrite in `src/reimpl/*.c` behaves like the original 
 
     tools/difftest/run.sh 0x404ab0            # one function (also 0x4026a0, 0x4ac0b0)
     tools/difftest/run.sh all --trials 5000   # everything; options: --trials N --seed S
+    tools/difftest/run.sh selftest            # the control check itself: a harness error must not pass (run first by `all`)
 
 First run creates `.venv` (gitignored) and installs `unicorn`. `LOMSE_EXE` overrides the exe path
 (default: `lom-artifacts-keep/decomp/bin/lomse.exe`). Exit 0 only if all three pass and the function is PROVEN (see Coverage):
