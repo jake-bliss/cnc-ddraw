@@ -359,3 +359,7 @@ __pycache__/
 ddraw_syms.dll
 tests/*.exe
 *.d
+
+# tools/difftest
+tools/difftest/.venv/
+tools/difftest/build/

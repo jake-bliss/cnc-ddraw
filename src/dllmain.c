@@ -1,4 +1,5 @@
 #include "lomhd.h"
+#include "lomhd_reimpl.h"
 #include <windows.h>
 #include "ddraw.h"
 #include <stdio.h>
@@ -135,6 +136,7 @@ BOOL WINAPI DllMain(HANDLE hDll, DWORD dwReason, LPVOID lpReserved)
 
         lomhd_path_init();
         lomhd_files_install();
+        lomhd_reimpl_install();
         lomhd_crash_install();
 
         /* Make sure screensaver will stay off and monitors will stay on */
@@ -177,6 +179,7 @@ BOOL WINAPI DllMain(HANDLE hDll, DWORD dwReason, LPVOID lpReserved)
             SystemParametersInfoA(SPI_SETSCREENSAVEACTIVE, TRUE, NULL, 0);
         }
 
+        lomhd_reimpl_report();
         lomhd_crash_exit(lpReserved != NULL);
 
         ULONG(WINAPI* remove_handler)(PVOID) =
