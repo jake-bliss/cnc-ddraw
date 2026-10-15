@@ -19,16 +19,22 @@ rc=0
 $py "$here/difftest.py" "$addr" --mode reimpl "$@" || rc=1
 $py "$here/difftest.py" "$addr" --mode self "$@" || rc=1
 $py "$here/difftest.py" "$addr" --mode reimpl --i486 "$@" || rc=1
-if $py "$here/difftest.py" "$addr" --mode mutant "$@"; then
-    echo "  CONTROL FAILED: mutant was not caught"
-    rc=1
-else
-    echo "  control ok: mutant caught"
-fi
-out=$($py "$here/difftest.py" "$addr" --mode mutant_cache "$@") && st=0 || st=$?
-echo "$out"
-case "$out" in
-*n/a*) ;;
-*) if [ $st -eq 0 ]; then echo "  CONTROL FAILED: cache mutant was not caught"; rc=1; else echo "  control ok: cache mutant caught"; fi ;;
-esac
+# A control is caught only when the harness finished and reported divergent > 0; a build error or
+# crash prints no summary line and fails the control.
+control() {
+    mode=$1
+    shift
+    out=$($py "$here/difftest.py" "$addr" --mode "$mode" "$@" 2>&1) || true
+    echo "$out"
+    case "$out" in *"[$mode]: n/a"*) return 0 ;; esac
+    d=$(printf '%s\n' "$out" | sed -n 's/.*trials=[0-9]* divergent=\([0-9]*\).*/\1/p' | tail -1)
+    if [ -n "$d" ] && [ "$d" -gt 0 ]; then
+        echo "  control ok: $mode caught"
+    else
+        echo "  CONTROL FAILED: $mode not caught (divergent=${d:-none})"
+        rc=1
+    fi
+}
+control mutant "$@"
+control mutant_cache "$@"
 exit $rc
